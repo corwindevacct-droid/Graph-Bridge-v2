@@ -1,0 +1,49 @@
+GRAPHBRIDGE AI - PYTHON TOOLS
+==============================
+
+SETUP
+1. pip install websockets anthropic openai
+2. Edit graphbridge_config.py and set your API keys
+   OR set environment variables:
+     Windows:   set ANTHROPIC_API_KEY=<your-key-here>
+     Mac/Linux: export ANTHROPIC_API_KEY=<your-key-here>
+3. Open your Unreal project with GraphBridge AI enabled
+4. Click Start Server in the GraphBridge AI panel (Window menu)
+5. Confirm the green dot shows Running on port 8080
+
+TOOLS
+  graphbridge_tools.py    - Find assets, inspect pins, list nodes
+    python graphbridge_tools.py find BP_MyCharacter
+    python graphbridge_tools.py nodes /Game/BP_MyCharacter.BP_MyCharacter
+    python graphbridge_tools.py pins /Game/BP_MyCharacter.BP_MyCharacter BeginPlay
+
+  graphbridge_scan.py     - Scan entire project, save manifest
+    python graphbridge_scan.py
+    python graphbridge_scan.py BP_MyCharacter
+
+  graphbridge_variables.py - Bulk create Blueprint variables
+    Edit STAT_VARIABLES list then: python graphbridge_variables.py
+
+  graphbridge_animation.py - Create montages, blend spaces, assign AnimBPs
+    python graphbridge_animation.py list --type AnimMontage
+    python graphbridge_animation.py montage --skeleton /Game/SK_Hero --name AM_Attack
+
+  graphbridge_agent.py    - Claude agentic loop (natural language)
+    python graphbridge_agent.py "Add a float variable Speed to /Game/BP_MyChar.BP_MyChar"
+    python graphbridge_agent.py "Wire BeginPlay to register the IMC on /Game/BP_MyChar.BP_MyChar"
+    python graphbridge_agent.py --openai "List all nodes in /Game/BP_MyChar.BP_MyChar"
+
+  graphbridge_server.py   - Raw command debug shell
+    python graphbridge_server.py
+    > LIST_NODES|/Game/BP_MyCharacter.BP_MyCharacter
+    > COMPILE|/Game/BP_MyCharacter.BP_MyCharacter
+
+EXAMPLES
+  graphbridge_example_flight.py      - Wire a flight ability Blueprint
+  graphbridge_example_anim_flight.py - Wire an animation Blueprint
+
+FROM THE UNREAL PYTHON CONSOLE
+  import graphbridge_bridge
+  import asyncio
+  bridge = graphbridge_bridge.UnrealBridge()
+  asyncio.run(bridge.connect())

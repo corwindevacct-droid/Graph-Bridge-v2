@@ -1,0 +1,40 @@
+{
+	"FileVersion": 3,
+	"Version": 5,
+	"VersionName": "1.0.4",
+	"FriendlyName": "GraphBridge AI",
+	"Description": "AI-powered Blueprint graph assistant. Chat with Claude or GPT directly inside the Unreal Editor to inspect, summarize, and manipulate your graphs using natural language. Requires EnhancedInput and PythonScriptPlugin (both included with Unreal Engine).",
+	"Category": "Editor Utilities",
+	"CreatedBy": "Corwin Hicks",
+	"CreatedByURL": "",
+	"DocsURL": "",
+	"MarketplaceURL": "",
+	"SupportURL": "",
+	"CanContainContent": false,
+	"IsBetaVersion": false,
+	"IsExperimentalVersion": false,
+	"Installed": false,
+	"SupportedTargetPlatforms": [
+		"Win64"
+	],
+	"Modules": [
+		{
+			"Name": "GraphBridgev2",
+			"Type": "Editor",
+			"LoadingPhase": "PostEngineInit",
+			"PlatformAllowList": [
+				"Win64"
+			]
+		}
+	],
+	"Plugins": [
+		{
+			"Name": "EnhancedInput",
+			"Enabled": true
+		},
+		{
+			"Name": "PythonScriptPlugin",
+			"Enabled": true
+		}
+	]
+}
