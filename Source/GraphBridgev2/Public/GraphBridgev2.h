@@ -13,9 +13,17 @@ class SDockTab;
 class FSpawnTabArgs;
 #endif
 
+class FGraphBridgeMCPServer;
+
 class FGraphBridgev2Module : public IModuleInterface
 {
 public:
+    // Declared out-of-line (defined in GraphBridgev2.cpp, where
+    // GraphBridgeMCPServer.h is fully included) because TUniquePtr's
+    // destructor requires a complete type for FGraphBridgeMCPServer, which is
+    // only forward-declared here.
+    virtual ~FGraphBridgev2Module() override;
+
     virtual void StartupModule() override;
     virtual void ShutdownModule() override;
 
@@ -28,4 +36,10 @@ public:
 
 private:
     TSharedPtr<FGraphBridgeLLMClient> LLMClient;
+
+    // Owns the MCP (Model Context Protocol) HTTP transport — auto-started in
+    // StartupModule alongside the WebSocket bridge above, independent of the
+    // separate MCPServer instance UGraphBridgeAutomationLibrary owns for the
+    // manual StartMCPServer/StopMCPServer Blueprint-callable functions.
+    TUniquePtr<FGraphBridgeMCPServer> MCPServer;
 };

@@ -30,4 +30,10 @@ public:
     UPROPERTY(Config, EditAnywhere, Category="GraphBridge",
         meta=(DisplayName="API Endpoint (blank=OpenAI, use https://api.anthropic.com/v1/messages for Claude)"))
     FString ApiEndpoint;
+
+    UPROPERTY(Config, EditAnywhere, Category="GraphBridge", meta=(DisplayName="Enable MCP Server"))
+    bool bEnableMCPServer;
+
+    UPROPERTY(Config, EditAnywhere, Category="GraphBridge", meta=(DisplayName="MCP Server Port"))
+    int32 MCPServerPort;
 };

@@ -435,7 +435,7 @@ TSharedPtr<FJsonObject> FGraphBridgeMCPServer::HandleInitialize(const TSharedPtr
     TSharedRef<FJsonObject> ServerInfo = MakeShared<FJsonObject>();
     ServerInfo->SetStringField(TEXT("name"), TEXT("GraphBridge"));
     ServerInfo->SetStringField(TEXT("title"), TEXT("GraphBridge AI"));
-    ServerInfo->SetStringField(TEXT("version"), TEXT("1.0.9"));
+    ServerInfo->SetStringField(TEXT("version"), TEXT("1.0.10"));
     Result->SetObjectField(TEXT("serverInfo"), ServerInfo);
 
     Result->SetStringField(TEXT("instructions"),

@@ -6,9 +6,9 @@ AI-powered Blueprint graph assistant for Unreal Engine 5. Chat with Claude or GP
 
 ## Installation
 
-1. Download `GraphBridgev2_v1.0.4_UE5.5.zip`
+1. Download `GraphBridgev2_v1.0.10_UE5.7.zip`
 2. Extract into `YourProject/Plugins/GraphBridgev2/`
-3. Open your project in UE 5.5 â€” when prompted, enable the plugin and restart the editor
+3. Open your project in UE 5.7 â€” when prompted, enable the plugin and restart the editor
 4. Go to **Window â†’ GraphBridge AI** to open the panel
 
 ---
@@ -26,8 +26,8 @@ AI-powered Blueprint graph assistant for Unreal Engine 5. Chat with Claude or GP
 
 ## Requirements
 
-- Unreal Engine 5.5 or later
-- Anthropic API key ([console.anthropic.com](https://console.anthropic.com))
+- Unreal Engine 5.7 or later
+- Anthropic API key ([console.anthropic.com](https://console.anthropic.com)) — only needed for the in-editor chat panel, not for the WebSocket/MCP bridges themselves
 - Python 3.x (for the companion WebSocket bridge server)
 - Windows 64-bit
 
@@ -40,8 +40,15 @@ Slate Chat Panel -> C++ GraphBridgeLLMClient -> Anthropic API (claude-sonnet-4-6
                             |
             C++ WebSocket Server (IXWebSocket, port 8080)
                             |
+       MCP Server (JSON-RPC 2.0 over HTTP, port 8090) <- any MCP-compatible client
+                            |
          Unreal Editor (Blueprint graph read/write via GraphBridgeAutomationLibrary)
 ```
+
+Both the WebSocket bridge and the MCP server start automatically with the editor
+(configurable in **Project Settings -> Plugins -> GraphBridge AI**) and route through
+the exact same command dispatcher — there is exactly one command implementation to
+maintain regardless of which transport a client connects over.
 
 The Python scripts (graphbridge_bridge.py, graphbridge_tools.py, graphbridge_server.py) are development/debug utilities only - they are NOT part of the runtime path.
 
@@ -51,13 +58,13 @@ The Python scripts (graphbridge_bridge.py, graphbridge_tools.py, graphbridge_ser
 
 GraphBridge also speaks the standard [Model Context Protocol](https://modelcontextprotocol.io) (spec version `2025-06-18`), as a second transport alongside the WebSocket bridge above. Any MCP-compatible client — Claude Code, Cursor, Windsurf, VS Code — can connect directly with no custom client needed, unlike the WebSocket bridge which requires the Python or C++ tooling in this repo.
 
-- **Endpoint:** `http://127.0.0.1:8090/mcp` (HTTP POST, JSON-RPC 2.0). Port is configurable via `DefaultEditor.ini`:
-  ```ini
-  [GraphBridge]
-  MCPPort=8090
-  ```
-- **Start it:** call the Blueprint-callable `Start MCP Server` node (or `UGraphBridgeAutomationLibrary::StartMCPServer()` in C++/Python), independent of `Start Graph Bridge Server`. Both can run at the same time on their own ports.
-- **Methods supported:** `initialize`, `tools/list`, `tools/call`, `ping`. Every one of GraphBridge's 80+ bridge commands (`LIST_NODES`, `SPAWN_NODE`, `CONNECT_PINS`, `CREATE_FUNCTION`, `SPAWN_ACTOR_IN_LEVEL`, etc.) is exposed as an MCP tool with an auto-generated JSON Schema.
+- **Endpoint:** `http://127.0.0.1:8090/mcp` (HTTP POST, JSON-RPC 2.0).
+- **Starts automatically** with the editor, alongside the WebSocket bridge — no manual step needed. Configurable in **Project Settings -> Plugins -> GraphBridge AI**:
+  - **Enable MCP Server** (default on)
+  - **MCP Server Port** (default `8090`)
+
+  For manual control without restarting the editor (e.g. toggling it off temporarily), the Blueprint-callable `Start MCP Server` / `Stop MCP Server` / `Is MCP Server Running` nodes (or their `UGraphBridgeAutomationLibrary` C++/Python equivalents) are still available independently of the automatic path.
+- **Methods supported:** `initialize`, `tools/list`, `tools/call`, `ping`. Every one of GraphBridge's 81 bridge commands (`LIST_NODES`, `SPAWN_NODE`, `CONNECT_PINS`, `CREATE_FUNCTION`, `SPAWN_ACTOR_IN_LEVEL`, `CREATE_WIDGET_BLUEPRINT`, `ADD_MATERIAL_NODE`, etc.) is exposed as an MCP tool with an auto-generated JSON Schema.
 - **Undo:** MCP calls route through the exact same command dispatcher the WebSocket bridge uses (`DispatchCommandSync`), so every mutating tool call gets the same `FScopedTransaction` undo/redo support — Ctrl+Z in the editor undoes an MCP-triggered change exactly like a WebSocket- or Slate-panel-triggered one.
 - **Transport notes:** implements the Streamable HTTP transport without Server-Sent Events (every request gets a single JSON response, which the spec allows) and without session IDs (both optional for a single-client local tool server). Binds to `localhost` only and rejects any request carrying an `Origin` header, as a DNS-rebinding mitigation.
 
@@ -156,19 +163,28 @@ asyncio.run(bridge.connect())
 
 ## Implemented Commands
 
-The WebSocket bridge (and, as of v1.0.9, the MCP transport) supports 80+ commands including:
+The WebSocket bridge and the MCP transport share the same 81 commands (every command
+is available on both — MCP is just a second way to reach the identical dispatcher):
 
-**Graph Manipulation:** `SPAWN_NODE`, `CONNECT_PINS`, `DISCONNECT_PINS`, `DELETE_NODE`, `CLEAR_NODES`, `SET_PIN_DEFAULT`
+**Graph Manipulation:** `SPAWN_NODE`, `SPAWN_NODE_IN_GRAPH`, `CONNECT_PINS`, `DISCONNECT_PINS`, `DELETE_NODE`, `CLEAR_NODES`, `SET_PIN_DEFAULT`, `GET_PIN_DEFAULT`, `GET_PIN_CONNECTIONS`, `SET_NODE_POSITION`, `CREATE_FUNCTION`
 
-**Variables:** `SPAWN_VARIABLE`, `SET_VARIABLE_DEFAULT`, `SET_VARIABLE_REF`, `SET_VARIABLE_TYPE`, `LIST_VARIABLES`
+**Variables:** `SPAWN_VARIABLE`, `ADD_VARIABLE`, `SET_VARIABLE_DEFAULT`, `SET_VARIABLE_REF`, `SET_VARIABLE_TYPE`, `LIST_VARIABLES`
 
-**Blueprint Lifecycle:** `COMPILE`, `SAVE_BLUEPRINT`, `OPEN_BLUEPRINT`, `CLOSE_BLUEPRINT`
+**Blueprint Lifecycle:** `CREATE_BLUEPRINT`, `COMPILE`, `GET_COMPILE_ERRORS`, `SAVE_BLUEPRINT`, `OPEN_BLUEPRINT`, `CLOSE_BLUEPRINT`
 
-**Discovery:** `LIST_NODES`, `GET_NODE_PINS`, `LIST_ASSETS`, `FIND_NODE_CLASS`
+**Discovery:** `LIST_NODES`, `GET_NODE_PINS`, `LIST_ASSETS`, `FIND_NODE_CLASS`, `LIST_ASSET_PROPERTIES`, `GET_ASSET_PROPERTY`, `SET_ASSET_PROPERTY`
 
-**Components & Input:** `ADD_COMPONENT`, `SET_INPUT_ACTION`, `SET_FUNCTION_REF`, `SET_EVENT_REF`, `ADD_IMC_TO_CHARACTER`
+**Components & Input:** `ADD_COMPONENT`, `SET_INPUT_ACTION`, `SET_FUNCTION_REF`, `SET_EVENT_REF`, `CREATE_INPUT_ACTION`, `CREATE_IMC`, `ADD_IMC_MAPPING`, `ADD_IMC_TO_CHARACTER`
 
-**Animation:** `SET_ANIM_CLASS`, `SET_MONTAGE_SLOT`, `ADD_MONTAGE_SECTION`, `LIST_BLENDSPACES`
+**Animation:** `SET_ANIM_CLASS`, `SET_MONTAGE_SLOT`, `ADD_MONTAGE_SECTION`, `ADD_MONTAGE_NOTIFY`, `LIST_BLENDSPACES`, `LIST_SKELETON_SOCKETS`, `ADD_SKELETON_SOCKET`
+
+**Level & Actors:** `SPAWN_ACTOR_IN_LEVEL`, `LIST_LEVEL_ACTORS`, `SET_ACTOR_TRANSFORM`, `DELETE_LEVEL_ACTOR`, `GET_PLAYER_START`, `SET_LEVEL_GAMEMODE`
+
+**UMG Widgets** *(new in v1.0.8)*: `CREATE_WIDGET_BLUEPRINT`, `ADD_WIDGET_ELEMENT`, `SET_WIDGET_TEXT`
+
+**Materials** *(new in v1.0.8)*: `CREATE_MATERIAL`, `ADD_MATERIAL_NODE`, `CONNECT_MATERIAL_PINS`, `SET_MATERIAL_RESULT`, `COMPILE_MATERIAL`, `CLOSE_MATERIAL`
+
+**DataTables:** `LIST_DATATABLE_ROWS`, `ADD_DATATABLE_ROW`, `DELETE_DATATABLE_ROW`, `RENAME_DATATABLE_ROW`
 
 ---
 
