@@ -1,7 +1,7 @@
 {
 	"FileVersion": 3,
-	"Version": 9,
-	"VersionName": "1.0.8",
+	"Version": 10,
+	"VersionName": "1.0.9",
 	"FriendlyName": "GraphBridge AI",
 	"Description": "AI-powered Blueprint graph assistant. Chat with Claude directly inside the Unreal Editor to inspect, summarize, and manipulate your graphs using natural language. Requires EnhancedInput and PythonScriptPlugin (both included with Unreal Engine - no separate installation needed).",
 	"Category": "Editor Utilities",

@@ -38,7 +38,10 @@ public class GraphBridgev2 : ModuleRules
                 "UMG",
                 "UMGEditor",
                 "MaterialEditor",
-                "RHI"
+                "RHI",
+                // MCP (Model Context Protocol) transport — UE's built-in HTTP server
+                // module, no third-party dependency needed alongside IXWebSocket.
+                "HTTPServer"
             });
         }
 

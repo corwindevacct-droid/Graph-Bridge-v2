@@ -47,6 +47,33 @@ The Python scripts (graphbridge_bridge.py, graphbridge_tools.py, graphbridge_ser
 
 ---
 
+## MCP Transport
+
+GraphBridge also speaks the standard [Model Context Protocol](https://modelcontextprotocol.io) (spec version `2025-06-18`), as a second transport alongside the WebSocket bridge above. Any MCP-compatible client — Claude Code, Cursor, Windsurf, VS Code — can connect directly with no custom client needed, unlike the WebSocket bridge which requires the Python or C++ tooling in this repo.
+
+- **Endpoint:** `http://127.0.0.1:8090/mcp` (HTTP POST, JSON-RPC 2.0). Port is configurable via `DefaultEditor.ini`:
+  ```ini
+  [GraphBridge]
+  MCPPort=8090
+  ```
+- **Start it:** call the Blueprint-callable `Start MCP Server` node (or `UGraphBridgeAutomationLibrary::StartMCPServer()` in C++/Python), independent of `Start Graph Bridge Server`. Both can run at the same time on their own ports.
+- **Methods supported:** `initialize`, `tools/list`, `tools/call`, `ping`. Every one of GraphBridge's 80+ bridge commands (`LIST_NODES`, `SPAWN_NODE`, `CONNECT_PINS`, `CREATE_FUNCTION`, `SPAWN_ACTOR_IN_LEVEL`, etc.) is exposed as an MCP tool with an auto-generated JSON Schema.
+- **Undo:** MCP calls route through the exact same command dispatcher the WebSocket bridge uses (`DispatchCommandSync`), so every mutating tool call gets the same `FScopedTransaction` undo/redo support — Ctrl+Z in the editor undoes an MCP-triggered change exactly like a WebSocket- or Slate-panel-triggered one.
+- **Transport notes:** implements the Streamable HTTP transport without Server-Sent Events (every request gets a single JSON response, which the spec allows) and without session IDs (both optional for a single-client local tool server). Binds to `localhost` only and rejects any request carrying an `Origin` header, as a DNS-rebinding mitigation.
+
+Example client config (Claude Code, Cursor, etc. — check your client's docs for the exact file):
+```json
+{
+  "mcpServers": {
+    "graphbridge": {
+      "url": "http://127.0.0.1:8090/mcp"
+    }
+  }
+}
+```
+
+---
+
 ## Python Tools
 
 ### Setup
@@ -129,7 +156,7 @@ asyncio.run(bridge.connect())
 
 ## Implemented Commands
 
-The WebSocket bridge supports 50+ commands including:
+The WebSocket bridge (and, as of v1.0.9, the MCP transport) supports 80+ commands including:
 
 **Graph Manipulation:** `SPAWN_NODE`, `CONNECT_PINS`, `DISCONNECT_PINS`, `DELETE_NODE`, `CLEAR_NODES`, `SET_PIN_DEFAULT`
 

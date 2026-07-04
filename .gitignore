@@ -6,3 +6,4 @@ Intermediate/
 *.opendb
 *.user
 .vs/
+__pycache__/

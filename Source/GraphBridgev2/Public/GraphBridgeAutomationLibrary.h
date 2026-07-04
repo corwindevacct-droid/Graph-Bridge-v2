@@ -14,6 +14,8 @@ namespace ix
     class WebSocket;
 }
 
+class FGraphBridgeMCPServer;
+
 // Editor-only forward declarations — placed here (before generated.h) so that
 // the private #if WITH_EDITOR methods below compile in editor builds.
 // UEdGraphNode* and UBlueprint* only need forward declarations (pointer use only);
@@ -60,6 +62,22 @@ public:
     UFUNCTION(BlueprintCallable, Category = "GraphBridge")
     static void SetSendMessageDelegate(FOnSendMessage InDelegate);
 
+    // -----------------------------------------------------------------------
+    // MCP (Model Context Protocol) transport — a second, independent entry
+    // point into the exact same commands as the WebSocket bridge above (both
+    // route through DispatchCommandSync). Runs on its own port so it can be
+    // started/stopped independently of the WebSocket server.
+    // -----------------------------------------------------------------------
+
+    UFUNCTION(BlueprintCallable, Category = "GraphBridge|MCP")
+    static bool StartMCPServer(int32 Port = 8090);
+
+    UFUNCTION(BlueprintCallable, Category = "GraphBridge|MCP")
+    static void StopMCPServer();
+
+    UFUNCTION(BlueprintCallable, Category = "GraphBridge|MCP")
+    static bool IsMCPServerRunning();
+
     /**
      * Synchronous in-process command dispatch — same routing as the WebSocket handler
      * but returns the JSON result string directly instead of sending it over the wire.
@@ -77,6 +95,9 @@ public:
 private:
     // Server owns the IXWebSocket server instance
     static std::unique_ptr<ix::WebSocketServer> Server;
+
+    // MCPServer owns the MCP (HTTP) server instance — independent of Server above.
+    static std::unique_ptr<FGraphBridgeMCPServer> MCPServer;
 
     // -----------------------------------------------------------------------
     // Internal command dispatch — takes the raw pipe-delimited string and the

@@ -2,6 +2,7 @@
 
 #include "GraphBridgeAutomationLibrary.h"
 #include "GraphBridgev2.h"
+#include "GraphBridgeMCPServer.h"
 
 // All UE5 headers MUST come before any third-party Windows headers.
 // IXWebSocket pulls in raw Windows atomics (winsock2.h etc.) which clash
@@ -136,6 +137,7 @@ THIRD_PARTY_INCLUDES_END
 // ---------------------------------------------------------------------------
 
 std::unique_ptr<ix::WebSocketServer> UGraphBridgeAutomationLibrary::Server;
+std::unique_ptr<FGraphBridgeMCPServer> UGraphBridgeAutomationLibrary::MCPServer;
 FOnSendMessage UGraphBridgeAutomationLibrary::SendMessageDelegate;
 
 // Non-null only during a DispatchCommandSync call — captures the JSON result
@@ -208,6 +210,47 @@ void UGraphBridgeAutomationLibrary::StopGraphBridgeServer()
 bool UGraphBridgeAutomationLibrary::IsServerRunning()
 {
     return Server != nullptr;
+}
+
+// ---------------------------------------------------------------------------
+// MCP server startup / shutdown — independent of the WebSocket server above.
+// ---------------------------------------------------------------------------
+
+bool UGraphBridgeAutomationLibrary::StartMCPServer(int32 Port)
+{
+    if (MCPServer && MCPServer->IsRunning()) return true;
+
+    // Allow port override via DefaultEditor.ini:
+    //   [GraphBridge]
+    //   MCPPort=8090
+    int32 ConfigPort = 0;
+    if (GConfig && GConfig->GetInt(TEXT("GraphBridge"), TEXT("MCPPort"), ConfigPort, GEditorIni) && ConfigPort > 0)
+    {
+        Port = ConfigPort;
+    }
+
+    if (!MCPServer)
+        MCPServer = std::make_unique<FGraphBridgeMCPServer>();
+
+    if (!MCPServer->Start(Port))
+    {
+        MCPServer.reset();
+        return false;
+    }
+    return true;
+}
+
+void UGraphBridgeAutomationLibrary::StopMCPServer()
+{
+    if (!MCPServer) return;
+    MCPServer->Stop();
+    MCPServer.reset();
+    UE_LOG(LogGraphBridge, Log, TEXT("GraphBridge: MCP server stopped"));
+}
+
+bool UGraphBridgeAutomationLibrary::IsMCPServerRunning()
+{
+    return MCPServer && MCPServer->IsRunning();
 }
 
 // ---------------------------------------------------------------------------
