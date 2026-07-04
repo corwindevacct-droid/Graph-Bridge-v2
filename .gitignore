@@ -1,0 +1,8 @@
+Binaries/
+Intermediate/
+*.VC.db
+*.opensdf
+*.sdf
+*.opendb
+*.user
+.vs/

@@ -1,0 +1,109 @@
+GRAPHBRIDGE AI - PYTHON TOOLS
+==============================
+
+SETUP
+1. pip install websockets anthropic openai
+2. Edit graphbridge_config.py and set your API keys
+   OR set environment variables:
+     Windows:   set ANTHROPIC_API_KEY=<your-key-here>
+     Mac/Linux: export ANTHROPIC_API_KEY=<your-key-here>
+3. Open your Unreal project with GraphBridge AI enabled
+4. Click Start Server in the GraphBridge AI panel (Window menu)
+5. Confirm the green dot shows Running on port 8080
+
+TOOLS
+  graphbridge_tools.py    - Find assets, inspect pins, list nodes
+    python graphbridge_tools.py find BP_MyCharacter
+    python graphbridge_tools.py nodes /Game/BP_MyCharacter.BP_MyCharacter
+    python graphbridge_tools.py pins /Game/BP_MyCharacter.BP_MyCharacter BeginPlay
+
+  graphbridge_scan.py     - Scan entire project, save manifest
+    python graphbridge_scan.py
+    python graphbridge_scan.py BP_MyCharacter
+
+  graphbridge_variables.py - Bulk create Blueprint variables
+    Edit STAT_VARIABLES list then: python graphbridge_variables.py
+
+  graphbridge_animation.py - Create montages, blend spaces, assign AnimBPs
+    python graphbridge_animation.py list --type AnimMontage
+    python graphbridge_animation.py montage --skeleton /Game/SK_Hero --name AM_Attack
+
+  graphbridge_agent.py    - Claude agentic loop (natural language)
+    python graphbridge_agent.py "Add a float variable Speed to /Game/BP_MyChar.BP_MyChar"
+    python graphbridge_agent.py "Wire BeginPlay to register the IMC on /Game/BP_MyChar.BP_MyChar"
+    python graphbridge_agent.py --openai "List all nodes in /Game/BP_MyChar.BP_MyChar"
+
+  graphbridge_server.py   - Raw command debug shell
+    python graphbridge_server.py
+    > LIST_NODES|/Game/BP_MyCharacter.BP_MyCharacter
+    > COMPILE|/Game/BP_MyCharacter.BP_MyCharacter
+
+EXAMPLES
+  graphbridge_example_flight.py      - Wire a flight ability Blueprint
+  graphbridge_example_anim_flight.py - Wire an animation Blueprint
+
+FROM THE UNREAL PYTHON CONSOLE
+  import graphbridge_bridge
+  import asyncio
+  bridge = graphbridge_bridge.UnrealBridge()
+  asyncio.run(bridge.connect())
+
+
+GRAPHBRIDGE AI - C++ TOOLS
+==============================
+A standalone C++ port of the tools above — same commands, same output,
+no Python interpreter required. Source: Plugins/graphbridge-cli/
+(sibling of this plugin's Source/ folder — it is a plain CMake project,
+not a UBT module, and never links against Unreal Engine headers).
+
+SETUP
+1. cmake -S Plugins/graphbridge-cli -B Plugins/graphbridge-cli/build
+   cmake --build Plugins/graphbridge-cli/build --config Release
+   (IXWebSocket + nlohmann/json are fetched automatically via FetchContent)
+2. Set ANTHROPIC_API_KEY as an environment variable, or create
+   graphbridge_config.json next to the built executable:
+     { "ANTHROPIC_API_KEY": "sk-ant-...", "BRIDGE_URI": "ws://127.0.0.1:8080" }
+3. Open your Unreal project with GraphBridge AI enabled.
+4. Click Start Server in the GraphBridge AI panel (Window menu).
+5. Confirm the green dot shows Running on port 8080.
+
+TOOLS
+  graphbridge find <term> [term2 ...]      - Find assets (Blueprint + AnimBlueprint)
+    graphbridge find BP_MyCharacter
+
+  graphbridge path <term> [term2 ...]      - Same as find — print full asset paths
+
+  graphbridge pins <BP_PATH> <node> ...    - Show pins on one or more graph nodes
+    graphbridge pins /Game/BP_MyCharacter.BP_MyCharacter BeginPlay
+
+  graphbridge nodes <BP_PATH>              - List all nodes in a Blueprint EventGraph
+    graphbridge nodes /Game/BP_MyCharacter.BP_MyCharacter
+
+  graphbridge discover [term] [term2 ...]  - Search node UClasses; saves discovered_nodes.txt
+    graphbridge discover EnhancedInputAction AddMovementInput
+
+  graphbridge scan [filter]                - Scan entire project, save project_manifest.json
+    graphbridge scan
+    graphbridge scan BP_MyCharacter
+
+  graphbridge variables <BP_PATH> <CATEGORY> <vars.json>
+                                            - Bulk create Blueprint variables from a JSON list
+    vars.json: [{"name":"WalkSpeed","type":"float","default":"600.0"}, ...]
+
+  graphbridge animation <subcommand> [args...]
+                                            - Create montages, blend spaces, assign AnimBPs
+    graphbridge animation list --type AnimMontage
+    graphbridge animation montage --skeleton /Game/SK_Hero --name AM_Attack
+
+  graphbridge agent [--bp PATH] [--clear-session] "<task>"
+                                            - Claude agentic loop (natural language)
+    graphbridge agent "Add a float variable Speed to /Game/BP_MyChar.BP_MyChar"
+    graphbridge agent "Wire BeginPlay to register the IMC on /Game/BP_MyChar.BP_MyChar"
+    (--openai is not yet implemented in the C++ tool — use graphbridge_agent.py --openai)
+
+  graphbridge shell                        - Raw command debug shell
+    graphbridge shell
+    > LIST_NODES|/Game/BP_MyCharacter.BP_MyCharacter
+    > COMPILE|/Game/BP_MyCharacter.BP_MyCharacter
+
+See Plugins/graphbridge-cli/README.md for build details.
