@@ -278,7 +278,8 @@ def build_session_context(state: dict) -> str:
 
     components = state.get("components", {})
     if components:
-        lines.append(f"  Components: {', '.join(f'{n} ({v[\"class\"]})' for n, v in components.items())}")
+        comp_list = ", ".join(f"{n} ({v['class']})" for n, v in components.items())
+        lines.append(f"  Components: {comp_list}")
 
     lines.append("")
     lines.append("Use GUIDs above directly. Only call LIST_NODES if you need to find a node not listed here.")

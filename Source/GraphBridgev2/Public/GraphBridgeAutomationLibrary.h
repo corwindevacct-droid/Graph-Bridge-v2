@@ -462,5 +462,88 @@ private:
     // the material could not be found.
     static FString CompileMaterial(FString MaterialPath);
 
+    // ------------------------------------------------------------------
+    // Blueprint completeness — enums, structs, function libraries (v1.10)
+    // ------------------------------------------------------------------
+
+    // CREATE_ENUM — creates a new UUserDefinedEnum asset with the given
+    // comma-separated enumerator display names, via
+    // FEnumEditorUtils::CreateUserDefinedEnum + AddNewEnumeratorForUserDefinedEnum
+    // (confirmed against Kismet2/EnumEditorUtils.h — the latter takes no name
+    // argument; the new enumerator's index is NumEnums()-2 immediately after
+    // the call, used with SetEnumeratorDisplayName to assign the real name).
+    // Returns the canonical asset path on success, "ERR:..." on failure.
+    static FString CreateEnum(FString AssetPath, FString CommaSeparatedNames);
+
+    // CREATE_STRUCT — creates a new UUserDefinedStruct asset via
+    // FStructureEditorUtils::CreateUserDefinedStruct, which already seeds one
+    // default bool member internally (confirmed against
+    // Kismet2/StructureEditorUtils.cpp) — this is intentional engine behavior,
+    // not something this command needs to strip out.
+    // Returns the canonical asset path on success, "ERR:..." on failure.
+    static FString CreateStruct(FString AssetPath);
+
+    // ADD_STRUCT_MEMBER — adds a member variable to an existing
+    // UUserDefinedStruct via FStructureEditorUtils::AddVariable (which appends
+    // to the end of GetVarDesc()), then renames it from its auto-generated
+    // name to MemberName via the GUID-based RenameVariable overload.
+    // MemberType uses the same names as ResolveTypeString (bool, float,
+    // FString, FVector, object:ClassName, etc).
+    // Returns empty string on success, "ERR:..." on failure.
+    static FString AddStructMember(FString StructAssetPath, FString MemberName, FString MemberType);
+
+    // CREATE_FUNCTION_LIBRARY — creates a new Blueprint Function Library asset.
+    // NOTE: this is NOT just CreateBlueprint(AssetPath, "BlueprintFunctionLibrary")
+    // — that was tried first and fails live: UBlueprintFunctionLibrary has no
+    // IsBlueprintBase metadata, so FKismetEditorUtilities::CanCreateBlueprintOfClass
+    // (which CreateBlueprint calls) rejects it. Confirmed against the engine's
+    // own UBlueprintFunctionLibraryFactory (Factories/BlueprintFunctionLibraryFactory.h,
+    // EditorFactories.cpp): it calls FKismetEditorUtilities::CreateBlueprint
+    // directly with BlueprintType = BPTYPE_FunctionLibrary (not BPTYPE_Normal),
+    // bypassing CanCreateBlueprintOfClass entirely. This function mirrors that.
+    // Returns the canonical asset path on success, "ERR:..." on failure.
+    static FString CreateFunctionLibrary(FString AssetPath);
+
+    // ------------------------------------------------------------------
+    // Blueprint completeness Phase 2 — local variables, variable metadata,
+    // event dispatchers (v1.11)
+    // ------------------------------------------------------------------
+
+    // ADD_LOCAL_VARIABLE — adds a variable scoped to a single function graph
+    // via FBlueprintEditorUtils::AddLocalVariable. FunctionGraphName is
+    // resolved the same way SPAWN_NODE_IN_GRAPH resolves graphs (see
+    // FindGraphByName). VarType uses the same names as ResolveTypeString.
+    // Returns empty string on success, "ERR:..." on failure.
+    static FString AddLocalVariable(FString BlueprintPath, FString FunctionGraphName,
+        FString VarName, FString VarType, FString DefaultValue);
+
+    // SET_VARIABLE_METADATA — sets a single metadata key/value pair on a
+    // class (member) variable via FBlueprintEditorUtils::SetBlueprintVariableMetaData.
+    // Class variables ONLY — local (function-scoped) variable metadata is
+    // silently dropped at compile time by the engine itself (Epic bug
+    // UE-239861, open as of this writing), so this deliberately does not
+    // support local variables rather than pretending to.
+    // SPECIAL CASE: MetaKey "Category" is NOT stored in the generic metadata
+    // array — confirmed live it's a dedicated FText field with its own API
+    // (FBlueprintEditorUtils::SetBlueprintVariableCategory), routed there
+    // automatically rather than silently landing somewhere the Details panel
+    // never reads it.
+    // Returns empty string on success, "ERR:..." on failure.
+    static FString SetVariableMetadata(FString BlueprintPath, FString VarName,
+        FString MetaKey, FString MetaValue);
+
+    // CREATE_EVENT_DISPATCHER — creates a new multicast delegate ("Event
+    // Dispatcher") member variable plus its signature graph, mirroring
+    // FBlueprintEditor::OnAddNewDelegate() exactly (confirmed against
+    // Editor/Kismet/Private/BlueprintEditor.cpp — the engine's own "Add New"
+    // button in the My Blueprint panel calls this same sequence). Parameters
+    // (ParamType:ParamName pairs, comma-separated) are added afterward via
+    // the signature graph's entry node — CreateUserDefinedPin with
+    // EGPD_Output, since dispatcher parameters flow out of the entry node to
+    // whatever binds to the dispatcher.
+    // Returns empty string on success, "ERR:..." on failure.
+    static FString CreateEventDispatcher(FString BlueprintPath, FString DispatcherName,
+        FString CommaSeparatedParams);
+
 #endif // WITH_EDITOR
 };

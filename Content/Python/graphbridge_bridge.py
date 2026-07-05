@@ -607,3 +607,93 @@ class UnrealBridge:
         a material's expression graph if it might be open for editing.
         """
         return await self._send_command(f"CLOSE_MATERIAL|{material_path}")
+
+    # ------------------------------------------------------------------
+    # Blueprint completeness — enums, structs, function libraries (v1.10)
+    # ------------------------------------------------------------------
+
+    async def create_enum(self, asset_path: str, enumerator_names: list[str]) -> dict | None:
+        """
+        Create a new UUserDefinedEnum asset with the given enumerator
+        display names, in order.
+
+        result["payload"] is the canonical asset path ("PackagePath.AssetName")
+        on success.
+        """
+        names_str = ",".join(enumerator_names)
+        return await self._send_command(f"CREATE_ENUM|{asset_path}|{names_str}")
+
+    async def create_struct(self, asset_path: str) -> dict | None:
+        """
+        Create a new UUserDefinedStruct asset. The engine itself seeds one
+        default bool member — this is intentional (UUserDefinedStruct assumes
+        at least one variable exists) — use add_struct_member() to add real
+        fields afterward.
+
+        result["payload"] is the canonical asset path ("PackagePath.AssetName")
+        on success.
+        """
+        return await self._send_command(f"CREATE_STRUCT|{asset_path}")
+
+    async def add_struct_member(self, struct_path: str, member_name: str, member_type: str) -> dict | None:
+        """
+        Add a member variable to an existing UUserDefinedStruct.
+
+        member_type: same names as spawn_variable()/add_variable() — bool,
+        int32, float, FString, FVector, object:ClassName, etc.
+        """
+        return await self._send_command(f"ADD_STRUCT_MEMBER|{struct_path}|{member_name}|{member_type}")
+
+    async def create_function_library(self, asset_path: str) -> dict | None:
+        """
+        Create a new Blueprint Function Library asset (ParentClass =
+        BlueprintFunctionLibrary, BlueprintType = BPTYPE_FunctionLibrary).
+        Functions added to it via create_function() are static and callable
+        from any Blueprint without a target pin.
+
+        result["payload"] is the canonical asset path ("PackagePath.AssetName")
+        on success.
+        """
+        return await self._send_command(f"CREATE_FUNCTION_LIBRARY|{asset_path}")
+
+    # ------------------------------------------------------------------
+    # Blueprint completeness Phase 2 — local variables, variable metadata,
+    # event dispatchers (v1.11)
+    # ------------------------------------------------------------------
+
+    async def add_local_variable(self, bp_path: str, function_graph_name: str,
+                                  var_name: str, var_type: str, default_value: str = "") -> dict | None:
+        """
+        Add a variable scoped to a single function graph (not the class).
+
+        function_graph_name: "EventGraph" or any function graph name created
+        via create_function().
+        var_type: same names as ResolveTypeString (bool, float, FString,
+        FVector, object:ClassName, etc).
+        """
+        return await self._send_command(
+            f"ADD_LOCAL_VARIABLE|{bp_path}|{function_graph_name}|{var_name}|{var_type}|{default_value}")
+
+    async def set_variable_metadata(self, bp_path: str, var_name: str,
+                                     meta_key: str, meta_value: str) -> dict | None:
+        """
+        Set a single metadata key/value pair on a class (member) variable —
+        e.g. Category, ToolTip, ExposeOnSpawn, ClampMin, ClampMax.
+
+        Class variables ONLY. Local (function-scoped) variable metadata is
+        silently dropped at compile time by the engine itself (Epic bug
+        UE-239861, open) — this deliberately does not support local variables.
+        """
+        return await self._send_command(f"SET_VARIABLE_METADATA|{bp_path}|{var_name}|{meta_key}|{meta_value}")
+
+    async def create_event_dispatcher(self, bp_path: str, dispatcher_name: str,
+                                       params: list[tuple[str, str]] | None = None) -> dict | None:
+        """
+        Create a new Event Dispatcher (multicast delegate) member variable
+        plus its signature graph.
+
+        params: list of (type, name) tuples, e.g. [("int32", "Amount"),
+        ("FString", "Reason")]. Types use the same names as ResolveTypeString.
+        """
+        params_str = ",".join(f"{t}:{n}" for t, n in (params or []))
+        return await self._send_command(f"CREATE_EVENT_DISPATCHER|{bp_path}|{dispatcher_name}|{params_str}")

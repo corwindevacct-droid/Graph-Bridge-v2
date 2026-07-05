@@ -41,7 +41,10 @@ public class GraphBridgev2 : ModuleRules
                 "RHI",
                 // MCP (Model Context Protocol) transport — UE's built-in HTTP server
                 // module, no third-party dependency needed alongside IXWebSocket.
-                "HTTPServer"
+                "HTTPServer",
+                // UAnimGraphNode_Base — used only to reject Anim Graph node classes
+                // in SpawnNodeOnGraph's safety guard (see GraphBridgeAutomationLibrary.cpp).
+                "AnimGraph"
             });
         }
 

@@ -24,7 +24,9 @@
 #include "K2Node_InputAction.h"
 #include "EnhancedInputActionDelegateBinding.h"
 #include "K2Node_VariableGet.h"
+#include "K2Node_EditablePinBase.h"
 #include "K2Node_SpawnActorFromClass.h"
+#include "AnimGraphNode_Base.h"
 #include "K2Node_VariableSet.h"
 #include "K2Node_Variable.h"
 #include "Editor.h"
@@ -108,6 +110,12 @@
 #include "Materials/MaterialExpressionTime.h"
 #include "SceneTypes.h"
 #include "ShaderCompiler.h"
+// Blueprint completeness (v1.10) — enums, structs, function libraries
+#include "Kismet2/EnumEditorUtils.h"
+#include "Kismet2/StructureEditorUtils.h"
+#include "Engine/UserDefinedEnum.h"
+#include "StructUtils/UserDefinedStruct.h"
+#include "UserDefinedStructure/UserDefinedStructEditorData.h"
 #endif // WITH_EDITOR
 
 // ── IXWebSocket (third-party) ────────────────────────────────────────────────
@@ -1139,6 +1147,66 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommand(FString Command, ix::We
         SendResponse(Sender, bOk, Op,
             bOk ? TEXT("Material editor closed") : TEXT("Close failed"), TEXT(""));
     }
+    else if (Op == TEXT("CREATE_ENUM") && P.Num() >= 3)
+    {
+        // CREATE_ENUM|AssetPath|Name1,Name2,Name3,...
+        FString Result = CreateEnum(P[1], P[2]);
+        bool bOk = !Result.StartsWith(TEXT("ERR:"));
+        SendResponse(Sender, bOk, Op,
+            bOk ? FString::Printf(TEXT("Enum created at '%s'"), *Result) : Result.RightChop(4),
+            bOk ? Result : TEXT(""));
+    }
+    else if (Op == TEXT("CREATE_STRUCT") && P.Num() >= 2)
+    {
+        // CREATE_STRUCT|AssetPath
+        FString Result = CreateStruct(P[1]);
+        bool bOk = !Result.StartsWith(TEXT("ERR:"));
+        SendResponse(Sender, bOk, Op,
+            bOk ? FString::Printf(TEXT("Struct created at '%s'"), *Result) : Result.RightChop(4),
+            bOk ? Result : TEXT(""));
+    }
+    else if (Op == TEXT("ADD_STRUCT_MEMBER") && P.Num() >= 4)
+    {
+        // ADD_STRUCT_MEMBER|StructAssetPath|MemberName|MemberType
+        FString Err = AddStructMember(P[1], P[2], P[3]);
+        bool bOk = Err.IsEmpty();
+        SendResponse(Sender, bOk, Op,
+            bOk ? TEXT("Struct member added") : Err.RightChop(4), TEXT(""));
+    }
+    else if (Op == TEXT("CREATE_FUNCTION_LIBRARY") && P.Num() >= 2)
+    {
+        // CREATE_FUNCTION_LIBRARY|AssetPath
+        FString Result = CreateFunctionLibrary(P[1]);
+        bool bOk = !Result.StartsWith(TEXT("ERR:"));
+        SendResponse(Sender, bOk, Op,
+            bOk ? FString::Printf(TEXT("Function Library created at '%s'"), *Result) : Result.RightChop(4),
+            bOk ? Result : TEXT(""));
+    }
+    else if (Op == TEXT("ADD_LOCAL_VARIABLE") && P.Num() >= 6)
+    {
+        // ADD_LOCAL_VARIABLE|BPPath|FunctionGraphName|VarName|VarType|DefaultValue
+        FString Err = AddLocalVariable(P[1], P[2], P[3], P[4], P[5]);
+        bool bOk = Err.IsEmpty();
+        SendResponse(Sender, bOk, Op,
+            bOk ? TEXT("Local variable added") : Err.RightChop(4), TEXT(""));
+    }
+    else if (Op == TEXT("SET_VARIABLE_METADATA") && P.Num() >= 5)
+    {
+        // SET_VARIABLE_METADATA|BPPath|VarName|MetaKey|MetaValue
+        FString Err = SetVariableMetadata(P[1], P[2], P[3], P[4]);
+        bool bOk = Err.IsEmpty();
+        SendResponse(Sender, bOk, Op,
+            bOk ? TEXT("Variable metadata set") : Err.RightChop(4), TEXT(""));
+    }
+    else if (Op == TEXT("CREATE_EVENT_DISPATCHER") && P.Num() >= 3)
+    {
+        // CREATE_EVENT_DISPATCHER|BPPath|DispatcherName|ParamType1:ParamName1,...
+        FString Params = P.Num() >= 4 ? P[3] : TEXT("");
+        FString Err = CreateEventDispatcher(P[1], P[2], Params);
+        bool bOk = Err.IsEmpty();
+        SendResponse(Sender, bOk, Op,
+            bOk ? TEXT("Event dispatcher created") : Err.RightChop(4), TEXT(""));
+    }
     else
     {
         UE_LOG(LogGraphBridge, Warning, TEXT("GraphBridge: Unknown or malformed command: %s"), *Command);
@@ -1422,6 +1490,34 @@ FString UGraphBridgeAutomationLibrary::SpawnNodeOnGraph(UBlueprint* Blueprint, U
 
     if (!FoundClass->IsChildOf(UK2Node::StaticClass()))
         return FString::Printf(TEXT("ERR:Resolved class '%s' is not a UK2Node"), *FoundClass->GetName());
+
+    // UAnimGraphNode_Base and its subclasses (e.g. UAnimGraphNode_CallFunction)
+    // rely on bespoke setup methods (SetupFromFunction, etc.) that populate
+    // members like InnerGraph *before* the node is ever duplicated/PostLoad'd.
+    // This generic pipeline only does NewObject + PerformAction's template
+    // duplication — it never calls that bespoke setup — so those classes'
+    // PostLoad()/BindDelegates() dereference a null InnerGraph and crash with
+    // an access violation in UEdGraph::AddOnGraphChangedHandler(), even when
+    // spawned on a legitimate AnimGraph (confirmed live: crashes identically
+    // on both EventGraph and a real AnimBlueprint's AnimGraph). Reject the
+    // whole family outright rather than guess which subclasses happen to be
+    // safe — SPAWN_NODE/SPAWN_NODE_IN_GRAPH do not support Anim Graph nodes.
+    if (FoundClass->IsChildOf(UAnimGraphNode_Base::StaticClass()))
+        return FString::Printf(
+            TEXT("ERR:Resolved class '%s' is an Anim Graph node — these require bespoke setup this command doesn't perform and can crash the editor if spawned via the generic template-duplication path. Not supported by SPAWN_NODE/SPAWN_NODE_IN_GRAPH."),
+            *FoundClass->GetName());
+
+    // Some UK2Node subclasses are only valid on a specific graph schema
+    // (e.g. Material/Sound/Niagara graph node classes that happen to derive
+    // from UK2Node) and could hit similar issues outside their intended
+    // schema. CanCreateUnderSpecifiedSchema is the same check the Blueprint
+    // editor's own node palette uses to filter actions per graph — ask the
+    // resolved class's CDO before ever constructing/duplicating it.
+    const UK2Node* FoundClassCDO = Cast<UK2Node>(FoundClass->GetDefaultObject());
+    if (!FoundClassCDO || !FoundClassCDO->CanCreateUnderSpecifiedSchema(Schema))
+        return FString::Printf(
+            TEXT("ERR:Resolved class '%s' is not valid on this graph (schema '%s') — it likely belongs to a different graph type. Use FIND_NODE_CLASS or a more specific NodeClass string to avoid ambiguous matches."),
+            *FoundClass->GetName(), *Schema->GetClass()->GetName());
 
     if (PartialMatches.Num() > 1)
         UE_LOG(LogGraphBridge, Warning, TEXT("GraphBridge SpawnNode: '%s' matched %d classes, using first: %s. Matches: %s"),
@@ -5597,6 +5693,491 @@ FString UGraphBridgeAutomationLibrary::CompileMaterial(FString MaterialPath)
     UE_LOG(LogGraphBridge, Log, TEXT("GraphBridge CompileMaterial: '%s' -> %s"),
         *MaterialPath, Entries.Num() > 0 ? TEXT("errors") : TEXT("clean"));
     return Entries.Num() > 0 ? FString::Join(Entries, TEXT("|")) : TEXT("CLEAN");
+}
+
+// ===========================================================================
+// Blueprint completeness — enums, structs, function libraries (v1.10)
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// CreateEnum
+// Command: CREATE_ENUM|AssetPath|Name1,Name2,Name3,...
+//
+// FEnumEditorUtils::CreateUserDefinedEnum mirrors CreateIMC/CreateBlueprint's
+// package-creation pattern. AddNewEnumeratorForUserDefinedEnum takes no name
+// argument — confirmed against Kismet2/EnumEditorUtils.cpp, it appends a new
+// enumerator with an auto-generated short name right before the implicit
+// _MAX sentinel, so immediately after the call the new enumerator's index is
+// Enum->NumEnums() - 2 (-1 for _MAX, -1 for 0-based). SetEnumeratorDisplayName
+// is what the Blueprint enum editor UI itself calls when you type a new name
+// into an enumerator row — it only touches the user-facing DisplayNameMap,
+// not the internal auto-generated short name, which is expected.
+// ---------------------------------------------------------------------------
+FString UGraphBridgeAutomationLibrary::CreateEnum(FString AssetPath, FString CommaSeparatedNames)
+{
+    if (AssetPath.IsEmpty())
+        return TEXT("ERR:AssetPath cannot be empty");
+
+    TArray<FString> Names;
+    CommaSeparatedNames.ParseIntoArray(Names, TEXT(","), /*bCullEmpty=*/true);
+    for (FString& Name : Names)
+        Name.TrimStartAndEndInline();
+    Names.RemoveAll([](const FString& N) { return N.IsEmpty(); });
+
+    if (Names.IsEmpty())
+        return TEXT("ERR:At least one enumerator name is required");
+
+    if (LoadObject<UUserDefinedEnum>(nullptr, *AssetPath))
+        return FString::Printf(TEXT("ERR:An Enum already exists at '%s'"), *AssetPath);
+
+    // Derive package name and asset name.
+    // Accept both /Game/Foo/Bar  and  /Game/Foo/Bar.Bar  forms.
+    FString PackageName = AssetPath;
+    FString AssetName;
+    int32 DotIdx;
+    if (PackageName.FindLastChar(TEXT('.'), DotIdx))
+    {
+        AssetName   = PackageName.Mid(DotIdx + 1);
+        PackageName = PackageName.Left(DotIdx);
+    }
+    else
+    {
+        int32 SlashIdx;
+        AssetName = PackageName.FindLastChar(TEXT('/'), SlashIdx)
+            ? PackageName.Mid(SlashIdx + 1)
+            : PackageName;
+    }
+    if (AssetName.IsEmpty())
+        return TEXT("ERR:Could not derive an asset name from the given path");
+
+    UPackage* NewPackage = CreatePackage(*PackageName);
+    if (!NewPackage)
+        return FString::Printf(TEXT("ERR:Failed to create package '%s'"), *PackageName);
+    NewPackage->FullyLoad();
+
+    const FScopedTransaction Transaction(
+        NSLOCTEXT("GraphBridge", "CreateEnum", "GraphBridge: Create Enum"));
+
+    UEnum* NewEnumBase = FEnumEditorUtils::CreateUserDefinedEnum(NewPackage, *AssetName, RF_Public | RF_Standalone | RF_Transactional);
+    UUserDefinedEnum* NewEnum = Cast<UUserDefinedEnum>(NewEnumBase);
+    if (!NewEnum)
+        return TEXT("ERR:FEnumEditorUtils::CreateUserDefinedEnum returned null");
+
+    for (const FString& Name : Names)
+    {
+        FEnumEditorUtils::AddNewEnumeratorForUserDefinedEnum(NewEnum);
+        const int32 NewIndex = NewEnum->NumEnums() - 2;
+        FEnumEditorUtils::SetEnumeratorDisplayName(NewEnum, NewIndex, FText::FromString(Name));
+    }
+
+    FAssetRegistryModule::AssetCreated(NewEnum);
+    NewPackage->MarkPackageDirty();
+
+    const FString PackageFilename = FPackageName::LongPackageNameToFilename(
+        PackageName, FPackageName::GetAssetPackageExtension());
+
+    FSavePackageArgs SaveArgs;
+    SaveArgs.TopLevelFlags = RF_Public | RF_Standalone;
+    SaveArgs.SaveFlags     = SAVE_NoError;
+
+    if (!UPackage::SavePackage(NewPackage, NewEnum, *PackageFilename, SaveArgs))
+        return FString::Printf(
+            TEXT("ERR:Enum created but failed to save to disk at '%s'"), *PackageFilename);
+
+    UE_LOG(LogGraphBridge, Log, TEXT("GraphBridge CreateEnum: '%s' with %d enumerator(s)"),
+        *AssetPath, Names.Num());
+    return PackageName + TEXT(".") + AssetName;
+}
+
+// ---------------------------------------------------------------------------
+// CreateStruct
+// Command: CREATE_STRUCT|AssetPath
+//
+// FStructureEditorUtils::CreateUserDefinedStruct already seeds one default
+// bool member internally (confirmed against Kismet2/StructureEditorUtils.cpp,
+// CreateUserDefinedStruct() itself calls AddVariable() once) — this is
+// intentional engine behavior (UUserDefinedStruct assumes at least one
+// variable exists in various editor code paths), not stripped out here.
+// ---------------------------------------------------------------------------
+FString UGraphBridgeAutomationLibrary::CreateStruct(FString AssetPath)
+{
+    if (AssetPath.IsEmpty())
+        return TEXT("ERR:AssetPath cannot be empty");
+
+    if (LoadObject<UUserDefinedStruct>(nullptr, *AssetPath))
+        return FString::Printf(TEXT("ERR:A Struct already exists at '%s'"), *AssetPath);
+
+    FString PackageName = AssetPath;
+    FString AssetName;
+    int32 DotIdx;
+    if (PackageName.FindLastChar(TEXT('.'), DotIdx))
+    {
+        AssetName   = PackageName.Mid(DotIdx + 1);
+        PackageName = PackageName.Left(DotIdx);
+    }
+    else
+    {
+        int32 SlashIdx;
+        AssetName = PackageName.FindLastChar(TEXT('/'), SlashIdx)
+            ? PackageName.Mid(SlashIdx + 1)
+            : PackageName;
+    }
+    if (AssetName.IsEmpty())
+        return TEXT("ERR:Could not derive an asset name from the given path");
+
+    UPackage* NewPackage = CreatePackage(*PackageName);
+    if (!NewPackage)
+        return FString::Printf(TEXT("ERR:Failed to create package '%s'"), *PackageName);
+    NewPackage->FullyLoad();
+
+    const FScopedTransaction Transaction(
+        NSLOCTEXT("GraphBridge", "CreateStruct", "GraphBridge: Create Struct"));
+
+    UUserDefinedStruct* NewStruct = FStructureEditorUtils::CreateUserDefinedStruct(
+        NewPackage, *AssetName, RF_Public | RF_Standalone | RF_Transactional);
+    if (!NewStruct)
+        return TEXT("ERR:FStructureEditorUtils::CreateUserDefinedStruct returned null");
+
+    FAssetRegistryModule::AssetCreated(NewStruct);
+    NewPackage->MarkPackageDirty();
+
+    const FString PackageFilename = FPackageName::LongPackageNameToFilename(
+        PackageName, FPackageName::GetAssetPackageExtension());
+
+    FSavePackageArgs SaveArgs;
+    SaveArgs.TopLevelFlags = RF_Public | RF_Standalone;
+    SaveArgs.SaveFlags     = SAVE_NoError;
+
+    if (!UPackage::SavePackage(NewPackage, NewStruct, *PackageFilename, SaveArgs))
+        return FString::Printf(
+            TEXT("ERR:Struct created but failed to save to disk at '%s'"), *PackageFilename);
+
+    UE_LOG(LogGraphBridge, Log, TEXT("GraphBridge CreateStruct: '%s'"), *AssetPath);
+    return PackageName + TEXT(".") + AssetName;
+}
+
+// ---------------------------------------------------------------------------
+// AddStructMember
+// Command: ADD_STRUCT_MEMBER|StructAssetPath|MemberName|MemberType
+//
+// FStructureEditorUtils::AddVariable appends a new FStructVariableDescription
+// to the end of GetVarDesc(Struct) with a fresh, freshly-generated Guid and
+// auto-generated name (confirmed against StructureEditorUtils.cpp) — so the
+// new variable's Guid is always GetVarDesc(Struct).Last().VarGuid immediately
+// after a successful AddVariable call. RenameVariable(Struct, Guid, NewName)
+// then renames it to the caller's requested MemberName. OnStructureChanged
+// (called inside AddVariable) already triggers CompileStructure internally,
+// so no separate compile step is needed here.
+// MemberType uses the same names as ResolveTypeString (SPAWN_VARIABLE/
+// ADD_VARIABLE) — reused rather than re-implementing the type mapping.
+// ---------------------------------------------------------------------------
+FString UGraphBridgeAutomationLibrary::AddStructMember(FString StructAssetPath, FString MemberName, FString MemberType)
+{
+    UUserDefinedStruct* Struct = LoadObject<UUserDefinedStruct>(nullptr, *StructAssetPath);
+    if (!Struct)
+        return FString::Printf(TEXT("ERR:Struct not found at '%s'"), *StructAssetPath);
+
+    if (MemberName.IsEmpty())
+        return TEXT("ERR:MemberName cannot be empty");
+
+    FEdGraphPinType PinType = ResolveTypeString(MemberType);
+    if (PinType.PinCategory == UEdGraphSchema_K2::PC_Wildcard)
+        return FString::Printf(TEXT("ERR:Unknown MemberType '%s'"), *MemberType);
+
+    const FScopedTransaction Transaction(
+        NSLOCTEXT("GraphBridge", "AddStructMember", "GraphBridge: Add Struct Member"));
+
+    if (!FStructureEditorUtils::AddVariable(Struct, PinType))
+        return TEXT("ERR:FStructureEditorUtils::AddVariable failed — check the type is supported for struct members");
+
+    const TArray<FStructVariableDescription>& VarDesc = FStructureEditorUtils::GetVarDesc(Struct);
+    if (VarDesc.Num() == 0)
+        return TEXT("ERR:AddVariable succeeded but no variable was found afterward");
+
+    const FGuid NewGuid = VarDesc.Last().VarGuid;
+    if (!FStructureEditorUtils::RenameVariable(Struct, NewGuid, MemberName))
+        return FString::Printf(
+            TEXT("ERR:Variable added but rename to '%s' failed (name may already be in use)"), *MemberName);
+
+    Struct->MarkPackageDirty();
+
+    UE_LOG(LogGraphBridge, Log, TEXT("GraphBridge AddStructMember: '%s' (%s) added to '%s'"),
+        *MemberName, *MemberType, *StructAssetPath);
+    return TEXT("");
+}
+
+// ---------------------------------------------------------------------------
+// CreateFunctionLibrary
+// Command: CREATE_FUNCTION_LIBRARY|AssetPath
+//
+// NOT a reuse of CreateBlueprint — that was tried first and rejected live
+// ("Cannot create a Blueprint based on class 'BlueprintFunctionLibrary'")
+// because UBlueprintFunctionLibrary has no IsBlueprintBase metadata, which
+// FKismetEditorUtilities::CanCreateBlueprintOfClass requires. Confirmed
+// against the engine's own UBlueprintFunctionLibraryFactory::FactoryCreateNew
+// (Editor/UnrealEd/Private/Factories/EditorFactories.cpp): it calls
+// FKismetEditorUtilities::CreateBlueprint directly with
+// BlueprintType = BPTYPE_FunctionLibrary, bypassing CanCreateBlueprintOfClass
+// entirely — this function does exactly the same thing.
+// ---------------------------------------------------------------------------
+FString UGraphBridgeAutomationLibrary::CreateFunctionLibrary(FString AssetPath)
+{
+    if (AssetPath.IsEmpty())
+        return TEXT("ERR:AssetPath cannot be empty");
+
+    if (LoadObject<UBlueprint>(nullptr, *AssetPath))
+        return FString::Printf(TEXT("ERR:A Blueprint already exists at '%s'"), *AssetPath);
+
+    FString PackageName = AssetPath;
+    FString AssetName;
+    int32 DotIdx;
+    if (PackageName.FindLastChar(TEXT('.'), DotIdx))
+    {
+        AssetName   = PackageName.Mid(DotIdx + 1);
+        PackageName = PackageName.Left(DotIdx);
+    }
+    else
+    {
+        int32 SlashIdx;
+        AssetName = PackageName.FindLastChar(TEXT('/'), SlashIdx)
+            ? PackageName.Mid(SlashIdx + 1)
+            : PackageName;
+    }
+    if (AssetName.IsEmpty())
+        return TEXT("ERR:Could not derive an asset name from the given path");
+
+    UPackage* NewPackage = CreatePackage(*PackageName);
+    if (!NewPackage)
+        return FString::Printf(TEXT("ERR:Failed to create package '%s'"), *PackageName);
+    NewPackage->FullyLoad();
+
+    const FScopedTransaction Transaction(
+        NSLOCTEXT("GraphBridge", "CreateFunctionLibrary", "GraphBridge: Create Function Library"));
+
+    UBlueprint* NewBP = FKismetEditorUtilities::CreateBlueprint(
+        UBlueprintFunctionLibrary::StaticClass(), NewPackage, FName(*AssetName), BPTYPE_FunctionLibrary,
+        UBlueprint::StaticClass(), UBlueprintGeneratedClass::StaticClass(), FName("GraphBridge"));
+    if (!NewBP)
+        return TEXT("ERR:FKismetEditorUtilities::CreateBlueprint returned null for BlueprintFunctionLibrary");
+
+    FAssetRegistryModule::AssetCreated(NewBP);
+    NewPackage->MarkPackageDirty();
+
+    const FString PackageFilename = FPackageName::LongPackageNameToFilename(
+        PackageName, FPackageName::GetAssetPackageExtension());
+
+    FSavePackageArgs SaveArgs;
+    SaveArgs.TopLevelFlags = RF_Public | RF_Standalone;
+    SaveArgs.SaveFlags     = SAVE_NoError;
+
+    if (!UPackage::SavePackage(NewPackage, NewBP, *PackageFilename, SaveArgs))
+        return FString::Printf(
+            TEXT("ERR:Function Library created but failed to save to disk at '%s'"), *PackageFilename);
+
+    UE_LOG(LogGraphBridge, Log, TEXT("GraphBridge CreateFunctionLibrary: '%s'"), *AssetPath);
+    return PackageName + TEXT(".") + AssetName;
+}
+
+// ---------------------------------------------------------------------------
+// AddLocalVariable
+// Command: ADD_LOCAL_VARIABLE|BPPath|FunctionGraphName|VarName|VarType|DefaultValue
+//
+// Adds a variable scoped to a single function graph via
+// FBlueprintEditorUtils::AddLocalVariable. FunctionGraphName is resolved via
+// FindGraphByName — the same lookup SPAWN_NODE_IN_GRAPH already uses.
+// ---------------------------------------------------------------------------
+FString UGraphBridgeAutomationLibrary::AddLocalVariable(FString BlueprintPath, FString FunctionGraphName,
+    FString VarName, FString VarType, FString DefaultValue)
+{
+    UBlueprint* Blueprint = GetBlueprintByPath(BlueprintPath);
+    if (!Blueprint)
+        return FString::Printf(TEXT("ERR:Blueprint not found at '%s'"), *BlueprintPath);
+
+    UEdGraph* Graph = FindGraphByName(Blueprint, FunctionGraphName);
+    if (!Graph)
+    {
+        TArray<FString> Available;
+        Available.Add(TEXT("EventGraph"));
+        for (UEdGraph* G : Blueprint->FunctionGraphs)
+            if (G) Available.Add(G->GetName());
+        return FString::Printf(
+            TEXT("ERR:Graph '%s' not found. Available graphs: %s"),
+            *FunctionGraphName, *FString::Join(Available, TEXT(", ")));
+    }
+
+    if (VarName.IsEmpty())
+        return TEXT("ERR:VarName cannot be empty");
+
+    FEdGraphPinType PinType = ResolveTypeString(VarType);
+    if (PinType.PinCategory == UEdGraphSchema_K2::PC_Wildcard)
+        return FString::Printf(TEXT("ERR:Unknown VarType '%s'"), *VarType);
+
+    const FScopedTransaction Transaction(
+        NSLOCTEXT("GraphBridge", "AddLocalVariable", "GraphBridge: Add Local Variable"));
+
+    const bool bOk = FBlueprintEditorUtils::AddLocalVariable(Blueprint, Graph, FName(*VarName), PinType, DefaultValue);
+    if (!bOk)
+        return FString::Printf(TEXT("ERR:AddLocalVariable failed for '%s' in graph '%s' — name may already be in use"),
+            *VarName, *FunctionGraphName);
+
+    UE_LOG(LogGraphBridge, Log, TEXT("GraphBridge AddLocalVariable: '%s' in '%s'"), *VarName, *FunctionGraphName);
+    return TEXT("");
+}
+
+// ---------------------------------------------------------------------------
+// SetVariableMetadata
+// Command: SET_VARIABLE_METADATA|BPPath|VarName|MetaKey|MetaValue
+//
+// Class (member) variables only. FBlueprintEditorUtils::SetBlueprintVariableMetaData
+// takes an InLocalVarScope parameter for local-variable metadata, but the
+// engine (as of this writing) silently drops metadata set that way at
+// compile time (Epic bug UE-239861, open) — always pass nullptr here and
+// do not extend this to local variables without first re-checking that bug.
+// ---------------------------------------------------------------------------
+FString UGraphBridgeAutomationLibrary::SetVariableMetadata(FString BlueprintPath, FString VarName,
+    FString MetaKey, FString MetaValue)
+{
+    UBlueprint* Blueprint = GetBlueprintByPath(BlueprintPath);
+    if (!Blueprint)
+        return FString::Printf(TEXT("ERR:Blueprint not found at '%s'"), *BlueprintPath);
+
+    if (VarName.IsEmpty())
+        return TEXT("ERR:VarName cannot be empty");
+    if (MetaKey.IsEmpty())
+        return TEXT("ERR:MetaKey cannot be empty");
+
+    const FName VarFName(*VarName);
+    const int32 VarIndex = FBlueprintEditorUtils::FindNewVariableIndex(Blueprint, VarFName);
+    if (VarIndex == INDEX_NONE)
+        return FString::Printf(
+            TEXT("ERR:Class variable '%s' not found — use LIST_VARIABLES to see available (local/function variables are not supported by this command)"),
+            *VarName);
+
+    const FScopedTransaction Transaction(
+        NSLOCTEXT("GraphBridge", "SetVariableMetadata", "GraphBridge: Set Variable Metadata"));
+
+    // "Category" is NOT stored in FBPVariableDescription::MetaDataArray like
+    // other metadata — it's a dedicated FText field on FBPVariableDescription
+    // with its own engine API. Confirmed live: the generic
+    // SetBlueprintVariableMetaData path silently writes it to the wrong
+    // place (round-trips fine through GetBlueprintVariableMetaData, but the
+    // Details panel's category widget never reads that — it calls
+    // FBlueprintEditorUtils::GetBlueprintVariableCategory(), per
+    // BlueprintDetailsCustomization.cpp). ToolTip and other generic keys do
+    // use the metadata-array path correctly.
+    if (MetaKey.Equals(TEXT("Category"), ESearchCase::IgnoreCase))
+        FBlueprintEditorUtils::SetBlueprintVariableCategory(Blueprint, VarFName, nullptr, FText::FromString(MetaValue));
+    else
+        FBlueprintEditorUtils::SetBlueprintVariableMetaData(Blueprint, VarFName, nullptr, FName(*MetaKey), MetaValue);
+
+    UE_LOG(LogGraphBridge, Log, TEXT("GraphBridge SetVariableMetadata: '%s' %s='%s'"), *VarName, *MetaKey, *MetaValue);
+    return TEXT("");
+}
+
+// ---------------------------------------------------------------------------
+// CreateEventDispatcher
+// Command: CREATE_EVENT_DISPATCHER|BPPath|DispatcherName|ParamType1:ParamName1,ParamType2:ParamName2,...
+//
+// Mirrors FBlueprintEditor::OnAddNewDelegate() exactly (confirmed against
+// Editor/Kismet/Private/BlueprintEditor.cpp — the engine's own "Add New"
+// button in the My Blueprint panel's Event Dispatchers section calls this
+// same sequence). Parameters are new — the engine's own default action adds
+// none — added afterward via the signature graph's entry node using
+// CreateUserDefinedPin(..., EGPD_Output, ...). EGPD_Output here is this
+// command's own addition, not verbatim engine source like the rest of this
+// function — confirmed live (not just by compiling) via a real
+// K2Node_CallDelegate referencing the dispatcher: the parameter correctly
+// appears as an IN pin on the caller (a caller must supply it), matching
+// real Event Dispatcher semantics, and the FunctionEntry node in the
+// dispatcher's own signature graph correctly shows it as an output pin.
+// ---------------------------------------------------------------------------
+FString UGraphBridgeAutomationLibrary::CreateEventDispatcher(FString BlueprintPath, FString DispatcherName,
+    FString CommaSeparatedParams)
+{
+    UBlueprint* Blueprint = GetBlueprintByPath(BlueprintPath);
+    if (!Blueprint)
+        return FString::Printf(TEXT("ERR:Blueprint not found at '%s'"), *BlueprintPath);
+
+    if (DispatcherName.IsEmpty())
+        return TEXT("ERR:DispatcherName cannot be empty");
+
+    const UEdGraphSchema_K2* K2Schema = GetDefault<UEdGraphSchema_K2>();
+    if (!K2Schema)
+        return TEXT("ERR:Could not get K2 schema");
+
+    // Parse "Type1:Name1,Type2:Name2,..." up front so a malformed parameter
+    // list fails cleanly before any state is mutated.
+    struct FParamSpec { FString Name; FEdGraphPinType PinType; };
+    TArray<FParamSpec> Params;
+    if (!CommaSeparatedParams.IsEmpty())
+    {
+        TArray<FString> Pairs;
+        CommaSeparatedParams.ParseIntoArray(Pairs, TEXT(","), true);
+        for (FString& Pair : Pairs)
+        {
+            Pair.TrimStartAndEndInline();
+            FString TypeStr, NameStr;
+            if (!Pair.Split(TEXT(":"), &TypeStr, &NameStr))
+                return FString::Printf(TEXT("ERR:Malformed parameter '%s' — expected Type:Name"), *Pair);
+            TypeStr.TrimStartAndEndInline();
+            NameStr.TrimStartAndEndInline();
+            if (NameStr.IsEmpty())
+                return FString::Printf(TEXT("ERR:Malformed parameter '%s' — empty parameter name"), *Pair);
+
+            FEdGraphPinType PinType = ResolveTypeString(TypeStr);
+            if (PinType.PinCategory == UEdGraphSchema_K2::PC_Wildcard)
+                return FString::Printf(TEXT("ERR:Unknown parameter type '%s' in '%s'"), *TypeStr, *Pair);
+
+            Params.Add(FParamSpec{ NameStr, PinType });
+        }
+    }
+
+    FName Name = FBlueprintEditorUtils::FindUniqueKismetName(Blueprint, DispatcherName);
+
+    const FScopedTransaction Transaction(
+        NSLOCTEXT("GraphBridge", "CreateEventDispatcher", "GraphBridge: Create Event Dispatcher"));
+    Blueprint->Modify();
+
+    FEdGraphPinType DelegateType;
+    DelegateType.PinCategory = UEdGraphSchema_K2::PC_MCDelegate;
+    const bool bVarCreatedSuccess = FBlueprintEditorUtils::AddMemberVariable(Blueprint, Name, DelegateType);
+    if (!bVarCreatedSuccess)
+        return TEXT("ERR:AddMemberVariable failed for the dispatcher's delegate variable");
+
+    UEdGraph* NewGraph = FBlueprintEditorUtils::CreateNewGraph(Blueprint, Name, UEdGraph::StaticClass(), UEdGraphSchema_K2::StaticClass());
+    if (!NewGraph)
+    {
+        FBlueprintEditorUtils::RemoveMemberVariable(Blueprint, Name);
+        return TEXT("ERR:CreateNewGraph failed for the dispatcher's signature graph");
+    }
+
+    NewGraph->bEditable = false;
+    K2Schema->CreateDefaultNodesForGraph(*NewGraph);
+    K2Schema->CreateFunctionGraphTerminators(*NewGraph, (UClass*)nullptr);
+    K2Schema->AddExtraFunctionFlags(NewGraph, (FUNC_BlueprintCallable | FUNC_BlueprintEvent | FUNC_Public));
+    K2Schema->MarkFunctionEntryAsEditable(NewGraph, true);
+
+    Blueprint->DelegateSignatureGraphs.Add(NewGraph);
+    FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
+
+    if (Params.Num() > 0)
+    {
+        TWeakObjectPtr<UK2Node_EditablePinBase> EntryNode, ResultNode;
+        FBlueprintEditorUtils::GetEntryAndResultNodes(NewGraph, EntryNode, ResultNode);
+        if (!EntryNode.IsValid())
+            return FString::Printf(TEXT("ERR:Dispatcher '%s' created but its entry node could not be found to add parameters"), *Name.ToString());
+
+        for (const FParamSpec& P : Params)
+        {
+            UEdGraphPin* NewPin = EntryNode->CreateUserDefinedPin(FName(*P.Name), P.PinType, EGPD_Output, true);
+            if (!NewPin)
+                return FString::Printf(TEXT("ERR:Dispatcher '%s' created but parameter '%s' could not be added"), *Name.ToString(), *P.Name);
+        }
+    }
+
+    UE_LOG(LogGraphBridge, Log, TEXT("GraphBridge CreateEventDispatcher: '%s' (%d params) in '%s'"),
+        *Name.ToString(), Params.Num(), *BlueprintPath);
+    return TEXT("");
 }
 
 #endif // WITH_EDITOR
