@@ -44,7 +44,31 @@ public class GraphBridgev2 : ModuleRules
                 "HTTPServer",
                 // UAnimGraphNode_Base — used only to reject Anim Graph node classes
                 // in SpawnNodeOnGraph's safety guard (see GraphBridgeAutomationLibrary.cpp).
-                "AnimGraph"
+                "AnimGraph",
+                // Niagara system/emitter creation and Stack Editor module
+                // inspection (CREATE_NIAGARA_SYSTEM/EMITTER, LIST_NIAGARA_MODULES,
+                // SET_NIAGARA_MODULE_INPUT). Runtime + Editor module both needed:
+                // Niagara for UNiagaraSystem/UNiagaraEmitter themselves,
+                // NiagaraEditor for the factories and Stack Editor ViewModel types.
+                "Niagara",
+                "NiagaraEditor",
+                // Physics Asset auto-generation (CREATE_PHYSICS_ASSET) —
+                // FPhysicsAssetUtils::CreateFromSkeletalMesh lives here, not in
+                // UnrealEd (confirmed: UPhysicsAssetFactory::CreatePhysicsAssetFromMesh
+                // itself is interactive-only, this is the real headless path it
+                // calls internally).
+                "PhysicsUtilities",
+                // IK Rig + IK Retargeter creation and scripting API
+                // (CREATE_IK_RIG, IK_RIG_AUTO_SETUP, ADD_IK_GOAL,
+                // ADD_RETARGET_CHAIN, CREATE_IK_RETARGETER). IKRig for the
+                // runtime asset types, IKRigEditor for UIKRigController /
+                // UIKRigDefinitionFactory / UIKRetargetFactory / UIKRetargeterController.
+                "IKRig",
+                "IKRigEditor",
+                // IAssetTools::CreateAsset — used for CREATE_IK_RETARGETER,
+                // matching the same pattern IKRigDefinitionFactory's own
+                // CreateNewIKRigAsset() uses internally.
+                "AssetTools"
             });
         }
 

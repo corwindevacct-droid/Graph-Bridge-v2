@@ -1,9 +1,9 @@
 {
 	"FileVersion": 3,
-	"Version": 12,
-	"VersionName": "1.1.0",
+	"Version": 13,
+	"VersionName": "1.2.0",
 	"FriendlyName": "GraphBridge AI",
-	"Description": "AI-powered Blueprint graph assistant. Works with Claude, GPT, or any WebSocket-capable AI agent to inspect, summarize, and manipulate your Blueprint graphs using natural language. Requires EnhancedInput and PythonScriptPlugin (both included with Unreal Engine - no separate installation needed).",
+	"Description": "The only Unreal AI bridge that checks its work. Build and verify Blueprints, Animation Blueprints, and full character rigs — from graph logic through skeletal mesh, physics, and IK — with real compile-error and pin-connection checks, not guesses. Works with Claude, GPT, or any WebSocket/MCP-capable AI agent. Requires EnhancedInput and PythonScriptPlugin (both included with Unreal Engine - no separate installation needed).",
 	"Category": "Editor Utilities",
 	"CreatedBy": "Corwin Hicks",
 	"CreatedByURL": "",
@@ -34,6 +34,14 @@
 		},
 		{
 			"Name": "PythonScriptPlugin",
+			"Enabled": true
+		},
+		{
+			"Name": "Niagara",
+			"Enabled": true
+		},
+		{
+			"Name": "IKRig",
 			"Enabled": true
 		}
 	],

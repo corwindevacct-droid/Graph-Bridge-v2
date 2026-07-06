@@ -150,6 +150,15 @@ private:
     // via SPAWN_NODE_IN_GRAPH inside a custom function graph.
     static UEdGraphNode* FindNodeByIdAllGraphs(UBlueprint* Blueprint, FString NodeId);
 
+    // Locates a previously-spawned UAnimGraphNode_StateMachineBase by GUID.
+    // State machine nodes live in a normal K2-schema AnimGraph, so
+    // FindNodeByIdAllGraphs already reaches them.
+    static class UAnimGraphNode_StateMachineBase* FindStateMachineNode(UBlueprint* Blueprint, const FString& NodeGUID);
+
+    // Locates a UAnimStateNodeBase (state or transition node) by GUID inside
+    // a specific state machine's EditorStateMachineGraph.
+    static class UAnimStateNodeBase* FindAnimStateNode(class UAnimGraphNode_StateMachineBase* MachineNode, const FString& NodeGUID);
+
     // SET_NODE_POSITION — moves a node to specific graph coordinates.
     // Returns empty string on success, "ERR:..." on failure.
     static FString SetNodePosition(FString BlueprintPath, FString NodeGUID, int32 X, int32 Y);
@@ -312,7 +321,6 @@ private:
     // MOVE_SKELETON_SOCKET takes loc (cm) and rot (degrees) in UE native units.
     // ------------------------------------------------------------------
     static FString ListSkeletonSockets(FString AssetPath);
-    static FString AddSkeletonSocket(FString AssetPath, FString SocketName, FString BoneName);
     static FString MoveSkeletonSocket(FString AssetPath, FString SocketName,
                                       FVector Location, FRotator Rotation);
     static FString DeleteSkeletonSocket(FString AssetPath, FString SocketName);
@@ -544,6 +552,220 @@ private:
     // Returns empty string on success, "ERR:..." on failure.
     static FString CreateEventDispatcher(FString BlueprintPath, FString DispatcherName,
         FString CommaSeparatedParams);
+
+    // ------------------------------------------------------------------
+    // Animation Blueprint state machines (v1.12)
+    // ------------------------------------------------------------------
+    // UAnimGraphNode_StateMachine derives from UAnimGraphNode_Base — the
+    // same hierarchy the SPAWN_NODE crash-guard rejects outright (see
+    // SpawnNodeOnGraph). That guard is correct for the general case
+    // (most UAnimGraphNode_Base subclasses need a bespoke setup call the
+    // generic template-duplication pipeline never performs), but confirmed
+    // against engine source that UAnimGraphNode_StateMachineBase is NOT one
+    // of those cases: its EditorStateMachineGraph is populated inside
+    // PostPlacedNewNode() itself (Editor/AnimGraph/Private/
+    // AnimGraphNode_StateMachineBase.cpp), which IS one of the standard
+    // lifecycle hooks a node-construction path calls — unlike
+    // UAnimGraphNode_CallFunction's InnerGraph, which only gets set by a
+    // separate SetupFromFunction() the generic pipeline never calls. These
+    // commands therefore use their OWN dedicated construction path (mirroring
+    // the existing K2Node_SpawnActorFromClass manual-construction pattern in
+    // SpawnNodeOnGraph) rather than reusing SpawnNode/SpawnNodeOnGraph, so the
+    // blanket Anim Graph guard there is never even consulted.
+
+    // CREATE_STATE_MACHINE — spawns a UAnimGraphNode_StateMachine into the
+    // named graph (typically "AnimGraph", resolved via the existing
+    // FindGraphByName) of an Animation Blueprint. Returns the new node's
+    // GUID on success, "ERR:..." on failure.
+    static FString CreateStateMachine(FString BlueprintPath, FString GraphName,
+        FString StateMachineName, int32 X, int32 Y);
+
+    // ADD_ANIM_STATE — adds a UAnimStateNode into a state machine's inner
+    // EditorStateMachineGraph via the confirmed real
+    // FEdGraphSchemaAction_NewStateNode::SpawnNodeFromTemplate<UAnimStateNode>
+    // pathway (Editor/AnimGraph/Public/AnimationStateMachineSchema.h) — unlike
+    // the K2 node path, this does NOT duplicate a template object at all
+    // (the template is added to the graph directly), so there is no
+    // StaticDuplicateObjectEx/PostLoad risk here.
+    // Returns the new state node's GUID on success, "ERR:..." on failure.
+    static FString AddAnimState(FString BlueprintPath, FString StateMachineNodeGUID,
+        FString StateName, int32 X, int32 Y);
+
+    // ADD_ANIM_TRANSITION — connects two existing states with a real
+    // UAnimStateTransitionNode. NOTE: UAnimationStateMachineSchema::
+    // TryCreateConnection alone (the API this task originally guessed at)
+    // only makes a plain pin-to-pin link — it does NOT create the transition
+    // node real state machines need. Confirmed against engine source
+    // (AnimationStateMachineSchema.cpp, CreateAutomaticConversionNodeAndConnections)
+    // that the real mechanism is: spawn a UAnimStateTransitionNode via
+    // SpawnNodeFromTemplate, then call its CreateConnections(FromState, ToState)
+    // — which takes the two state nodes directly, not pins.
+    // Returns the new transition node's GUID on success, "ERR:..." on failure.
+    static FString AddAnimTransition(FString BlueprintPath, FString StateMachineNodeGUID,
+        FString FromStateGUID, FString ToStateGUID);
+
+    // LIST_ANIM_STATES — lists all UAnimStateNodeBase-derived nodes inside a
+    // state machine's EditorStateMachineGraph. Returns comma-separated
+    // "GUID~StateName" entries, "ERR:..." on failure.
+    static FString ListAnimStates(FString BlueprintPath, FString StateMachineNodeGUID);
+
+    // GET_ANIM_STATE_TRANSITIONS — wraps UAnimStateNodeBase::GetTransitionList().
+    // Returns comma-separated "GUID~FromStateName~ToStateName" entries (one
+    // per transition connected to the given state), "ERR:..." on failure.
+    static FString GetAnimStateTransitions(FString BlueprintPath, FString StateNodeGUID);
+
+    // ------------------------------------------------------------------
+    // Niagara — scoped to what's confirmed real in this engine version
+    // (v1.12). Does NOT support adding modules/renderers to an emitter or
+    // building a VFX system from scratch — no confirmed API exists for
+    // that; see GraphBridgeAutomationLibrary.cpp for the investigation.
+    // ------------------------------------------------------------------
+
+    // CREATE_NIAGARA_SYSTEM — creates an empty Niagara System asset via the
+    // standard UNiagaraSystemFactoryNew (same shape as every other CREATE_
+    // command in this file). Returns the canonical asset path on success,
+    // "ERR:..." on failure.
+    static FString CreateNiagaraSystem(FString AssetPath);
+
+    // CREATE_NIAGARA_EMITTER — creates a Niagara Emitter asset via
+    // UNiagaraEmitterFactoryNew, with bAddDefaultModulesAndRenderersToEmptyEmitter
+    // = true so the result actually has real modules (EmitterState, SpawnRate,
+    // a sprite renderer, etc.) — confirmed against engine source
+    // (NiagaraEmitterFactoryNew.cpp) — this is what makes LIST_NIAGARA_MODULES/
+    // SET_NIAGARA_MODULE_INPUT usable without a separately-authored template.
+    // Returns the canonical asset path on success, "ERR:..." on failure.
+    static FString CreateNiagaraEmitter(FString AssetPath);
+
+    // LIST_NIAGARA_MODULES — lists module names in an emitter's Stack.
+    // Confirmed real headless usage pattern for FNiagaraSystemViewModel
+    // (constructed outside any open System Editor tab) against
+    // Editor/.../Commandlets/NiagaraSystemAuditCommandlet.cpp and
+    // Tests/NiagaraEditorTestUtilities.cpp — both construct one directly via
+    // MakeShared<FNiagaraSystemViewModel>() + Initialize(), the same pattern
+    // used here. Requires an emitter that already has modules (e.g. one
+    // created via CREATE_NIAGARA_EMITTER, which adds default modules).
+    // NOTE: only supports classic emitters (UNiagaraStackModuleItem) — the
+    // newer "Stateless Emitter" system (e.g. the "...Lightweight" templates)
+    // uses a parallel class hierarchy (UNiagaraStackStatelessModuleItem) this
+    // does not walk. Confirmed live: this matches what CREATE_NIAGARA_EMITTER
+    // actually produces (a classic emitter via UNiagaraEmitterFactoryNew), so
+    // this isn't a gap for the intended create-then-inspect workflow.
+    // Returns comma-separated module names, "ERR:..." on failure.
+    static FString ListNiagaraModules(FString SystemAssetPath, FString EmitterName);
+
+    // SET_NIAGARA_MODULE_INPUT — sets a module input's value. NOTE: this
+    // task's originally-assumed API (UUpgradeNiagaraScriptResults's
+    // SetFloatInput/SetIntInput/etc.) does NOT work outside its designed
+    // purpose — confirmed against engine source that those setters only
+    // mutate that class's own disconnected internal NewInputs array, never
+    // touching a live UNiagaraStackModuleItem. The real, live-connected write
+    // path used here instead: UNiagaraClipboardFunctionInput::CreateLocalValue
+    // (the same byte-packing technique UUpgradeNiagaraScriptResults uses
+    // internally) + UNiagaraStackModuleItem::SetInputValuesFromClipboardFunctionInputs
+    // (which actually applies the value to the live module). Supports float,
+    // int32, bool, and vec3 inputs (Value format for vec3: "X,Y,Z").
+    // Returns empty string on success, "ERR:..." on failure.
+    static FString SetNiagaraModuleInput(FString SystemAssetPath, FString EmitterName,
+        FString ModuleName, FString InputName, FString Value);
+
+    // ------------------------------------------------------------------
+    // Character pipeline — Physics Assets, IK Rig, Montage/BlendSpace,
+    // Skeleton sockets (v1.13)
+    // ------------------------------------------------------------------
+
+    // CREATE_PHYSICS_ASSET — auto-generates a Physics Asset from a
+    // SkeletalMesh. NOTE: does NOT call UPhysicsAssetFactory::
+    // CreatePhysicsAssetFromMesh — confirmed live-blocking: that function
+    // unconditionally opens an interactive "New Body" options modal dialog
+    // (IPhysicsAssetEditorModule::OpenNewBodyDlg) before doing anything,
+    // which would hang a bridge command waiting for a user click. Confirmed
+    // against its own source that the real body/constraint generation work
+    // happens in a separate, non-interactive function it calls internally —
+    // FPhysicsAssetUtils::CreateFromSkeletalMesh — which this command calls
+    // directly instead, using the same FPhysAssetCreateParams defaults
+    // (GetDefault<UPhysicsAssetGenerationSettings>()->CreateParams) the
+    // dialog would have pre-populated, then replicating the rest of the
+    // factory's post-creation steps (AssetCreated, MarkPackageDirty, and if
+    // bSetToMesh: RefreshSkelMeshOnPhysicsAssetChange to update any already-
+    // spawned components using this mesh).
+    // Returns the canonical asset path on success, "ERR:..." on failure.
+    static FString CreatePhysicsAsset(FString SkeletalMeshPath, FString AssetPath, bool bSetToMesh);
+
+    // CREATE_IK_RIG — creates a new IK Rig asset via the confirmed
+    // real, purpose-built UIKRigDefinitionFactory::CreateNewIKRigAsset()
+    // (a dedicated static scripting API, not hand-rolled factory
+    // boilerplate). That function does not take a skeletal mesh parameter,
+    // so the mesh is set immediately afterward via
+    // UIKRigController::GetController(NewRig)->SetSkeletalMesh().
+    // Returns the canonical asset path on success, "ERR:..." on failure.
+    static FString CreateIKRig(FString AssetPath, FString SkeletalMeshPath);
+
+    // IK_RIG_AUTO_SETUP — wraps UIKRigController::ApplyAutoFBIK(), which
+    // analyzes the skeleton against known templates and auto-generates a
+    // full solver/goal/chain setup in one call.
+    // Returns empty string on success, "ERR:..." on failure (including when
+    // ApplyAutoFBIK() itself returns false — the skeleton didn't match a
+    // known template).
+    static FString IKRigAutoSetup(FString IKRigAssetPath);
+
+    // ADD_IK_GOAL — wraps UIKRigController::AddNewGoal() + SetGoalBone()
+    // (AddNewGoal already takes the bone name directly, so SetGoalBone is
+    // only needed if reassigning an existing goal — not required here, but
+    // called anyway to explicitly confirm the bone stuck, matching the
+    // task's specified shape).
+    // Returns empty string on success, "ERR:..." on failure.
+    static FString AddIKGoal(FString IKRigAssetPath, FString GoalName, FString BoneName);
+
+    // ADD_RETARGET_CHAIN — wraps UIKRigController::AddRetargetChain(), which
+    // already takes ChainName/StartBone/EndBone/GoalName all in one call —
+    // confirmed against the header that the separate SetRetargetChainStartBone/
+    // EndBone/Goal setters are only needed to modify an EXISTING chain
+    // afterward, not for initial creation, so this doesn't call them.
+    // Returns empty string on success, "ERR:..." on failure.
+    static FString AddRetargetChain(FString IKRigAssetPath, FString ChainName,
+        FString StartBone, FString EndBone, FString GoalName);
+
+    // CREATE_IK_RETARGETER — creates a new IK Retargeter asset via
+    // UIKRetargetFactory (confirmed real, same NewObject+AssetTools::CreateAsset
+    // pattern as CreateNewIKRigAsset). The factory's own FactoryCreateNew
+    // does NOT set the source/target IK Rigs despite the factory having a
+    // SourceIKRig property (confirmed by reading its .cpp — that property is
+    // never referenced) — both are set afterward via
+    // UIKRetargeterController::SetIKRig(ERetargetSourceOrTarget::Source/Target, ...).
+    // Returns the canonical asset path on success, "ERR:..." on failure.
+    static FString CreateIKRetargeter(FString AssetPath, FString SourceIKRigPath, FString TargetIKRigPath);
+
+    // CREATE_ANIM_MONTAGE — creates a Montage via UAnimMontageFactory.
+    // Confirmed against the factory's .cpp that FactoryCreateNew does NOT
+    // need ConfigureProperties() (the interactive skeleton-picker step) —
+    // setting Factory->TargetSkeleton and/or Factory->SourceAnimation
+    // directly before calling FactoryCreateNew is sufficient and
+    // non-interactive. AnimSequencePath is optional (empty string skips it,
+    // producing an empty Montage on the given skeleton).
+    // Returns the canonical asset path on success, "ERR:..." on failure.
+    static FString CreateAnimMontage(FString AssetPath, FString SkeletonPath, FString AnimSequencePath);
+
+    // CREATE_BLEND_SPACE — creates a BlendSpace via UBlendSpaceFactoryNew.
+    // Confirmed against EditorFactories.cpp that FactoryCreateNew only
+    // requires Factory->TargetSkeleton to be set — non-interactive, same
+    // pattern as CreateAnimMontage.
+    // Returns the canonical asset path on success, "ERR:..." on failure.
+    static FString CreateBlendSpace(FString AssetPath, FString SkeletonPath);
+
+    // ADD_SKELETON_SOCKET — NOTE: USkeleton::AddSocket() does not exist —
+    // confirmed by searching the actual engine source that no such function
+    // is declared anywhere. The real mechanism (confirmed by reading
+    // USkeletalMesh::AddSocket()'s implementation, which optionally
+    // replicates a socket onto its Skeleton when bAddToSkeleton=true) is a
+    // direct, public TArray property: USkeleton::Sockets. This function
+    // replicates that same logic directly against the Skeleton asset,
+    // without requiring a SkeletalMesh at all: constructs a new
+    // USkeletalMeshSocket owned by the Skeleton, validates BoneName exists
+    // in the skeleton's reference skeleton, sets RelativeLocation from
+    // X/Y/Z, and appends it to Skeleton->Sockets.
+    // Returns empty string on success, "ERR:..." on failure.
+    static FString AddSkeletonSocket(FString SkeletonPath, FString SocketName, FString BoneName,
+        float X, float Y, float Z);
 
 #endif // WITH_EDITOR
 };

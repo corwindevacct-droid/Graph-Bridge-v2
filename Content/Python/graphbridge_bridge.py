@@ -697,3 +697,178 @@ class UnrealBridge:
         """
         params_str = ",".join(f"{t}:{n}" for t, n in (params or []))
         return await self._send_command(f"CREATE_EVENT_DISPATCHER|{bp_path}|{dispatcher_name}|{params_str}")
+
+    # ------------------------------------------------------------------
+    # Animation Blueprint state machines (v1.12)
+    # ------------------------------------------------------------------
+
+    async def create_state_machine(self, bp_path: str, graph_name: str,
+                                    state_machine_name: str, x: int, y: int) -> dict | None:
+        """
+        Spawn a state machine node (UAnimGraphNode_StateMachine) into the
+        named graph of an Animation Blueprint — graph_name is typically
+        "AnimGraph".
+
+        result["payload"] is the new node's GUID on success.
+        """
+        return await self._send_command(
+            f"CREATE_STATE_MACHINE|{bp_path}|{graph_name}|{state_machine_name}|{x}|{y}")
+
+    async def add_anim_state(self, bp_path: str, state_machine_node_guid: str,
+                              state_name: str, x: int, y: int) -> dict | None:
+        """
+        Add a state into an existing state machine.
+
+        result["payload"] is the new state node's GUID on success.
+        """
+        return await self._send_command(
+            f"ADD_ANIM_STATE|{bp_path}|{state_machine_node_guid}|{state_name}|{x}|{y}")
+
+    async def add_anim_transition(self, bp_path: str, state_machine_node_guid: str,
+                                   from_state_guid: str, to_state_guid: str) -> dict | None:
+        """
+        Connect two existing states with a transition.
+
+        result["payload"] is the new transition node's GUID on success.
+        """
+        return await self._send_command(
+            f"ADD_ANIM_TRANSITION|{bp_path}|{state_machine_node_guid}|{from_state_guid}|{to_state_guid}")
+
+    async def list_anim_states(self, bp_path: str, state_machine_node_guid: str) -> dict | None:
+        """
+        List all states in a state machine.
+
+        result["payload"] is comma-separated "GUID~StateName" entries.
+        """
+        return await self._send_command(f"LIST_ANIM_STATES|{bp_path}|{state_machine_node_guid}")
+
+    async def get_anim_state_transitions(self, bp_path: str, state_node_guid: str) -> dict | None:
+        """
+        List all transitions connected to a given state.
+
+        result["payload"] is comma-separated "GUID~FromStateName~ToStateName"
+        entries.
+        """
+        return await self._send_command(f"GET_ANIM_STATE_TRANSITIONS|{bp_path}|{state_node_guid}")
+
+    # ------------------------------------------------------------------
+    # Niagara — scoped to what's confirmed real in this engine version
+    # (v1.12). Does NOT support adding modules/renderers to an emitter or
+    # building a VFX system from scratch.
+    # ------------------------------------------------------------------
+
+    async def create_niagara_system(self, asset_path: str) -> dict | None:
+        """
+        Create an empty Niagara System asset.
+
+        result["payload"] is the canonical asset path on success.
+        """
+        return await self._send_command(f"CREATE_NIAGARA_SYSTEM|{asset_path}")
+
+    async def create_niagara_emitter(self, asset_path: str) -> dict | None:
+        """
+        Create a Niagara Emitter asset with default modules and a sprite
+        renderer already added (EmitterState, SpawnRate, etc.) — this is
+        what makes list_niagara_modules()/set_niagara_module_input() usable
+        without a separately-authored template emitter.
+
+        result["payload"] is the canonical asset path on success.
+        """
+        return await self._send_command(f"CREATE_NIAGARA_EMITTER|{asset_path}")
+
+    async def list_niagara_modules(self, system_asset_path: str, emitter_name: str) -> dict | None:
+        """
+        List module names in an emitter's Stack.
+
+        result["payload"] is a comma-separated list of module names.
+        """
+        return await self._send_command(f"LIST_NIAGARA_MODULES|{system_asset_path}|{emitter_name}")
+
+    async def set_niagara_module_input(self, system_asset_path: str, emitter_name: str,
+                                        module_name: str, input_name: str, value: str) -> dict | None:
+        """
+        Set a module input's value. Supports float, int32, bool, and vec3
+        inputs (vec3 value format: "X,Y,Z").
+        """
+        return await self._send_command(
+            f"SET_NIAGARA_MODULE_INPUT|{system_asset_path}|{emitter_name}|{module_name}|{input_name}|{value}")
+
+    # ------------------------------------------------------------------
+    # Character pipeline — Physics Assets, IK Rig, Montage/BlendSpace,
+    # Skeleton sockets (v1.13)
+    # ------------------------------------------------------------------
+
+    async def create_physics_asset(self, skeletal_mesh_path: str, asset_path: str,
+                                    set_to_mesh: bool = True) -> dict | None:
+        """
+        Auto-generate a Physics Asset from a SkeletalMesh's vertex weights.
+
+        set_to_mesh: if True, assigns the new Physics Asset back onto the
+        mesh's PhysicsAsset property and refreshes any spawned components.
+
+        result["payload"] is the canonical asset path on success.
+        """
+        return await self._send_command(
+            f"CREATE_PHYSICS_ASSET|{skeletal_mesh_path}|{asset_path}|{str(set_to_mesh).lower()}")
+
+    async def create_ik_rig(self, asset_path: str, skeletal_mesh_path: str) -> dict | None:
+        """
+        Create a new IK Rig asset targeting the given skeletal mesh.
+
+        result["payload"] is the canonical asset path on success.
+        """
+        return await self._send_command(f"CREATE_IK_RIG|{asset_path}|{skeletal_mesh_path}")
+
+    async def ik_rig_auto_setup(self, ik_rig_asset_path: str) -> dict | None:
+        """
+        Auto-generate a full solver/goal/chain IK setup for the rig's
+        skeleton in one call (UIKRigController::ApplyAutoFBIK()).
+        """
+        return await self._send_command(f"IK_RIG_AUTO_SETUP|{ik_rig_asset_path}")
+
+    async def add_ik_goal(self, ik_rig_asset_path: str, goal_name: str, bone_name: str) -> dict | None:
+        """Add a new IK Goal associated with the given bone."""
+        return await self._send_command(f"ADD_IK_GOAL|{ik_rig_asset_path}|{goal_name}|{bone_name}")
+
+    async def add_retarget_chain(self, ik_rig_asset_path: str, chain_name: str,
+                                  start_bone: str, end_bone: str, goal_name: str) -> dict | None:
+        """Add a new retarget chain spanning start_bone to end_bone."""
+        return await self._send_command(
+            f"ADD_RETARGET_CHAIN|{ik_rig_asset_path}|{chain_name}|{start_bone}|{end_bone}|{goal_name}")
+
+    async def create_ik_retargeter(self, asset_path: str, source_ik_rig_path: str,
+                                    target_ik_rig_path: str) -> dict | None:
+        """
+        Create a new IK Retargeter mapping animation from source_ik_rig_path's
+        skeleton to target_ik_rig_path's skeleton.
+
+        result["payload"] is the canonical asset path on success.
+        """
+        return await self._send_command(
+            f"CREATE_IK_RETARGETER|{asset_path}|{source_ik_rig_path}|{target_ik_rig_path}")
+
+    async def create_anim_montage(self, asset_path: str, skeleton_path: str,
+                                   anim_sequence_path: str = "") -> dict | None:
+        """
+        Create an Anim Montage on the given skeleton. anim_sequence_path is
+        optional — if given, becomes the montage's only contained sequence.
+
+        result["payload"] is the canonical asset path on success.
+        """
+        return await self._send_command(
+            f"CREATE_ANIM_MONTAGE|{asset_path}|{skeleton_path}|{anim_sequence_path}")
+
+    async def create_blend_space(self, asset_path: str, skeleton_path: str) -> dict | None:
+        """
+        Create a BlendSpace on the given skeleton.
+
+        result["payload"] is the canonical asset path on success.
+        """
+        return await self._send_command(f"CREATE_BLEND_SPACE|{asset_path}|{skeleton_path}")
+
+    async def add_skeleton_socket(self, skeleton_path: str, socket_name: str, bone_name: str,
+                                   x: float, y: float, z: float) -> dict | None:
+        """Add a new socket directly to a Skeleton asset (not a mesh)."""
+        return await self._send_command(
+            f"ADD_SKELETON_SOCKET|{skeleton_path}|{socket_name}|{bone_name}|{x}|{y}|{z}")
+

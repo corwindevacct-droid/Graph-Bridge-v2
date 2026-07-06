@@ -27,6 +27,38 @@
 #include "K2Node_EditablePinBase.h"
 #include "K2Node_SpawnActorFromClass.h"
 #include "AnimGraphNode_Base.h"
+#include "AnimGraphNode_StateMachine.h"
+#include "AnimationStateMachineGraph.h"
+#include "AnimationStateMachineSchema.h"
+#include "AnimStateNode.h"
+#include "AnimStateNodeBase.h"
+#include "AnimStateTransitionNode.h"
+#include "NiagaraSystemFactoryNew.h"
+#include "NiagaraEmitterFactoryNew.h"
+#include "NiagaraSystem.h"
+#include "NiagaraEmitter.h"
+#include "NiagaraClipboard.h"
+#include "NiagaraNodeFunctionCall.h"
+#include "ViewModels/NiagaraSystemViewModel.h"
+#include "ViewModels/NiagaraEmitterHandleViewModel.h"
+#include "ViewModels/Stack/NiagaraStackViewModel.h"
+#include "ViewModels/Stack/NiagaraStackModuleItem.h"
+#include "ViewModels/Stack/NiagaraStackFunctionInput.h"
+#include "Factories/PhysicsAssetFactory.h"
+#include "PhysicsAssetUtils.h"
+#include "PhysicsAssetGenerationSettings.h"
+#include "PhysicsEngine/PhysicsAsset.h"
+#include "RigEditor/IKRigDefinitionFactory.h"
+#include "RigEditor/IKRigController.h"
+#include "RetargetEditor/IKRetargetFactory.h"
+#include "RetargetEditor/IKRetargeterController.h"
+#include "Retargeter/IKRetargeter.h"
+#include "Rig/IKRigDefinition.h"
+#include "Factories/AnimMontageFactory.h"
+#include "Factories/BlendSpaceFactoryNew.h"
+#include "Animation/AnimSequence.h"
+#include "AssetToolsModule.h"
+#include "IAssetTools.h"
 #include "K2Node_VariableSet.h"
 #include "K2Node_Variable.h"
 #include "Editor.h"
@@ -711,14 +743,6 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommand(FString Command, ix::We
             bOk ? TEXT("Sockets listed") : Result.RightChop(4),
             bOk ? Result : TEXT(""));
     }
-    else if (Op == TEXT("ADD_SKELETON_SOCKET") && P.Num() >= 4)
-    {
-        // ADD_SKELETON_SOCKET|SkeletonAssetPath|SocketName|BoneName
-        FString Err = AddSkeletonSocket(P[1], P[2], P[3]);
-        bool bOk = Err.IsEmpty();
-        SendResponse(Sender, bOk, Op,
-            bOk ? TEXT("Socket added") : Err, TEXT(""));
-    }
     else if (Op == TEXT("MOVE_SKELETON_SOCKET") && P.Num() >= 9)
     {
         // MOVE_SKELETON_SOCKET|AssetPath|SocketName|LocX|LocY|LocZ|RotP|RotY|RotR
@@ -1207,6 +1231,166 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommand(FString Command, ix::We
         SendResponse(Sender, bOk, Op,
             bOk ? TEXT("Event dispatcher created") : Err.RightChop(4), TEXT(""));
     }
+    else if (Op == TEXT("CREATE_STATE_MACHINE") && P.Num() >= 6)
+    {
+        // CREATE_STATE_MACHINE|BPPath|GraphName|StateMachineName|X|Y
+        FString Result = CreateStateMachine(P[1], P[2], P[3], FCString::Atoi(*P[4]), FCString::Atoi(*P[5]));
+        bool bOk = !Result.StartsWith(TEXT("ERR:"));
+        SendResponse(Sender, bOk, Op,
+            bOk ? FString::Printf(TEXT("State machine node spawned: %s"), *Result) : Result.RightChop(4),
+            bOk ? Result : TEXT(""));
+    }
+    else if (Op == TEXT("ADD_ANIM_STATE") && P.Num() >= 6)
+    {
+        // ADD_ANIM_STATE|BPPath|StateMachineNodeGUID|StateName|X|Y
+        FString Result = AddAnimState(P[1], P[2], P[3], FCString::Atoi(*P[4]), FCString::Atoi(*P[5]));
+        bool bOk = !Result.StartsWith(TEXT("ERR:"));
+        SendResponse(Sender, bOk, Op,
+            bOk ? FString::Printf(TEXT("State node spawned: %s"), *Result) : Result.RightChop(4),
+            bOk ? Result : TEXT(""));
+    }
+    else if (Op == TEXT("ADD_ANIM_TRANSITION") && P.Num() >= 5)
+    {
+        // ADD_ANIM_TRANSITION|BPPath|StateMachineNodeGUID|FromStateGUID|ToStateGUID
+        FString Result = AddAnimTransition(P[1], P[2], P[3], P[4]);
+        bool bOk = !Result.StartsWith(TEXT("ERR:"));
+        SendResponse(Sender, bOk, Op,
+            bOk ? FString::Printf(TEXT("Transition node spawned: %s"), *Result) : Result.RightChop(4),
+            bOk ? Result : TEXT(""));
+    }
+    else if (Op == TEXT("LIST_ANIM_STATES") && P.Num() >= 3)
+    {
+        // LIST_ANIM_STATES|BPPath|StateMachineNodeGUID
+        FString Result = ListAnimStates(P[1], P[2]);
+        bool bOk = !Result.StartsWith(TEXT("ERR:"));
+        SendResponse(Sender, bOk, Op,
+            bOk ? TEXT("States listed") : Result.RightChop(4),
+            bOk ? Result : TEXT(""));
+    }
+    else if (Op == TEXT("GET_ANIM_STATE_TRANSITIONS") && P.Num() >= 3)
+    {
+        // GET_ANIM_STATE_TRANSITIONS|BPPath|StateNodeGUID
+        FString Result = GetAnimStateTransitions(P[1], P[2]);
+        bool bOk = !Result.StartsWith(TEXT("ERR:"));
+        SendResponse(Sender, bOk, Op,
+            bOk ? TEXT("Transitions listed") : Result.RightChop(4),
+            bOk ? Result : TEXT(""));
+    }
+    else if (Op == TEXT("CREATE_NIAGARA_SYSTEM") && P.Num() >= 2)
+    {
+        // CREATE_NIAGARA_SYSTEM|AssetPath
+        FString Result = CreateNiagaraSystem(P[1]);
+        bool bOk = !Result.StartsWith(TEXT("ERR:"));
+        SendResponse(Sender, bOk, Op,
+            bOk ? FString::Printf(TEXT("Niagara System created at '%s'"), *Result) : Result.RightChop(4),
+            bOk ? Result : TEXT(""));
+    }
+    else if (Op == TEXT("CREATE_NIAGARA_EMITTER") && P.Num() >= 2)
+    {
+        // CREATE_NIAGARA_EMITTER|AssetPath
+        FString Result = CreateNiagaraEmitter(P[1]);
+        bool bOk = !Result.StartsWith(TEXT("ERR:"));
+        SendResponse(Sender, bOk, Op,
+            bOk ? FString::Printf(TEXT("Niagara Emitter created at '%s'"), *Result) : Result.RightChop(4),
+            bOk ? Result : TEXT(""));
+    }
+    else if (Op == TEXT("LIST_NIAGARA_MODULES") && P.Num() >= 3)
+    {
+        // LIST_NIAGARA_MODULES|SystemAssetPath|EmitterName
+        FString Result = ListNiagaraModules(P[1], P[2]);
+        bool bOk = !Result.StartsWith(TEXT("ERR:"));
+        SendResponse(Sender, bOk, Op,
+            bOk ? TEXT("Modules listed") : Result.RightChop(4),
+            bOk ? Result : TEXT(""));
+    }
+    else if (Op == TEXT("SET_NIAGARA_MODULE_INPUT") && P.Num() >= 6)
+    {
+        // SET_NIAGARA_MODULE_INPUT|SystemAssetPath|EmitterName|ModuleName|InputName|Value
+        FString Err = SetNiagaraModuleInput(P[1], P[2], P[3], P[4], P[5]);
+        bool bOk = Err.IsEmpty();
+        SendResponse(Sender, bOk, Op,
+            bOk ? TEXT("Module input set") : Err.RightChop(4), TEXT(""));
+    }
+    else if (Op == TEXT("CREATE_PHYSICS_ASSET") && P.Num() >= 4)
+    {
+        // CREATE_PHYSICS_ASSET|SkeletalMeshPath|AssetPath|bSetToMesh
+        bool bSetToMesh = P[3].ToBool();
+        FString Result = CreatePhysicsAsset(P[1], P[2], bSetToMesh);
+        bool bOk = !Result.StartsWith(TEXT("ERR:"));
+        SendResponse(Sender, bOk, Op,
+            bOk ? FString::Printf(TEXT("Physics Asset created at '%s'"), *Result) : Result.RightChop(4),
+            bOk ? Result : TEXT(""));
+    }
+    else if (Op == TEXT("CREATE_IK_RIG") && P.Num() >= 3)
+    {
+        // CREATE_IK_RIG|AssetPath|SkeletalMeshPath
+        FString Result = CreateIKRig(P[1], P[2]);
+        bool bOk = !Result.StartsWith(TEXT("ERR:"));
+        SendResponse(Sender, bOk, Op,
+            bOk ? FString::Printf(TEXT("IK Rig created at '%s'"), *Result) : Result.RightChop(4),
+            bOk ? Result : TEXT(""));
+    }
+    else if (Op == TEXT("IK_RIG_AUTO_SETUP") && P.Num() >= 2)
+    {
+        // IK_RIG_AUTO_SETUP|IKRigAssetPath
+        FString Err = IKRigAutoSetup(P[1]);
+        bool bOk = Err.IsEmpty();
+        SendResponse(Sender, bOk, Op,
+            bOk ? TEXT("IK Rig auto setup applied") : Err.RightChop(4), TEXT(""));
+    }
+    else if (Op == TEXT("ADD_IK_GOAL") && P.Num() >= 4)
+    {
+        // ADD_IK_GOAL|IKRigAssetPath|GoalName|BoneName
+        FString Err = AddIKGoal(P[1], P[2], P[3]);
+        bool bOk = Err.IsEmpty();
+        SendResponse(Sender, bOk, Op,
+            bOk ? TEXT("IK Goal added") : Err.RightChop(4), TEXT(""));
+    }
+    else if (Op == TEXT("ADD_RETARGET_CHAIN") && P.Num() >= 6)
+    {
+        // ADD_RETARGET_CHAIN|IKRigAssetPath|ChainName|StartBone|EndBone|GoalName
+        FString Err = AddRetargetChain(P[1], P[2], P[3], P[4], P[5]);
+        bool bOk = Err.IsEmpty();
+        SendResponse(Sender, bOk, Op,
+            bOk ? TEXT("Retarget chain added") : Err.RightChop(4), TEXT(""));
+    }
+    else if (Op == TEXT("CREATE_IK_RETARGETER") && P.Num() >= 4)
+    {
+        // CREATE_IK_RETARGETER|AssetPath|SourceIKRigPath|TargetIKRigPath
+        FString Result = CreateIKRetargeter(P[1], P[2], P[3]);
+        bool bOk = !Result.StartsWith(TEXT("ERR:"));
+        SendResponse(Sender, bOk, Op,
+            bOk ? FString::Printf(TEXT("IK Retargeter created at '%s'"), *Result) : Result.RightChop(4),
+            bOk ? Result : TEXT(""));
+    }
+    else if (Op == TEXT("CREATE_ANIM_MONTAGE") && P.Num() >= 3)
+    {
+        // CREATE_ANIM_MONTAGE|AssetPath|SkeletonPath|AnimSequencePath
+        FString AnimSeq = P.Num() >= 4 ? P[3] : TEXT("");
+        FString Result = CreateAnimMontage(P[1], P[2], AnimSeq);
+        bool bOk = !Result.StartsWith(TEXT("ERR:"));
+        SendResponse(Sender, bOk, Op,
+            bOk ? FString::Printf(TEXT("Anim Montage created at '%s'"), *Result) : Result.RightChop(4),
+            bOk ? Result : TEXT(""));
+    }
+    else if (Op == TEXT("CREATE_BLEND_SPACE") && P.Num() >= 3)
+    {
+        // CREATE_BLEND_SPACE|AssetPath|SkeletonPath
+        FString Result = CreateBlendSpace(P[1], P[2]);
+        bool bOk = !Result.StartsWith(TEXT("ERR:"));
+        SendResponse(Sender, bOk, Op,
+            bOk ? FString::Printf(TEXT("BlendSpace created at '%s'"), *Result) : Result.RightChop(4),
+            bOk ? Result : TEXT(""));
+    }
+    else if (Op == TEXT("ADD_SKELETON_SOCKET") && P.Num() >= 7)
+    {
+        // ADD_SKELETON_SOCKET|SkeletonPath|SocketName|BoneName|X|Y|Z
+        FString Err = AddSkeletonSocket(P[1], P[2], P[3],
+            FCString::Atof(*P[4]), FCString::Atof(*P[5]), FCString::Atof(*P[6]));
+        bool bOk = Err.IsEmpty();
+        SendResponse(Sender, bOk, Op,
+            bOk ? TEXT("Skeleton socket added") : Err.RightChop(4), TEXT(""));
+    }
     else
     {
         UE_LOG(LogGraphBridge, Warning, TEXT("GraphBridge: Unknown or malformed command: %s"), *Command);
@@ -1605,6 +1789,29 @@ UEdGraphNode* UGraphBridgeAutomationLibrary::FindNodeByIdAllGraphs(UBlueprint* B
 }
 
 // ---------------------------------------------------------------------------
+// FindStateMachineNode — see header comment.
+// ---------------------------------------------------------------------------
+UAnimGraphNode_StateMachineBase* UGraphBridgeAutomationLibrary::FindStateMachineNode(UBlueprint* Blueprint, const FString& NodeGUID)
+{
+    UEdGraphNode* Node = FindNodeByIdAllGraphs(Blueprint, NodeGUID);
+    return Cast<UAnimGraphNode_StateMachineBase>(Node);
+}
+
+// ---------------------------------------------------------------------------
+// FindAnimStateNode — see header comment.
+// ---------------------------------------------------------------------------
+UAnimStateNodeBase* UGraphBridgeAutomationLibrary::FindAnimStateNode(UAnimGraphNode_StateMachineBase* MachineNode, const FString& NodeGUID)
+{
+    if (!MachineNode || !MachineNode->EditorStateMachineGraph) return nullptr;
+    for (UEdGraphNode* Node : MachineNode->EditorStateMachineGraph->Nodes)
+    {
+        if (!Node) continue;
+        if (Node->NodeGuid.ToString() == NodeGUID) return Cast<UAnimStateNodeBase>(Node);
+    }
+    return nullptr;
+}
+
+// ---------------------------------------------------------------------------
 // SetNodePosition
 // Command: SET_NODE_POSITION|BPPath|NodeGUID|X|Y
 // Moves a node to specific coordinates. Searches EventGraph + FunctionGraphs.
@@ -1734,23 +1941,36 @@ bool UGraphBridgeAutomationLibrary::DisconnectPins(FString BlueprintPath,
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// DeleteNode
+// Command: DELETE_NODE|BPPath|NodeGUID
+//
+// Uses FindNodeByIdAllGraphs (UbergraphPages + FunctionGraphs) rather than
+// the narrower FindNodeById/FindNodeByName pair (EventGraph only) — the
+// original bug this fixes: a node in AnimGraph (which lives in
+// FunctionGraphs, same as CREATE_FUNCTION graphs) could never be found here.
+//
+// Uses FBlueprintEditorUtils::RemoveNode(Blueprint, Node) rather than a raw
+// Graph->RemoveNode(Node) call — confirmed against engine source that
+// UEdGraph::RemoveNode() ONLY removes the node from the graph's Nodes array;
+// it never calls Node->DestroyNode(). FBlueprintEditorUtils::RemoveNode DOES
+// call DestroyNode() (plus breakpoint/pin-watch cleanup, BreakNodeLinks via
+// schema). This matters a lot for state machine nodes specifically:
+// UAnimGraphNode_StateMachineBase::DestroyNode() is what actually removes
+// its EditorStateMachineGraph sub-graph — skipping it (the original bug)
+// would silently orphan that sub-graph in the package instead of deleting it.
+// ---------------------------------------------------------------------------
 bool UGraphBridgeAutomationLibrary::DeleteNode(FString BlueprintPath, FString NodeId)
 {
     UBlueprint* Blueprint = GetBlueprintByPath(BlueprintPath);
     if (!Blueprint) return false;
 
-    UEdGraphNode* Node = FindNodeById(Blueprint, NodeId);
-    if (!Node) Node = FindNodeByName(Blueprint, NodeId);
+    UEdGraphNode* Node = FindNodeByIdAllGraphs(Blueprint, NodeId);
     if (!Node) return false;
 
-    UEdGraph* Graph = Node->GetGraph();
-    if (!Graph) return false;
-
     const FScopedTransaction Transaction(NSLOCTEXT("GraphBridge", "DeleteNode", "GraphBridge: Delete Node"));
-    Graph->Modify();
-    Node->Modify();
-    Graph->RemoveNode(Node);
-    FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
+    FBlueprintEditorUtils::RemoveNode(Blueprint, Node);
+    FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
     return true;
 }
 
@@ -3412,51 +3632,6 @@ FString UGraphBridgeAutomationLibrary::ListSkeletonSockets(FString AssetPath)
     }
     Json += TEXT("]");
     return Json;
-}
-
-// ---------------------------------------------------------------------------
-// AddSkeletonSocket
-// Command: ADD_SKELETON_SOCKET|SkeletonAssetPath|SocketName|BoneName
-// Position defaults to bone origin — use MOVE_SKELETON_SOCKET to place it.
-// ---------------------------------------------------------------------------
-FString UGraphBridgeAutomationLibrary::AddSkeletonSocket(
-    FString AssetPath, FString SocketName, FString BoneName)
-{
-    USkeleton* Skeleton = LoadObject<USkeleton>(nullptr, *AssetPath);
-    if (!Skeleton)
-        return FString::Printf(TEXT("ERR:Skeleton not found at '%s'"), *AssetPath);
-    if (SocketName.IsEmpty())
-        return TEXT("ERR:SocketName cannot be empty");
-    if (BoneName.IsEmpty())
-        return TEXT("ERR:BoneName cannot be empty");
-
-    // Guard: duplicate name
-    for (const USkeletalMeshSocket* S : Skeleton->Sockets)
-        if (S && S->SocketName == FName(*SocketName))
-            return FString::Printf(TEXT("ERR:Socket '%s' already exists"), *SocketName);
-
-    // Guard: bone must exist on the skeleton
-    if (Skeleton->GetReferenceSkeleton().FindBoneIndex(FName(*BoneName)) == INDEX_NONE)
-        return FString::Printf(TEXT("ERR:Bone '%s' not found on skeleton"), *BoneName);
-
-    const FScopedTransaction Transaction(
-        NSLOCTEXT("GraphBridge", "AddSkeletonSocket", "GraphBridge: Add Skeleton Socket"));
-    Skeleton->Modify();
-
-    USkeletalMeshSocket* NewSocket = NewObject<USkeletalMeshSocket>(
-        Skeleton, NAME_None, RF_Transactional);
-    NewSocket->SocketName       = FName(*SocketName);
-    NewSocket->BoneName         = FName(*BoneName);
-    NewSocket->RelativeLocation = FVector::ZeroVector;
-    NewSocket->RelativeRotation = FRotator::ZeroRotator;
-    NewSocket->RelativeScale    = FVector::OneVector;
-
-    Skeleton->Sockets.Add(NewSocket);
-    Skeleton->MarkPackageDirty();
-
-    UE_LOG(LogGraphBridge, Log, TEXT("GraphBridge AddSkeletonSocket: '%s' on bone '%s'"),
-        *SocketName, *BoneName);
-    return TEXT("");
 }
 
 // ---------------------------------------------------------------------------
@@ -6177,6 +6352,1035 @@ FString UGraphBridgeAutomationLibrary::CreateEventDispatcher(FString BlueprintPa
 
     UE_LOG(LogGraphBridge, Log, TEXT("GraphBridge CreateEventDispatcher: '%s' (%d params) in '%s'"),
         *Name.ToString(), Params.Num(), *BlueprintPath);
+    return TEXT("");
+}
+
+// ---------------------------------------------------------------------------
+// Animation Blueprint state machines
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// CreateStateMachine
+// Command: CREATE_STATE_MACHINE|BPPath|GraphName|StateMachineName|X|Y
+//
+// Dedicated construction path — does NOT reuse SpawnNode/SpawnNodeOnGraph,
+// since that function's crash-guard blanket-rejects all UAnimGraphNode_Base
+// subclasses. Confirmed via engine source that UAnimGraphNode_StateMachine
+// doesn't have the bespoke-setup problem that guard protects against (see
+// header comment for the full explanation) — its EditorStateMachineGraph is
+// populated inside the standard PostPlacedNewNode() lifecycle hook, which
+// this manual construction sequence already calls, mirroring the existing
+// K2Node_SpawnActorFromClass special case in SpawnNodeOnGraph.
+// ---------------------------------------------------------------------------
+FString UGraphBridgeAutomationLibrary::CreateStateMachine(FString BlueprintPath, FString GraphName,
+    FString StateMachineName, int32 X, int32 Y)
+{
+    UBlueprint* Blueprint = GetBlueprintByPath(BlueprintPath);
+    if (!Blueprint)
+        return FString::Printf(TEXT("ERR:Blueprint not found at '%s'"), *BlueprintPath);
+
+    UEdGraph* Graph = FindGraphByName(Blueprint, GraphName);
+    if (!Graph)
+    {
+        TArray<FString> Available;
+        Available.Add(TEXT("EventGraph"));
+        for (UEdGraph* G : Blueprint->FunctionGraphs)
+            if (G) Available.Add(G->GetName());
+        return FString::Printf(
+            TEXT("ERR:Graph '%s' not found. Available graphs: %s"),
+            *GraphName, *FString::Join(Available, TEXT(", ")));
+    }
+
+    if (StateMachineName.IsEmpty())
+        return TEXT("ERR:StateMachineName cannot be empty");
+
+    const FScopedTransaction Transaction(
+        NSLOCTEXT("GraphBridge", "CreateStateMachine", "GraphBridge: Create State Machine"));
+    Graph->Modify();
+
+    UAnimGraphNode_StateMachine* NewNode = NewObject<UAnimGraphNode_StateMachine>(
+        Graph, UAnimGraphNode_StateMachine::StaticClass(), NAME_None, RF_Transactional);
+    NewNode->CreateNewGuid();
+    NewNode->NodePosX = X;
+    NewNode->NodePosY = Y;
+    Graph->AddNode(NewNode, /*bFromUI=*/false, /*bSelectNewNode=*/false);
+    NewNode->AllocateDefaultPins();
+    NewNode->PostPlacedNewNode();
+
+    if (!NewNode->EditorStateMachineGraph)
+        return TEXT("ERR:State machine node created but EditorStateMachineGraph was not populated — PostPlacedNewNode may not have run correctly");
+
+    FBlueprintEditorUtils::RenameGraph(NewNode->EditorStateMachineGraph, StateMachineName);
+    FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
+
+    UE_LOG(LogGraphBridge, Log, TEXT("GraphBridge CreateStateMachine: '%s' in '%s'"), *StateMachineName, *GraphName);
+    return NewNode->NodeGuid.ToString();
+}
+
+// ---------------------------------------------------------------------------
+// AddAnimState
+// Command: ADD_ANIM_STATE|BPPath|StateMachineNodeGUID|StateName|X|Y
+// ---------------------------------------------------------------------------
+FString UGraphBridgeAutomationLibrary::AddAnimState(FString BlueprintPath, FString StateMachineNodeGUID,
+    FString StateName, int32 X, int32 Y)
+{
+    UBlueprint* Blueprint = GetBlueprintByPath(BlueprintPath);
+    if (!Blueprint)
+        return FString::Printf(TEXT("ERR:Blueprint not found at '%s'"), *BlueprintPath);
+
+    UAnimGraphNode_StateMachineBase* MachineNode = FindStateMachineNode(Blueprint, StateMachineNodeGUID);
+    if (!MachineNode)
+        return FString::Printf(TEXT("ERR:State machine node not found: '%s' — use LIST_NODES to get valid GUIDs"), *StateMachineNodeGUID);
+    if (!MachineNode->EditorStateMachineGraph)
+        return TEXT("ERR:State machine node has no EditorStateMachineGraph");
+
+    if (StateName.IsEmpty())
+        return TEXT("ERR:StateName cannot be empty");
+
+    const FScopedTransaction Transaction(
+        NSLOCTEXT("GraphBridge", "AddAnimState", "GraphBridge: Add Anim State"));
+
+    UAnimStateNode* NewStateNode = FEdGraphSchemaAction_NewStateNode::SpawnNodeFromTemplate<UAnimStateNode>(
+        MachineNode->EditorStateMachineGraph, NewObject<UAnimStateNode>(), FVector2f((float)X, (float)Y), false);
+    if (!NewStateNode)
+        return TEXT("ERR:SpawnNodeFromTemplate returned null for UAnimStateNode");
+    if (!NewStateNode->BoundGraph)
+        return TEXT("ERR:State node created but its BoundGraph was not populated");
+
+    FBlueprintEditorUtils::RenameGraph(NewStateNode->BoundGraph, StateName);
+    FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
+
+    UE_LOG(LogGraphBridge, Log, TEXT("GraphBridge AddAnimState: '%s' in state machine '%s'"), *StateName, *StateMachineNodeGUID);
+    return NewStateNode->NodeGuid.ToString();
+}
+
+// ---------------------------------------------------------------------------
+// AddAnimTransition
+// Command: ADD_ANIM_TRANSITION|BPPath|StateMachineNodeGUID|FromStateGUID|ToStateGUID
+// See header comment — TryCreateConnection alone is NOT sufficient; the real
+// transition-node creation is SpawnNodeFromTemplate<UAnimStateTransitionNode>
+// + CreateConnections(FromState, ToState).
+// ---------------------------------------------------------------------------
+FString UGraphBridgeAutomationLibrary::AddAnimTransition(FString BlueprintPath, FString StateMachineNodeGUID,
+    FString FromStateGUID, FString ToStateGUID)
+{
+    UBlueprint* Blueprint = GetBlueprintByPath(BlueprintPath);
+    if (!Blueprint)
+        return FString::Printf(TEXT("ERR:Blueprint not found at '%s'"), *BlueprintPath);
+
+    UAnimGraphNode_StateMachineBase* MachineNode = FindStateMachineNode(Blueprint, StateMachineNodeGUID);
+    if (!MachineNode)
+        return FString::Printf(TEXT("ERR:State machine node not found: '%s'"), *StateMachineNodeGUID);
+    if (!MachineNode->EditorStateMachineGraph)
+        return TEXT("ERR:State machine node has no EditorStateMachineGraph");
+
+    UAnimStateNodeBase* FromState = FindAnimStateNode(MachineNode, FromStateGUID);
+    if (!FromState)
+        return FString::Printf(TEXT("ERR:FromState node not found: '%s' — use LIST_ANIM_STATES to get valid GUIDs"), *FromStateGUID);
+
+    UAnimStateNodeBase* ToState = FindAnimStateNode(MachineNode, ToStateGUID);
+    if (!ToState)
+        return FString::Printf(TEXT("ERR:ToState node not found: '%s' — use LIST_ANIM_STATES to get valid GUIDs"), *ToStateGUID);
+
+    const FScopedTransaction Transaction(
+        NSLOCTEXT("GraphBridge", "AddAnimTransition", "GraphBridge: Add Anim Transition"));
+
+    UAnimStateTransitionNode* TransitionNode = FEdGraphSchemaAction_NewStateNode::SpawnNodeFromTemplate<UAnimStateTransitionNode>(
+        MachineNode->EditorStateMachineGraph, NewObject<UAnimStateTransitionNode>(), FVector2f(0.0f, 0.0f), false);
+    if (!TransitionNode)
+        return TEXT("ERR:SpawnNodeFromTemplate returned null for UAnimStateTransitionNode");
+
+    TransitionNode->CreateConnections(FromState, ToState);
+    FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
+
+    UE_LOG(LogGraphBridge, Log, TEXT("GraphBridge AddAnimTransition: '%s' -> '%s' in state machine '%s'"),
+        *FromStateGUID, *ToStateGUID, *StateMachineNodeGUID);
+    return TransitionNode->NodeGuid.ToString();
+}
+
+// ---------------------------------------------------------------------------
+// ListAnimStates
+// Command: LIST_ANIM_STATES|BPPath|StateMachineNodeGUID
+// Returns comma-separated "GUID~StateName" entries for every
+// UAnimStateNodeBase-derived node in the machine (this includes plain
+// states, conduits, and entry nodes — all derive from UAnimStateNodeBase).
+// ---------------------------------------------------------------------------
+FString UGraphBridgeAutomationLibrary::ListAnimStates(FString BlueprintPath, FString StateMachineNodeGUID)
+{
+    UBlueprint* Blueprint = GetBlueprintByPath(BlueprintPath);
+    if (!Blueprint)
+        return FString::Printf(TEXT("ERR:Blueprint not found at '%s'"), *BlueprintPath);
+
+    UAnimGraphNode_StateMachineBase* MachineNode = FindStateMachineNode(Blueprint, StateMachineNodeGUID);
+    if (!MachineNode)
+        return FString::Printf(TEXT("ERR:State machine node not found: '%s'"), *StateMachineNodeGUID);
+    if (!MachineNode->EditorStateMachineGraph)
+        return TEXT("ERR:State machine node has no EditorStateMachineGraph");
+
+    TArray<FString> Entries;
+    for (UEdGraphNode* Node : MachineNode->EditorStateMachineGraph->Nodes)
+    {
+        UAnimStateNodeBase* StateNode = Cast<UAnimStateNodeBase>(Node);
+        if (!StateNode) continue;
+        // Transition nodes are also UAnimStateNodeBase-derived but represent
+        // edges, not states — exclude them from the state list.
+        if (Cast<UAnimStateTransitionNode>(StateNode)) continue;
+        Entries.Add(FString::Printf(TEXT("%s~%s"), *StateNode->NodeGuid.ToString(), *StateNode->GetStateName()));
+    }
+
+    return FString::Join(Entries, TEXT(","));
+}
+
+// ---------------------------------------------------------------------------
+// GetAnimStateTransitions
+// Command: GET_ANIM_STATE_TRANSITIONS|BPPath|StateNodeGUID
+// Wraps UAnimStateNodeBase::GetTransitionList(). Returns comma-separated
+// "GUID~FromStateName~ToStateName" entries. Note StateNodeGUID must be
+// searched across ALL state machines in the Blueprint's AnimGraph(s), since
+// the command doesn't take a StateMachineNodeGUID — this mirrors LIST_NODES'
+// GUID-only lookup convention elsewhere in this file.
+// ---------------------------------------------------------------------------
+FString UGraphBridgeAutomationLibrary::GetAnimStateTransitions(FString BlueprintPath, FString StateNodeGUID)
+{
+    UBlueprint* Blueprint = GetBlueprintByPath(BlueprintPath);
+    if (!Blueprint)
+        return FString::Printf(TEXT("ERR:Blueprint not found at '%s'"), *BlueprintPath);
+
+    TArray<UEdGraph*> AllGraphs;
+    AllGraphs.Append(Blueprint->UbergraphPages);
+    AllGraphs.Append(Blueprint->FunctionGraphs);
+
+    UAnimStateNodeBase* TargetState = nullptr;
+    for (UEdGraph* Graph : AllGraphs)
+    {
+        if (!Graph) continue;
+        for (UEdGraphNode* Node : Graph->Nodes)
+        {
+            UAnimGraphNode_StateMachineBase* MachineNode = Cast<UAnimGraphNode_StateMachineBase>(Node);
+            if (!MachineNode || !MachineNode->EditorStateMachineGraph) continue;
+            TargetState = FindAnimStateNode(MachineNode, StateNodeGUID);
+            if (TargetState) break;
+        }
+        if (TargetState) break;
+    }
+
+    if (!TargetState)
+        return FString::Printf(TEXT("ERR:State node not found: '%s' — use LIST_ANIM_STATES to get valid GUIDs"), *StateNodeGUID);
+
+    TArray<UAnimStateTransitionNode*> Transitions;
+    TargetState->GetTransitionList(Transitions);
+
+    TArray<FString> Entries;
+    for (UAnimStateTransitionNode* Transition : Transitions)
+    {
+        if (!Transition) continue;
+        UAnimStateNodeBase* PrevState = Transition->GetPreviousState();
+        UAnimStateNodeBase* NextState = Transition->GetNextState();
+        Entries.Add(FString::Printf(TEXT("%s~%s~%s"),
+            *Transition->NodeGuid.ToString(),
+            PrevState ? *PrevState->GetStateName() : TEXT("?"),
+            NextState ? *NextState->GetStateName() : TEXT("?")));
+    }
+
+    return FString::Join(Entries, TEXT(","));
+}
+
+// ---------------------------------------------------------------------------
+// Niagara
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// DeriveAssetPathParts — shared by CreateNiagaraSystem/CreateNiagaraEmitter,
+// same derivation logic already used by CreateEnum/CreateStruct/
+// CreateFunctionLibrary (accepts "/Game/Foo/Bar" or "/Game/Foo/Bar.Bar").
+// ---------------------------------------------------------------------------
+static bool DeriveAssetPathParts(const FString& AssetPath, FString& OutPackageName, FString& OutAssetName)
+{
+    OutPackageName = AssetPath;
+    int32 DotIdx;
+    if (OutPackageName.FindLastChar(TEXT('.'), DotIdx))
+    {
+        OutAssetName = OutPackageName.Mid(DotIdx + 1);
+        OutPackageName = OutPackageName.Left(DotIdx);
+    }
+    else
+    {
+        int32 SlashIdx;
+        OutAssetName = OutPackageName.FindLastChar(TEXT('/'), SlashIdx)
+            ? OutPackageName.Mid(SlashIdx + 1)
+            : OutPackageName;
+    }
+    return !OutAssetName.IsEmpty();
+}
+
+// ---------------------------------------------------------------------------
+// SaveExistingAssetPackage — persists an already-loaded asset's package to
+// disk immediately after an in-place mutation (MarkPackageDirty() alone only
+// lives in memory — a crash or ungraceful editor exit before the next
+// autosave/manual save silently discards the change, as happened to
+// IKRigAutoSetup's ApplyAutoFBIK() results here). Mirrors the SavePackage
+// block every CreateXxx command in this file already uses.
+// ---------------------------------------------------------------------------
+static bool SaveExistingAssetPackage(UObject* Asset, FString& OutError)
+{
+    UPackage* Package = Asset->GetOutermost();
+    const FString PackageFilename = FPackageName::LongPackageNameToFilename(
+        Package->GetName(), FPackageName::GetAssetPackageExtension());
+
+    FSavePackageArgs SaveArgs;
+    SaveArgs.TopLevelFlags = RF_Public | RF_Standalone;
+    SaveArgs.SaveFlags     = SAVE_NoError;
+
+    if (!UPackage::SavePackage(Package, Asset, *PackageFilename, SaveArgs))
+    {
+        OutError = FString::Printf(TEXT("ERR:Change applied but failed to save to disk at '%s'"), *PackageFilename);
+        return false;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// CreateNiagaraSystem
+// Command: CREATE_NIAGARA_SYSTEM|AssetPath
+// ---------------------------------------------------------------------------
+FString UGraphBridgeAutomationLibrary::CreateNiagaraSystem(FString AssetPath)
+{
+    if (AssetPath.IsEmpty())
+        return TEXT("ERR:AssetPath cannot be empty");
+    if (LoadObject<UNiagaraSystem>(nullptr, *AssetPath))
+        return FString::Printf(TEXT("ERR:A Niagara System already exists at '%s'"), *AssetPath);
+
+    FString PackageName, AssetName;
+    if (!DeriveAssetPathParts(AssetPath, PackageName, AssetName))
+        return TEXT("ERR:Could not derive an asset name from the given path");
+
+    UPackage* NewPackage = CreatePackage(*PackageName);
+    if (!NewPackage)
+        return FString::Printf(TEXT("ERR:Failed to create package '%s'"), *PackageName);
+    NewPackage->FullyLoad();
+
+    const FScopedTransaction Transaction(
+        NSLOCTEXT("GraphBridge", "CreateNiagaraSystem", "GraphBridge: Create Niagara System"));
+
+    UNiagaraSystemFactoryNew* Factory = NewObject<UNiagaraSystemFactoryNew>();
+    UNiagaraSystem* NewSystem = Cast<UNiagaraSystem>(Factory->FactoryCreateNew(
+        UNiagaraSystem::StaticClass(), NewPackage, FName(*AssetName), RF_Public | RF_Standalone, nullptr, GWarn));
+    if (!NewSystem)
+        return TEXT("ERR:UNiagaraSystemFactoryNew::FactoryCreateNew returned null");
+
+    FAssetRegistryModule::AssetCreated(NewSystem);
+    NewPackage->MarkPackageDirty();
+
+    const FString PackageFilename = FPackageName::LongPackageNameToFilename(
+        PackageName, FPackageName::GetAssetPackageExtension());
+
+    FSavePackageArgs SaveArgs;
+    SaveArgs.TopLevelFlags = RF_Public | RF_Standalone;
+    SaveArgs.SaveFlags     = SAVE_NoError;
+
+    if (!UPackage::SavePackage(NewPackage, NewSystem, *PackageFilename, SaveArgs))
+        return FString::Printf(TEXT("ERR:Niagara System created but failed to save to disk at '%s'"), *PackageFilename);
+
+    UE_LOG(LogGraphBridge, Log, TEXT("GraphBridge CreateNiagaraSystem: '%s'"), *AssetPath);
+    return PackageName + TEXT(".") + AssetName;
+}
+
+// ---------------------------------------------------------------------------
+// CreateNiagaraEmitter
+// Command: CREATE_NIAGARA_EMITTER|AssetPath
+// ---------------------------------------------------------------------------
+FString UGraphBridgeAutomationLibrary::CreateNiagaraEmitter(FString AssetPath)
+{
+    if (AssetPath.IsEmpty())
+        return TEXT("ERR:AssetPath cannot be empty");
+    if (LoadObject<UNiagaraEmitter>(nullptr, *AssetPath))
+        return FString::Printf(TEXT("ERR:A Niagara Emitter already exists at '%s'"), *AssetPath);
+
+    FString PackageName, AssetName;
+    if (!DeriveAssetPathParts(AssetPath, PackageName, AssetName))
+        return TEXT("ERR:Could not derive an asset name from the given path");
+
+    UPackage* NewPackage = CreatePackage(*PackageName);
+    if (!NewPackage)
+        return FString::Printf(TEXT("ERR:Failed to create package '%s'"), *PackageName);
+    NewPackage->FullyLoad();
+
+    const FScopedTransaction Transaction(
+        NSLOCTEXT("GraphBridge", "CreateNiagaraEmitter", "GraphBridge: Create Niagara Emitter"));
+
+    UNiagaraEmitterFactoryNew* Factory = NewObject<UNiagaraEmitterFactoryNew>();
+    Factory->bAddDefaultModulesAndRenderersToEmptyEmitter = true;
+    UNiagaraEmitter* NewEmitter = Cast<UNiagaraEmitter>(Factory->FactoryCreateNew(
+        UNiagaraEmitter::StaticClass(), NewPackage, FName(*AssetName), RF_Public | RF_Standalone, nullptr, GWarn));
+    if (!NewEmitter)
+        return TEXT("ERR:UNiagaraEmitterFactoryNew::FactoryCreateNew returned null");
+
+    FAssetRegistryModule::AssetCreated(NewEmitter);
+    NewPackage->MarkPackageDirty();
+
+    const FString PackageFilename = FPackageName::LongPackageNameToFilename(
+        PackageName, FPackageName::GetAssetPackageExtension());
+
+    FSavePackageArgs SaveArgs;
+    SaveArgs.TopLevelFlags = RF_Public | RF_Standalone;
+    SaveArgs.SaveFlags     = SAVE_NoError;
+
+    if (!UPackage::SavePackage(NewPackage, NewEmitter, *PackageFilename, SaveArgs))
+        return FString::Printf(TEXT("ERR:Niagara Emitter created but failed to save to disk at '%s'"), *PackageFilename);
+
+    UE_LOG(LogGraphBridge, Log, TEXT("GraphBridge CreateNiagaraEmitter: '%s'"), *AssetPath);
+    return PackageName + TEXT(".") + AssetName;
+}
+
+// ---------------------------------------------------------------------------
+// BuildEmitterStackViewModel — shared by ListNiagaraModules/SetNiagaraModuleInput.
+// Constructs a headless FNiagaraSystemViewModel (no open System Editor tab
+// required) — confirmed real pattern against
+// Commandlets/NiagaraSystemAuditCommandlet.cpp and
+// Tests/NiagaraEditorTestUtilities.cpp, both of which build one exactly this
+// way for non-interactive use. The caller must keep OutSystemViewModelKeepAlive
+// alive for as long as the returned UNiagaraStackViewModel is used.
+// ---------------------------------------------------------------------------
+static UNiagaraStackViewModel* BuildEmitterStackViewModel(const FString& SystemAssetPath, const FString& EmitterName,
+    TSharedPtr<FNiagaraSystemViewModel>& OutSystemViewModelKeepAlive, FString& OutError)
+{
+    UNiagaraSystem* System = LoadObject<UNiagaraSystem>(nullptr, *SystemAssetPath);
+    if (!System)
+    {
+        OutError = FString::Printf(TEXT("ERR:Niagara System not found at '%s'"), *SystemAssetPath);
+        return nullptr;
+    }
+
+    FNiagaraSystemViewModelOptions Options;
+    Options.bCanSimulate = false;
+    Options.bCanAutoCompile = false;
+    // bIsForDataProcessingOnly deliberately left false (its default) — unlike
+    // the commandlet, this needs real edit-mode Stack population (module
+    // listing came back empty with it true) and, for SET_NIAGARA_MODULE_INPUT,
+    // an actually-editable input. NiagaraEditorTestUtilities.cpp's headless
+    // test pattern (also confirmed real, non-interactive) leaves this false.
+    // Confirmed-crashing without this: FNiagaraMessageManager asserts
+    // "MessageAssetKey != FGuid()" inside Initialize()->RefreshAll() if
+    // MessageLogGuid isn't set — NiagaraSystemAuditCommandlet.cpp sets this
+    // to the system's own asset GUID, which is what's replicated here.
+    Options.MessageLogGuid = System->GetAssetGuid();
+
+    OutSystemViewModelKeepAlive = MakeShared<FNiagaraSystemViewModel>();
+    OutSystemViewModelKeepAlive->Initialize(*System, Options);
+
+    for (const TSharedRef<FNiagaraEmitterHandleViewModel>& HandleVM : OutSystemViewModelKeepAlive->GetEmitterHandleViewModels())
+    {
+        if (HandleVM->GetName().ToString() == EmitterName)
+        {
+            UNiagaraStackViewModel* StackViewModel = HandleVM->GetEmitterStackViewModel();
+            if (!StackViewModel || !StackViewModel->GetRootEntry())
+            {
+                OutError = TEXT("ERR:Could not get emitter's Stack ViewModel");
+                return nullptr;
+            }
+            StackViewModel->GetRootEntry()->RefreshChildren();
+            return StackViewModel;
+        }
+    }
+
+    TArray<FString> Available;
+    for (const TSharedRef<FNiagaraEmitterHandleViewModel>& HandleVM : OutSystemViewModelKeepAlive->GetEmitterHandleViewModels())
+        Available.Add(HandleVM->GetName().ToString());
+    OutError = FString::Printf(TEXT("ERR:Emitter '%s' not found in system '%s'. Available emitters: %s"),
+        *EmitterName, *SystemAssetPath, *FString::Join(Available, TEXT(", ")));
+    return nullptr;
+}
+
+// ---------------------------------------------------------------------------
+// ListNiagaraModules
+// Command: LIST_NIAGARA_MODULES|SystemAssetPath|EmitterName
+// ---------------------------------------------------------------------------
+FString UGraphBridgeAutomationLibrary::ListNiagaraModules(FString SystemAssetPath, FString EmitterName)
+{
+    if (SystemAssetPath.IsEmpty()) return TEXT("ERR:SystemAssetPath cannot be empty");
+    if (EmitterName.IsEmpty()) return TEXT("ERR:EmitterName cannot be empty");
+
+    TSharedPtr<FNiagaraSystemViewModel> SystemViewModelKeepAlive;
+    FString Error;
+    UNiagaraStackViewModel* StackViewModel = BuildEmitterStackViewModel(SystemAssetPath, EmitterName, SystemViewModelKeepAlive, Error);
+    if (!StackViewModel) return Error;
+
+    TArray<UNiagaraStackModuleItem*> ModuleItems;
+    StackViewModel->GetRootEntry()->GetUnfilteredChildrenOfType<UNiagaraStackModuleItem>(ModuleItems, /*bRecursive=*/true);
+
+    TArray<FString> Names;
+    for (UNiagaraStackModuleItem* ModuleItem : ModuleItems)
+    {
+        if (!ModuleItem) continue;
+        Names.Add(ModuleItem->GetModuleNode().GetFunctionName());
+    }
+
+    return FString::Join(Names, TEXT(","));
+}
+
+// ---------------------------------------------------------------------------
+// SetNiagaraModuleInput
+// Command: SET_NIAGARA_MODULE_INPUT|SystemAssetPath|EmitterName|ModuleName|InputName|Value
+// See header comment for why this does NOT use UUpgradeNiagaraScriptResults.
+// ---------------------------------------------------------------------------
+FString UGraphBridgeAutomationLibrary::SetNiagaraModuleInput(FString SystemAssetPath, FString EmitterName,
+    FString ModuleName, FString InputName, FString Value)
+{
+    if (SystemAssetPath.IsEmpty()) return TEXT("ERR:SystemAssetPath cannot be empty");
+    if (EmitterName.IsEmpty()) return TEXT("ERR:EmitterName cannot be empty");
+    if (ModuleName.IsEmpty()) return TEXT("ERR:ModuleName cannot be empty");
+    if (InputName.IsEmpty()) return TEXT("ERR:InputName cannot be empty");
+
+    TSharedPtr<FNiagaraSystemViewModel> SystemViewModelKeepAlive;
+    FString Error;
+    UNiagaraStackViewModel* StackViewModel = BuildEmitterStackViewModel(SystemAssetPath, EmitterName, SystemViewModelKeepAlive, Error);
+    if (!StackViewModel) return Error;
+
+    TArray<UNiagaraStackModuleItem*> ModuleItems;
+    StackViewModel->GetRootEntry()->GetUnfilteredChildrenOfType<UNiagaraStackModuleItem>(ModuleItems, /*bRecursive=*/true);
+
+    UNiagaraStackModuleItem* TargetModule = nullptr;
+    TArray<FString> AvailableModules;
+    for (UNiagaraStackModuleItem* ModuleItem : ModuleItems)
+    {
+        if (!ModuleItem) continue;
+        FString Name = ModuleItem->GetModuleNode().GetFunctionName();
+        AvailableModules.Add(Name);
+        if (Name == ModuleName) { TargetModule = ModuleItem; break; }
+    }
+    if (!TargetModule)
+        return FString::Printf(TEXT("ERR:Module '%s' not found — use LIST_NIAGARA_MODULES to see available (%s)"),
+            *ModuleName, *FString::Join(AvailableModules, TEXT(", ")));
+
+    TArray<UNiagaraStackFunctionInput*> Inputs;
+    TargetModule->GetParameterInputs(Inputs);
+
+    UNiagaraStackFunctionInput* TargetInput = nullptr;
+    for (UNiagaraStackFunctionInput* Input : Inputs)
+    {
+        if (Input && Input->GetInputParameterHandle().GetName().ToString() == InputName)
+        {
+            TargetInput = Input;
+            break;
+        }
+    }
+    if (!TargetInput)
+        return FString::Printf(TEXT("ERR:Input '%s' not found on module '%s'"), *InputName, *ModuleName);
+
+    const FNiagaraTypeDefinition& Type = TargetInput->GetInputType();
+    TArray<uint8> LocalData;
+
+    if (Type == FNiagaraTypeDefinition::GetFloatDef())
+    {
+        float V = FCString::Atof(*Value);
+        LocalData.SetNumZeroed(sizeof(float));
+        FMemory::Memcpy(LocalData.GetData(), &V, sizeof(float));
+    }
+    else if (Type == FNiagaraTypeDefinition::GetIntDef())
+    {
+        int32 V = FCString::Atoi(*Value);
+        LocalData.SetNumZeroed(sizeof(int32));
+        FMemory::Memcpy(LocalData.GetData(), &V, sizeof(int32));
+    }
+    else if (Type == FNiagaraTypeDefinition::GetBoolDef())
+    {
+        FNiagaraBool V;
+        V.SetValue(Value.ToBool());
+        LocalData.SetNumZeroed(sizeof(FNiagaraBool));
+        FMemory::Memcpy(LocalData.GetData(), &V, sizeof(FNiagaraBool));
+    }
+    else if (Type == FNiagaraTypeDefinition::GetVec3Def())
+    {
+        TArray<FString> Parts;
+        Value.ParseIntoArray(Parts, TEXT(","), true);
+        if (Parts.Num() < 3)
+            return FString::Printf(TEXT("ERR:vec3 Value must be 'X,Y,Z' — got '%s'"), *Value);
+        FVector3f V(FCString::Atof(*Parts[0]), FCString::Atof(*Parts[1]), FCString::Atof(*Parts[2]));
+        LocalData.SetNumZeroed(sizeof(FVector3f));
+        FMemory::Memcpy(LocalData.GetData(), &V, sizeof(FVector3f));
+    }
+    else
+    {
+        return FString::Printf(TEXT("ERR:Unsupported input type for '%s' — SET_NIAGARA_MODULE_INPUT currently supports float, int32, bool, vec3 ('X,Y,Z')"), *InputName);
+    }
+
+    const UNiagaraClipboardFunctionInput* ClipboardInput = UNiagaraClipboardFunctionInput::CreateLocalValue(
+        TargetModule, TargetInput->GetInputParameterHandle().GetName(), Type, TOptional<bool>(), LocalData);
+    if (!ClipboardInput)
+        return TEXT("ERR:UNiagaraClipboardFunctionInput::CreateLocalValue failed");
+
+    TargetModule->SetInputValuesFromClipboardFunctionInputs({ ClipboardInput });
+
+    UE_LOG(LogGraphBridge, Log, TEXT("GraphBridge SetNiagaraModuleInput: '%s'.'%s' = '%s' on emitter '%s'"),
+        *ModuleName, *InputName, *Value, *EmitterName);
+    return TEXT("");
+}
+
+// ---------------------------------------------------------------------------
+// Character pipeline — Physics Assets, IK Rig, Montage/BlendSpace, sockets
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// CreatePhysicsAsset
+// Command: CREATE_PHYSICS_ASSET|SkeletalMeshPath|AssetPath|bSetToMesh
+// See header comment — bypasses UPhysicsAssetFactory::CreatePhysicsAssetFromMesh
+// entirely (interactive-only) in favor of the non-interactive
+// FPhysicsAssetUtils::CreateFromSkeletalMesh it calls internally.
+// ---------------------------------------------------------------------------
+FString UGraphBridgeAutomationLibrary::CreatePhysicsAsset(FString SkeletalMeshPath, FString AssetPath, bool bSetToMesh)
+{
+    if (SkeletalMeshPath.IsEmpty()) return TEXT("ERR:SkeletalMeshPath cannot be empty");
+    if (AssetPath.IsEmpty()) return TEXT("ERR:AssetPath cannot be empty");
+
+    USkeletalMesh* SkelMesh = LoadObject<USkeletalMesh>(nullptr, *SkeletalMeshPath);
+    if (!SkelMesh)
+        return FString::Printf(TEXT("ERR:Skeletal Mesh not found at '%s'"), *SkeletalMeshPath);
+
+    if (LoadObject<UPhysicsAsset>(nullptr, *AssetPath))
+        return FString::Printf(TEXT("ERR:A Physics Asset already exists at '%s'"), *AssetPath);
+
+    FString PackageName, AssetName;
+    if (!DeriveAssetPathParts(AssetPath, PackageName, AssetName))
+        return TEXT("ERR:Could not derive an asset name from the given path");
+
+    UPackage* NewPackage = CreatePackage(*PackageName);
+    if (!NewPackage)
+        return FString::Printf(TEXT("ERR:Failed to create package '%s'"), *PackageName);
+    NewPackage->FullyLoad();
+
+    const FScopedTransaction Transaction(
+        NSLOCTEXT("GraphBridge", "CreatePhysicsAsset", "GraphBridge: Create Physics Asset"));
+
+    UPhysicsAsset* NewAsset = NewObject<UPhysicsAsset>(NewPackage, *AssetName, RF_Public | RF_Standalone | RF_Transactional);
+    if (!NewAsset)
+        return TEXT("ERR:Failed to construct UPhysicsAsset object");
+
+    FText ErrorMessage;
+    const FPhysAssetCreateParams& CreateParams = GetDefault<UPhysicsAssetGenerationSettings>()->CreateParams;
+    const bool bSuccess = FPhysicsAssetUtils::CreateFromSkeletalMesh(NewAsset, SkelMesh, CreateParams, ErrorMessage, bSetToMesh);
+    if (!bSuccess)
+        return FString::Printf(TEXT("ERR:FPhysicsAssetUtils::CreateFromSkeletalMesh failed: %s"), *ErrorMessage.ToString());
+
+    NewAsset->MarkPackageDirty();
+    FAssetRegistryModule::AssetCreated(NewAsset);
+
+    if (bSetToMesh)
+    {
+        RefreshSkelMeshOnPhysicsAssetChange(SkelMesh);
+        SkelMesh->MarkPackageDirty();
+    }
+
+    const FString PackageFilename = FPackageName::LongPackageNameToFilename(
+        PackageName, FPackageName::GetAssetPackageExtension());
+
+    FSavePackageArgs SaveArgs;
+    SaveArgs.TopLevelFlags = RF_Public | RF_Standalone;
+    SaveArgs.SaveFlags     = SAVE_NoError;
+
+    if (!UPackage::SavePackage(NewPackage, NewAsset, *PackageFilename, SaveArgs))
+        return FString::Printf(TEXT("ERR:Physics Asset created but failed to save to disk at '%s'"), *PackageFilename);
+
+    UE_LOG(LogGraphBridge, Log, TEXT("GraphBridge CreatePhysicsAsset: '%s' from '%s'"), *AssetPath, *SkeletalMeshPath);
+    return PackageName + TEXT(".") + AssetName;
+}
+
+// ---------------------------------------------------------------------------
+// CreateIKRig
+// Command: CREATE_IK_RIG|AssetPath|SkeletalMeshPath
+// ---------------------------------------------------------------------------
+FString UGraphBridgeAutomationLibrary::CreateIKRig(FString AssetPath, FString SkeletalMeshPath)
+{
+    if (AssetPath.IsEmpty()) return TEXT("ERR:AssetPath cannot be empty");
+    if (SkeletalMeshPath.IsEmpty()) return TEXT("ERR:SkeletalMeshPath cannot be empty");
+
+    USkeletalMesh* SkelMesh = LoadObject<USkeletalMesh>(nullptr, *SkeletalMeshPath);
+    if (!SkelMesh)
+        return FString::Printf(TEXT("ERR:Skeletal Mesh not found at '%s'"), *SkeletalMeshPath);
+
+    if (LoadObject<UIKRigDefinition>(nullptr, *AssetPath))
+        return FString::Printf(TEXT("ERR:An IK Rig already exists at '%s'"), *AssetPath);
+
+    FString PackageName, AssetName;
+    if (!DeriveAssetPathParts(AssetPath, PackageName, AssetName))
+        return TEXT("ERR:Could not derive an asset name from the given path");
+
+    // CreateNewIKRigAsset takes a plain FOLDER path (its own doc comment:
+    // "ie /Game/MyIKRigs/") and appends AssetName itself — unlike this
+    // file's usual CreatePackage(*PackageName) convention where PackageName
+    // already includes the asset-name-like final segment. Passing PackageName
+    // directly here double-nests a folder matching the asset name (confirmed
+    // live) — strip it back down to the containing folder first.
+    const FString FolderPath = PackageName.LeftChop(AssetName.Len() + 1);
+
+    const FScopedTransaction Transaction(
+        NSLOCTEXT("GraphBridge", "CreateIKRig", "GraphBridge: Create IK Rig"));
+
+    UIKRigDefinition* NewRig = UIKRigDefinitionFactory::CreateNewIKRigAsset(FolderPath, AssetName);
+    if (!NewRig)
+        return TEXT("ERR:UIKRigDefinitionFactory::CreateNewIKRigAsset returned null");
+
+    UIKRigController* Controller = UIKRigController::GetController(NewRig);
+    if (!Controller)
+        return TEXT("ERR:Could not get IK Rig controller for the new asset");
+
+    if (!Controller->SetSkeletalMesh(SkelMesh))
+        return FString::Printf(TEXT("ERR:SetSkeletalMesh failed — '%s' may be incompatible"), *SkeletalMeshPath);
+
+    NewRig->MarkPackageDirty();
+
+    UPackage* Package = NewRig->GetOutermost();
+    const FString PackageFilename = FPackageName::LongPackageNameToFilename(
+        Package->GetName(), FPackageName::GetAssetPackageExtension());
+
+    FSavePackageArgs SaveArgs;
+    SaveArgs.TopLevelFlags = RF_Public | RF_Standalone;
+    SaveArgs.SaveFlags     = SAVE_NoError;
+
+    if (!UPackage::SavePackage(Package, NewRig, *PackageFilename, SaveArgs))
+        return FString::Printf(TEXT("ERR:IK Rig created but failed to save to disk at '%s'"), *PackageFilename);
+
+    UE_LOG(LogGraphBridge, Log, TEXT("GraphBridge CreateIKRig: '%s' for mesh '%s'"), *AssetPath, *SkeletalMeshPath);
+    return Package->GetName() + TEXT(".") + AssetName;
+}
+
+// ---------------------------------------------------------------------------
+// IKRigAutoSetup
+// Command: IK_RIG_AUTO_SETUP|IKRigAssetPath
+// ---------------------------------------------------------------------------
+FString UGraphBridgeAutomationLibrary::IKRigAutoSetup(FString IKRigAssetPath)
+{
+    if (IKRigAssetPath.IsEmpty()) return TEXT("ERR:IKRigAssetPath cannot be empty");
+
+    UIKRigDefinition* IKRig = LoadObject<UIKRigDefinition>(nullptr, *IKRigAssetPath);
+    if (!IKRig)
+        return FString::Printf(TEXT("ERR:IK Rig not found at '%s'"), *IKRigAssetPath);
+
+    UIKRigController* Controller = UIKRigController::GetController(IKRig);
+    if (!Controller)
+        return TEXT("ERR:Could not get IK Rig controller");
+
+    const FScopedTransaction Transaction(
+        NSLOCTEXT("GraphBridge", "IKRigAutoSetup", "GraphBridge: IK Rig Auto Setup"));
+
+    const bool bSuccess = Controller->ApplyAutoFBIK();
+    if (!bSuccess)
+        return TEXT("ERR:ApplyAutoFBIK failed — skeleton didn't match a known template");
+
+    IKRig->MarkPackageDirty();
+
+    FString SaveError;
+    if (!SaveExistingAssetPackage(IKRig, SaveError))
+        return SaveError;
+
+    UE_LOG(LogGraphBridge, Log, TEXT("GraphBridge IKRigAutoSetup: '%s'"), *IKRigAssetPath);
+    return TEXT("");
+}
+
+// ---------------------------------------------------------------------------
+// AddIKGoal
+// Command: ADD_IK_GOAL|IKRigAssetPath|GoalName|BoneName
+// ---------------------------------------------------------------------------
+FString UGraphBridgeAutomationLibrary::AddIKGoal(FString IKRigAssetPath, FString GoalName, FString BoneName)
+{
+    if (IKRigAssetPath.IsEmpty()) return TEXT("ERR:IKRigAssetPath cannot be empty");
+    if (GoalName.IsEmpty()) return TEXT("ERR:GoalName cannot be empty");
+    if (BoneName.IsEmpty()) return TEXT("ERR:BoneName cannot be empty");
+
+    UIKRigDefinition* IKRig = LoadObject<UIKRigDefinition>(nullptr, *IKRigAssetPath);
+    if (!IKRig)
+        return FString::Printf(TEXT("ERR:IK Rig not found at '%s'"), *IKRigAssetPath);
+
+    UIKRigController* Controller = UIKRigController::GetController(IKRig);
+    if (!Controller)
+        return TEXT("ERR:Could not get IK Rig controller");
+
+    const FScopedTransaction Transaction(
+        NSLOCTEXT("GraphBridge", "AddIKGoal", "GraphBridge: Add IK Goal"));
+
+    // AddNewGoal(GoalName, BoneName) already assigns BoneName to the new goal
+    // internally (confirmed in IKRigController.cpp: NewGoal->BoneName = BoneName).
+    // A follow-up SetGoalBone() call with the same bone is not just redundant —
+    // SetGoalBone() explicitly returns false as a no-op when the goal already
+    // uses that bone (IKRigController.cpp: "goal is already using this bone"),
+    // so treating that as an error would misreport every successful call.
+    const FName NewGoalName = Controller->AddNewGoal(FName(*GoalName), FName(*BoneName));
+    if (NewGoalName.IsNone())
+        return FString::Printf(TEXT("ERR:AddNewGoal failed for '%s' on bone '%s' — check the goal name isn't taken and the bone exists"), *GoalName, *BoneName);
+
+    IKRig->MarkPackageDirty();
+
+    FString SaveError;
+    if (!SaveExistingAssetPackage(IKRig, SaveError))
+        return SaveError;
+
+    UE_LOG(LogGraphBridge, Log, TEXT("GraphBridge AddIKGoal: '%s' on bone '%s'"), *NewGoalName.ToString(), *BoneName);
+    return TEXT("");
+}
+
+// ---------------------------------------------------------------------------
+// AddRetargetChain
+// Command: ADD_RETARGET_CHAIN|IKRigAssetPath|ChainName|StartBone|EndBone|GoalName
+// ---------------------------------------------------------------------------
+FString UGraphBridgeAutomationLibrary::AddRetargetChain(FString IKRigAssetPath, FString ChainName,
+    FString StartBone, FString EndBone, FString GoalName)
+{
+    if (IKRigAssetPath.IsEmpty()) return TEXT("ERR:IKRigAssetPath cannot be empty");
+    if (ChainName.IsEmpty()) return TEXT("ERR:ChainName cannot be empty");
+    if (StartBone.IsEmpty()) return TEXT("ERR:StartBone cannot be empty");
+    if (EndBone.IsEmpty()) return TEXT("ERR:EndBone cannot be empty");
+
+    UIKRigDefinition* IKRig = LoadObject<UIKRigDefinition>(nullptr, *IKRigAssetPath);
+    if (!IKRig)
+        return FString::Printf(TEXT("ERR:IK Rig not found at '%s'"), *IKRigAssetPath);
+
+    UIKRigController* Controller = UIKRigController::GetController(IKRig);
+    if (!Controller)
+        return TEXT("ERR:Could not get IK Rig controller");
+
+    const FScopedTransaction Transaction(
+        NSLOCTEXT("GraphBridge", "AddRetargetChain", "GraphBridge: Add Retarget Chain"));
+
+    const FName NewChainName = Controller->AddRetargetChain(
+        FName(*ChainName), FName(*StartBone), FName(*EndBone), FName(*GoalName));
+    if (NewChainName.IsNone())
+        return FString::Printf(TEXT("ERR:AddRetargetChain failed for '%s'"), *ChainName);
+
+    IKRig->MarkPackageDirty();
+
+    FString SaveError;
+    if (!SaveExistingAssetPackage(IKRig, SaveError))
+        return SaveError;
+
+    UE_LOG(LogGraphBridge, Log, TEXT("GraphBridge AddRetargetChain: '%s' (%s -> %s) in '%s'"),
+        *NewChainName.ToString(), *StartBone, *EndBone, *IKRigAssetPath);
+    return TEXT("");
+}
+
+// ---------------------------------------------------------------------------
+// CreateIKRetargeter
+// Command: CREATE_IK_RETARGETER|AssetPath|SourceIKRigPath|TargetIKRigPath
+// ---------------------------------------------------------------------------
+FString UGraphBridgeAutomationLibrary::CreateIKRetargeter(FString AssetPath, FString SourceIKRigPath, FString TargetIKRigPath)
+{
+    if (AssetPath.IsEmpty()) return TEXT("ERR:AssetPath cannot be empty");
+    if (SourceIKRigPath.IsEmpty()) return TEXT("ERR:SourceIKRigPath cannot be empty");
+    if (TargetIKRigPath.IsEmpty()) return TEXT("ERR:TargetIKRigPath cannot be empty");
+
+    UIKRigDefinition* SourceRig = LoadObject<UIKRigDefinition>(nullptr, *SourceIKRigPath);
+    if (!SourceRig)
+        return FString::Printf(TEXT("ERR:Source IK Rig not found at '%s'"), *SourceIKRigPath);
+
+    UIKRigDefinition* TargetRig = LoadObject<UIKRigDefinition>(nullptr, *TargetIKRigPath);
+    if (!TargetRig)
+        return FString::Printf(TEXT("ERR:Target IK Rig not found at '%s'"), *TargetIKRigPath);
+
+    if (LoadObject<UIKRetargeter>(nullptr, *AssetPath))
+        return FString::Printf(TEXT("ERR:An IK Retargeter already exists at '%s'"), *AssetPath);
+
+    FString PackageName, AssetName;
+    if (!DeriveAssetPathParts(AssetPath, PackageName, AssetName))
+        return TEXT("ERR:Could not derive an asset name from the given path");
+
+    // IAssetTools::CreateAsset's PackagePath parameter is a plain containing
+    // FOLDER, not the full package name — it internally does
+    // PackagePath + "/" + AssetName (confirmed in AssetTools.cpp,
+    // UAssetToolsImpl::CreateAsset). Same double-nesting trap as
+    // UIKRigDefinitionFactory::CreateNewIKRigAsset in CreateIKRig above —
+    // strip the trailing /AssetName segment before calling.
+    const FString FolderPath = PackageName.LeftChop(AssetName.Len() + 1);
+
+    const FScopedTransaction Transaction(
+        NSLOCTEXT("GraphBridge", "CreateIKRetargeter", "GraphBridge: Create IK Retargeter"));
+
+    FAssetToolsModule& AssetToolsModule = FModuleManager::LoadModuleChecked<FAssetToolsModule>("AssetTools");
+    UIKRetargetFactory* Factory = NewObject<UIKRetargetFactory>();
+    UObject* NewAssetObj = AssetToolsModule.Get().CreateAsset(AssetName, FolderPath, UIKRetargeter::StaticClass(), Factory);
+    UIKRetargeter* NewRetargeter = Cast<UIKRetargeter>(NewAssetObj);
+    if (!NewRetargeter)
+        return TEXT("ERR:Failed to create IK Retargeter asset");
+
+    UIKRetargeterController* Controller = UIKRetargeterController::GetController(NewRetargeter);
+    if (!Controller)
+        return TEXT("ERR:Could not get IK Retargeter controller");
+
+    Controller->SetIKRig(ERetargetSourceOrTarget::Source, SourceRig);
+    Controller->SetIKRig(ERetargetSourceOrTarget::Target, TargetRig);
+
+    NewRetargeter->MarkPackageDirty();
+
+    FString SaveError;
+    if (!SaveExistingAssetPackage(NewRetargeter, SaveError))
+        return SaveError;
+
+    UE_LOG(LogGraphBridge, Log, TEXT("GraphBridge CreateIKRetargeter: '%s' (%s -> %s)"),
+        *AssetPath, *SourceIKRigPath, *TargetIKRigPath);
+    return NewRetargeter->GetOutermost()->GetName() + TEXT(".") + AssetName;
+}
+
+// ---------------------------------------------------------------------------
+// CreateAnimMontage
+// Command: CREATE_ANIM_MONTAGE|AssetPath|SkeletonPath|AnimSequencePath
+// AnimSequencePath may be empty — produces an empty Montage on the given
+// Skeleton. Confirmed against AnimMontageFactory.cpp that FactoryCreateNew
+// doesn't need ConfigureProperties() (the interactive skeleton picker) when
+// TargetSkeleton/SourceAnimation are pre-set.
+// ---------------------------------------------------------------------------
+FString UGraphBridgeAutomationLibrary::CreateAnimMontage(FString AssetPath, FString SkeletonPath, FString AnimSequencePath)
+{
+    if (AssetPath.IsEmpty()) return TEXT("ERR:AssetPath cannot be empty");
+    if (SkeletonPath.IsEmpty()) return TEXT("ERR:SkeletonPath cannot be empty");
+
+    USkeleton* Skeleton = LoadObject<USkeleton>(nullptr, *SkeletonPath);
+    if (!Skeleton)
+        return FString::Printf(TEXT("ERR:Skeleton not found at '%s'"), *SkeletonPath);
+
+    UAnimSequence* SourceAnim = nullptr;
+    if (!AnimSequencePath.IsEmpty())
+    {
+        SourceAnim = LoadObject<UAnimSequence>(nullptr, *AnimSequencePath);
+        if (!SourceAnim)
+            return FString::Printf(TEXT("ERR:AnimSequence not found at '%s'"), *AnimSequencePath);
+    }
+
+    if (LoadObject<UAnimMontage>(nullptr, *AssetPath))
+        return FString::Printf(TEXT("ERR:An Anim Montage already exists at '%s'"), *AssetPath);
+
+    FString PackageName, AssetName;
+    if (!DeriveAssetPathParts(AssetPath, PackageName, AssetName))
+        return TEXT("ERR:Could not derive an asset name from the given path");
+
+    UPackage* NewPackage = CreatePackage(*PackageName);
+    if (!NewPackage)
+        return FString::Printf(TEXT("ERR:Failed to create package '%s'"), *PackageName);
+    NewPackage->FullyLoad();
+
+    const FScopedTransaction Transaction(
+        NSLOCTEXT("GraphBridge", "CreateAnimMontage", "GraphBridge: Create Anim Montage"));
+
+    UAnimMontageFactory* Factory = NewObject<UAnimMontageFactory>();
+    Factory->TargetSkeleton = Skeleton;
+    Factory->SourceAnimation = SourceAnim;
+
+    UAnimMontage* NewMontage = Cast<UAnimMontage>(Factory->FactoryCreateNew(
+        UAnimMontage::StaticClass(), NewPackage, FName(*AssetName), RF_Public | RF_Standalone | RF_Transactional, nullptr, GWarn));
+    if (!NewMontage)
+        return TEXT("ERR:UAnimMontageFactory::FactoryCreateNew returned null");
+
+    FAssetRegistryModule::AssetCreated(NewMontage);
+    NewPackage->MarkPackageDirty();
+
+    const FString PackageFilename = FPackageName::LongPackageNameToFilename(
+        PackageName, FPackageName::GetAssetPackageExtension());
+
+    FSavePackageArgs SaveArgs;
+    SaveArgs.TopLevelFlags = RF_Public | RF_Standalone;
+    SaveArgs.SaveFlags     = SAVE_NoError;
+
+    if (!UPackage::SavePackage(NewPackage, NewMontage, *PackageFilename, SaveArgs))
+        return FString::Printf(TEXT("ERR:Anim Montage created but failed to save to disk at '%s'"), *PackageFilename);
+
+    UE_LOG(LogGraphBridge, Log, TEXT("GraphBridge CreateAnimMontage: '%s'"), *AssetPath);
+    return PackageName + TEXT(".") + AssetName;
+}
+
+// ---------------------------------------------------------------------------
+// CreateBlendSpace
+// Command: CREATE_BLEND_SPACE|AssetPath|SkeletonPath
+// Confirmed against EditorFactories.cpp that FactoryCreateNew only needs
+// TargetSkeleton pre-set — non-interactive.
+// ---------------------------------------------------------------------------
+FString UGraphBridgeAutomationLibrary::CreateBlendSpace(FString AssetPath, FString SkeletonPath)
+{
+    if (AssetPath.IsEmpty()) return TEXT("ERR:AssetPath cannot be empty");
+    if (SkeletonPath.IsEmpty()) return TEXT("ERR:SkeletonPath cannot be empty");
+
+    USkeleton* Skeleton = LoadObject<USkeleton>(nullptr, *SkeletonPath);
+    if (!Skeleton)
+        return FString::Printf(TEXT("ERR:Skeleton not found at '%s'"), *SkeletonPath);
+
+    if (LoadObject<UBlendSpace>(nullptr, *AssetPath))
+        return FString::Printf(TEXT("ERR:A BlendSpace already exists at '%s'"), *AssetPath);
+
+    FString PackageName, AssetName;
+    if (!DeriveAssetPathParts(AssetPath, PackageName, AssetName))
+        return TEXT("ERR:Could not derive an asset name from the given path");
+
+    UPackage* NewPackage = CreatePackage(*PackageName);
+    if (!NewPackage)
+        return FString::Printf(TEXT("ERR:Failed to create package '%s'"), *PackageName);
+    NewPackage->FullyLoad();
+
+    const FScopedTransaction Transaction(
+        NSLOCTEXT("GraphBridge", "CreateBlendSpace", "GraphBridge: Create Blend Space"));
+
+    UBlendSpaceFactoryNew* Factory = NewObject<UBlendSpaceFactoryNew>();
+    Factory->TargetSkeleton = Skeleton;
+
+    UBlendSpace* NewBlendSpace = Cast<UBlendSpace>(Factory->FactoryCreateNew(
+        UBlendSpace::StaticClass(), NewPackage, FName(*AssetName), RF_Public | RF_Standalone | RF_Transactional, nullptr, GWarn));
+    if (!NewBlendSpace)
+        return TEXT("ERR:UBlendSpaceFactoryNew::FactoryCreateNew returned null");
+
+    FAssetRegistryModule::AssetCreated(NewBlendSpace);
+    NewPackage->MarkPackageDirty();
+
+    const FString PackageFilename = FPackageName::LongPackageNameToFilename(
+        PackageName, FPackageName::GetAssetPackageExtension());
+
+    FSavePackageArgs SaveArgs;
+    SaveArgs.TopLevelFlags = RF_Public | RF_Standalone;
+    SaveArgs.SaveFlags     = SAVE_NoError;
+
+    if (!UPackage::SavePackage(NewPackage, NewBlendSpace, *PackageFilename, SaveArgs))
+        return FString::Printf(TEXT("ERR:BlendSpace created but failed to save to disk at '%s'"), *PackageFilename);
+
+    UE_LOG(LogGraphBridge, Log, TEXT("GraphBridge CreateBlendSpace: '%s'"), *AssetPath);
+    return PackageName + TEXT(".") + AssetName;
+}
+
+// ---------------------------------------------------------------------------
+// AddSkeletonSocket
+// Command: ADD_SKELETON_SOCKET|SkeletonPath|SocketName|BoneName|X|Y|Z
+// See header comment — USkeleton::AddSocket() does not exist; this
+// replicates the same logic USkeletalMesh::AddSocket()'s bAddToSkeleton=true
+// path uses internally, directly against Skeleton->Sockets.
+// ---------------------------------------------------------------------------
+FString UGraphBridgeAutomationLibrary::AddSkeletonSocket(FString SkeletonPath, FString SocketName, FString BoneName,
+    float X, float Y, float Z)
+{
+    if (SkeletonPath.IsEmpty()) return TEXT("ERR:SkeletonPath cannot be empty");
+    if (SocketName.IsEmpty()) return TEXT("ERR:SocketName cannot be empty");
+    if (BoneName.IsEmpty()) return TEXT("ERR:BoneName cannot be empty");
+
+    USkeleton* Skeleton = LoadObject<USkeleton>(nullptr, *SkeletonPath);
+    if (!Skeleton)
+        return FString::Printf(TEXT("ERR:Skeleton not found at '%s'"), *SkeletonPath);
+
+    const FName BoneFName(*BoneName);
+    if (Skeleton->GetReferenceSkeleton().FindBoneIndex(BoneFName) == INDEX_NONE)
+        return FString::Printf(TEXT("ERR:Bone '%s' not found in skeleton"), *BoneName);
+
+    const FName SocketFName(*SocketName);
+    if (Skeleton->Sockets.ContainsByPredicate([SocketFName](const TObjectPtr<USkeletalMeshSocket>& S) { return S->SocketName == SocketFName; }))
+        return FString::Printf(TEXT("ERR:Socket '%s' already exists on this skeleton"), *SocketName);
+
+    const FScopedTransaction Transaction(
+        NSLOCTEXT("GraphBridge", "AddSkeletonSocket", "GraphBridge: Add Skeleton Socket"));
+
+    Skeleton->Modify();
+    USkeletalMeshSocket* NewSocket = NewObject<USkeletalMeshSocket>(Skeleton);
+    NewSocket->SocketName = SocketFName;
+    NewSocket->BoneName = BoneFName;
+    NewSocket->RelativeLocation = FVector(X, Y, Z);
+    Skeleton->Sockets.Add(NewSocket);
+    Skeleton->MarkPackageDirty();
+
+    FString SaveError;
+    if (!SaveExistingAssetPackage(Skeleton, SaveError))
+        return SaveError;
+
+    UE_LOG(LogGraphBridge, Log, TEXT("GraphBridge AddSkeletonSocket: '%s' on bone '%s' in '%s'"),
+        *SocketName, *BoneName, *SkeletonPath);
     return TEXT("");
 }
 
