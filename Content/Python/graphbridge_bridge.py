@@ -77,14 +77,16 @@ class UnrealBridge:
     # ------------------------------------------------------------------
 
     async def spawn_node(self, bp_path: str, node_class: str,
-                         comment: str, x: int, y: int) -> dict | None:
+                         comment: str, x: int, y: int, graph_name: str = "") -> dict | None:
         """
         Spawn a graph node.
         node_class: partial or full UClass name, e.g. "K2Node_CallFunction"
+        graph_name: optional — name of a Function or Macro graph (from
+            list_graphs()) to target instead of the default EventGraph.
         Returns payload containing the new node's GUID.
         """
         return await self._send_command(
-            f"SPAWN_NODE|{bp_path}|{node_class}|{comment}|{x}|{y}")
+            f"SPAWN_NODE|{bp_path}|{node_class}|{comment}|{x}|{y}|{graph_name}")
 
     async def spawn_event_node(self, bp_path: str, event_func_name: str,
                                comment: str, x: int, y: int) -> dict | None:
@@ -110,25 +112,41 @@ class UnrealBridge:
 
     async def connect_pins(self, bp_path: str,
                            node_a: str, pin_a: str,
-                           node_b: str, pin_b: str) -> dict | None:
-        """Connect an output pin on node_a to an input pin on node_b."""
+                           node_b: str, pin_b: str, graph_name: str = "") -> dict | None:
+        """
+        Connect an output pin on node_a to an input pin on node_b.
+        graph_name: optional — scope the node lookup to this graph (from
+            list_graphs()) instead of the default EventGraph.
+        """
         return await self._send_command(
-            f"CONNECT_PINS|{bp_path}|{node_a}|{pin_a}|{node_b}|{pin_b}")
+            f"CONNECT_PINS|{bp_path}|{node_a}|{pin_a}|{node_b}|{pin_b}|{graph_name}")
 
     async def disconnect_pins(self, bp_path: str,
                               node_a: str, pin_a: str,
-                              node_b: str, pin_b: str) -> dict | None:
-        """Break all connections on pin_a of node_a."""
+                              node_b: str, pin_b: str, graph_name: str = "") -> dict | None:
+        """
+        Break all connections on pin_a of node_a.
+        graph_name: optional — see connect_pins().
+        """
         return await self._send_command(
-            f"DISCONNECT_PINS|{bp_path}|{node_a}|{pin_a}|{node_b}|{pin_b}")
+            f"DISCONNECT_PINS|{bp_path}|{node_a}|{pin_a}|{node_b}|{pin_b}|{graph_name}")
 
-    async def delete_node(self, bp_path: str, node_id: str) -> dict | None:
-        """Delete a node by GUID or comment string."""
-        return await self._send_command(f"DELETE_NODE|{bp_path}|{node_id}")
+    async def delete_node(self, bp_path: str, node_id: str, graph_name: str = "") -> dict | None:
+        """
+        Delete a node by GUID or comment string.
+        graph_name: optional — scope the lookup to this graph. Omitted,
+            this searches every graph (EventGraph, Function, AnimGraph,
+            state machines) for the node.
+        """
+        return await self._send_command(f"DELETE_NODE|{bp_path}|{node_id}|{graph_name}")
 
-    async def clear_nodes(self, bp_path: str, comment_match: str) -> dict | None:
-        """Delete all nodes whose comment contains comment_match."""
-        return await self._send_command(f"CLEAR_NODES|{bp_path}|{comment_match}")
+    async def clear_nodes(self, bp_path: str, comment_match: str, graph_name: str = "") -> dict | None:
+        """
+        Delete all nodes whose comment contains comment_match.
+        graph_name: optional — scope the match to this graph instead of the
+            default EventGraph.
+        """
+        return await self._send_command(f"CLEAR_NODES|{bp_path}|{comment_match}|{graph_name}")
 
     async def set_pin_default(self, bp_path: str, node_id: str,
                               pin_name: str, default_value: str) -> dict | None:
@@ -136,13 +154,15 @@ class UnrealBridge:
         return await self._send_command(
             f"SET_PIN_DEFAULT|{bp_path}|{node_id}|{pin_name}|{default_value}")
 
-    async def get_node_pins(self, bp_path: str, node_name: str) -> dict | None:
+    async def get_node_pins(self, bp_path: str, node_name: str, graph_name: str = "") -> dict | None:
         """
         Return a comma-separated list of pin descriptors for a node.
         Each descriptor is formatted as IN:PinName or OUT:PinName.
         node_name can be the node title, comment, or GUID.
+        graph_name: optional — scope the lookup to this graph instead of the
+            default EventGraph.
         """
-        return await self._send_command(f"GET_NODE_PINS|{bp_path}|{node_name}")
+        return await self._send_command(f"GET_NODE_PINS|{bp_path}|{node_name}|{graph_name}")
 
     async def get_pin_connections(self, bp_path: str, node_guid: str, pin_name: str) -> list[dict]:
         """
@@ -378,6 +398,51 @@ class UnrealBridge:
         """
         return await self._send_command(f"CREATE_FUNCTION|{bp_path}|{function_name}")
 
+    async def list_graphs(self, bp_path: str) -> list[dict]:
+        """
+        List every graph on a Blueprint (EventGraph, Function graphs, Macro
+        graphs). Call this before spawning nodes into anything other than
+        the default EventGraph — it's how you discover valid graph_name
+        values for spawn_node()/connect_pins()/etc.
+
+        Returns a list of dicts: { name, type } where type is one of
+        "EventGraph", "Function", "Macro".
+        """
+        result = await self._send_command(f"LIST_GRAPHS|{bp_path}")
+        if not result or not result.get("success") or not result.get("payload"):
+            return []
+        graphs = []
+        for entry in result["payload"].split("|"):
+            parts = entry.split("~", 1)
+            if len(parts) == 2:
+                graphs.append({"name": parts[0], "type": parts[1]})
+        return graphs
+
+    async def create_function_graph(self, bp_path: str, function_name: str) -> dict | None:
+        """
+        Create a new custom function graph (same underlying operation as
+        create_function()), but result["payload"] is the new graph's
+        K2Node_FunctionEntry node GUID instead of the function name — use
+        this when you want to immediately act on the entry node itself.
+        For the graph_name to pass to spawn_node()/etc., use
+        create_function() or list_graphs() instead.
+        """
+        return await self._send_command(f"CREATE_FUNCTION_GRAPH|{bp_path}|{function_name}")
+
+    async def create_macro_graph(self, bp_path: str, macro_name: str) -> dict | None:
+        """
+        Create a new macro graph. Unlike a function graph, a macro is
+        inlined at each call site, can have multiple exec pins, and can
+        contain latent nodes — but it cannot be overridden in child
+        Blueprints.
+
+        result["payload"] is the new entry tunnel node's GUID (macro graphs
+        use a UK2Node_Tunnel entry point, not a FunctionEntry node).
+        Use the macro_name (or list_graphs()) as graph_name for
+        spawn_node()/connect_pins()/etc. to add nodes to it.
+        """
+        return await self._send_command(f"CREATE_MACRO_GRAPH|{bp_path}|{macro_name}")
+
     async def spawn_node_in_graph(self, bp_path: str, graph_name: str, node_class: str,
                                   comment: str, x: int, y: int) -> dict | None:
         """
@@ -464,15 +529,16 @@ class UnrealBridge:
     # Discovery / query
     # ------------------------------------------------------------------
 
-    async def list_nodes(self, bp_path: str) -> list[dict]:
+    async def list_nodes(self, bp_path: str, graph_name: str = "") -> list[dict]:
         """
-        List all nodes in a Blueprint's EventGraph.
+        List all nodes in a Blueprint's EventGraph (or, if graph_name is
+        given, in that Function/Macro graph instead).
         Returns a list of dicts: { guid, title, comment, class_name }
 
         This is the foundation of the scan-first workflow — call this
         before any manipulation to get ground truth on what exists.
         """
-        result = await self._send_command(f"LIST_NODES|{bp_path}")
+        result = await self._send_command(f"LIST_NODES|{bp_path}|{graph_name}")
         if not result or not result.get("success") or not result.get("payload"):
             return []
 

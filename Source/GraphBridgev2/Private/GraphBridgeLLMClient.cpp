@@ -28,13 +28,25 @@ static const FString GSystemPrompt = TEXT(
     "Pin names come from GET_NODE_PINS results.\n"
     "6. Node GUIDs are in LIST_NODES responses as: GUID~NodeTitle~Tooltip~NodeClass. Always use exact GUIDs.\n"
     "7. When you have all the information you need, act immediately — do not ask for confirmation unless the task is ambiguous.\n"
-    "8. After completing a task, give a short summary of what was done."
+    "8. After completing a task, give a short summary of what was done.\n"
+    "9. A Blueprint can have more than just the default EventGraph — Function graphs and Macro graphs too. "
+    "Call LIST_GRAPHS before spawning nodes into anything other than the default EventGraph, to see what graphs "
+    "already exist and their type (EventGraph/Function/Macro). Use CREATE_FUNCTION_GRAPH or CREATE_MACRO_GRAPH "
+    "to create a new one first if needed.\n"
+    "10. SPAWN_NODE, CONNECT_PINS, DISCONNECT_PINS, DELETE_NODE, GET_NODE_PINS, and LIST_NODES all accept an "
+    "optional graph_name argument. Pass it explicitly whenever you are operating on a Function or Macro graph — "
+    "never assume the default EventGraph once other graphs exist."
 );
 
 // ── Tool schema helpers ───────────────────────────────────────────────────────
 
+// OptionalParams: added to "properties" the same as Params, but NOT added to
+// "required" — lets a tool call omit them (e.g. graph_name, defaulting to
+// the main EventGraph on the C++ side) without the LLM provider rejecting
+// the call for missing a required field.
 static TSharedPtr<FJsonObject> MakeTool(const FString& Name, const FString& Description,
-    TArray<TPair<FString,FString>> Params)
+    TArray<TPair<FString,FString>> Params,
+    TArray<TPair<FString,FString>> OptionalParams = {})
 {
     TSharedPtr<FJsonObject> Properties = MakeShareable(new FJsonObject);
     TArray<TSharedPtr<FJsonValue>> Required;
@@ -46,6 +58,14 @@ static TSharedPtr<FJsonObject> MakeTool(const FString& Name, const FString& Desc
         Prop->SetStringField(TEXT("description"), Pair.Value);
         Properties->SetObjectField(Pair.Key, Prop);
         Required.Add(MakeShareable(new FJsonValueString(Pair.Key)));
+    }
+
+    for (auto& Pair : OptionalParams)
+    {
+        TSharedPtr<FJsonObject> Prop = MakeShareable(new FJsonObject);
+        Prop->SetStringField(TEXT("type"),        TEXT("string"));
+        Prop->SetStringField(TEXT("description"), Pair.Value);
+        Properties->SetObjectField(Pair.Key, Prop);
     }
 
     TSharedPtr<FJsonObject> Parameters = MakeShareable(new FJsonObject);
@@ -131,6 +151,12 @@ TArray<TSharedPtr<FJsonValue>> FGraphBridgeLLMClient::BuildToolSchemas() const
         TEXT("Close the currently open Blueprint editor."),
         { {TEXT("asset_path"), TEXT("Content-browser path to the Blueprint")} }));
 
+    // Shared optional param — used by every verb below that can target a
+    // Function or Macro graph instead of the default EventGraph.
+    const TArray<TPair<FString,FString>> GraphNameOpt = {
+        {TEXT("graph_name"), TEXT("Optional: name of a Function or Macro graph to target (from LIST_GRAPHS). Omit for the default EventGraph.")}
+    };
+
     Add(MakeTool(TEXT("SPAWN_NODE"),
         TEXT("Spawn a new node in the Blueprint graph."),
         {
@@ -139,7 +165,7 @@ TArray<TSharedPtr<FJsonValue>> FGraphBridgeLLMClient::BuildToolSchemas() const
             {TEXT("comment"),    TEXT("Optional comment label for the node")},
             {TEXT("pos_x"),      TEXT("X position in the graph")},
             {TEXT("pos_y"),      TEXT("Y position in the graph")}
-        }));
+        }, GraphNameOpt));
 
     Add(MakeTool(TEXT("CONNECT_PINS"),
         TEXT("Connect an output pin on one node to an input pin on another."),
@@ -149,7 +175,7 @@ TArray<TSharedPtr<FJsonValue>> FGraphBridgeLLMClient::BuildToolSchemas() const
             {TEXT("source_pin"),     TEXT("Name of the output pin")},
             {TEXT("target_node_id"), TEXT("GUID of the target node")},
             {TEXT("target_pin"),     TEXT("Name of the input pin")}
-        }));
+        }, GraphNameOpt));
 
     Add(MakeTool(TEXT("DISCONNECT_PINS"),
         TEXT("Disconnect a pin connection."),
@@ -159,21 +185,21 @@ TArray<TSharedPtr<FJsonValue>> FGraphBridgeLLMClient::BuildToolSchemas() const
             {TEXT("source_pin"),     TEXT("Name of the output pin")},
             {TEXT("target_node_id"), TEXT("GUID of the target node")},
             {TEXT("target_pin"),     TEXT("Name of the input pin")}
-        }));
+        }, GraphNameOpt));
 
     Add(MakeTool(TEXT("DELETE_NODE"),
         TEXT("Delete a node from the graph by its GUID."),
         {
             {TEXT("asset_path"), TEXT("Content-browser path to the Blueprint")},
             {TEXT("node_id"),    TEXT("GUID of the node to delete")}
-        }));
+        }, GraphNameOpt));
 
     Add(MakeTool(TEXT("CLEAR_NODES"),
         TEXT("Delete nodes matching a comment tag in a Blueprint graph."),
         {
             {TEXT("asset_path"),    TEXT("Content-browser path to the Blueprint")},
             {TEXT("comment_match"), TEXT("Comment tag to match for deletion")}
-        }));
+        }, GraphNameOpt));
 
     Add(MakeTool(TEXT("SET_PIN_DEFAULT"),
         TEXT("Set the default value of a pin on a node."),
@@ -189,11 +215,33 @@ TArray<TSharedPtr<FJsonValue>> FGraphBridgeLLMClient::BuildToolSchemas() const
         {
             {TEXT("asset_path"), TEXT("Content-browser path to the Blueprint")},
             {TEXT("node_id"),    TEXT("GUID or title of the node")}
-        }));
+        }, GraphNameOpt));
 
     Add(MakeTool(TEXT("LIST_NODES"),
         TEXT("List all nodes in a Blueprint graph."),
+        { {TEXT("asset_path"), TEXT("Content-browser path to the Blueprint")} }, GraphNameOpt));
+
+    Add(MakeTool(TEXT("LIST_GRAPHS"),
+        TEXT("List every graph on a Blueprint (EventGraph, Function graphs, Macro graphs) with its type. "
+             "Call this before spawning nodes into anything other than the default EventGraph."),
         { {TEXT("asset_path"), TEXT("Content-browser path to the Blueprint")} }));
+
+    Add(MakeTool(TEXT("CREATE_FUNCTION_GRAPH"),
+        TEXT("Create a new custom function graph in a Blueprint. Compiles to a real callable UFunction "
+             "with its own call frame — cannot contain latent nodes. Returns the new FunctionEntry node's GUID."),
+        {
+            {TEXT("asset_path"),    TEXT("Content-browser path to the Blueprint")},
+            {TEXT("function_name"), TEXT("Name for the new function")}
+        }));
+
+    Add(MakeTool(TEXT("CREATE_MACRO_GRAPH"),
+        TEXT("Create a new macro graph in a Blueprint. Unlike a function, a macro is inlined at each call "
+             "site, can have multiple exec pins, and can contain latent nodes — but cannot be overridden in "
+             "child Blueprints. Returns the new entry tunnel node's GUID."),
+        {
+            {TEXT("asset_path"),  TEXT("Content-browser path to the Blueprint")},
+            {TEXT("macro_name"),  TEXT("Name for the new macro")}
+        }));
 
     Add(MakeTool(TEXT("COMPILE"),
         TEXT("Compile a Blueprint."),
@@ -883,14 +931,17 @@ FString FGraphBridgeLLMClient::DispatchToolCall(const FString& ToolName, const T
 
     if      (ToolName == TEXT("OPEN_BLUEPRINT"))        Command = FString::Printf(TEXT("OPEN_BLUEPRINT|%s"),              *GetArg(TEXT("asset_path")));
     else if (ToolName == TEXT("CLOSE_BLUEPRINT"))       Command = FString::Printf(TEXT("CLOSE_BLUEPRINT|%s"),             *GetArg(TEXT("asset_path")));
-    else if (ToolName == TEXT("SPAWN_NODE"))            Command = FString::Printf(TEXT("SPAWN_NODE|%s|%s|%s|%s|%s"),      *GetArg(TEXT("asset_path")), *GetArg(TEXT("node_class")), *GetArg(TEXT("comment")), *GetArg(TEXT("pos_x")), *GetArg(TEXT("pos_y")));
-    else if (ToolName == TEXT("CONNECT_PINS"))          Command = FString::Printf(TEXT("CONNECT_PINS|%s|%s|%s|%s|%s"),    *GetArg(TEXT("asset_path")), *GetArg(TEXT("source_node_id")), *GetArg(TEXT("source_pin")), *GetArg(TEXT("target_node_id")), *GetArg(TEXT("target_pin")));
-    else if (ToolName == TEXT("DISCONNECT_PINS"))       Command = FString::Printf(TEXT("DISCONNECT_PINS|%s|%s|%s|%s|%s"), *GetArg(TEXT("asset_path")), *GetArg(TEXT("source_node_id")), *GetArg(TEXT("source_pin")), *GetArg(TEXT("target_node_id")), *GetArg(TEXT("target_pin")));
-    else if (ToolName == TEXT("DELETE_NODE"))           Command = FString::Printf(TEXT("DELETE_NODE|%s|%s"),               *GetArg(TEXT("asset_path")), *GetArg(TEXT("node_id")));
-    else if (ToolName == TEXT("CLEAR_NODES"))           Command = FString::Printf(TEXT("CLEAR_NODES|%s|%s"),               *GetArg(TEXT("asset_path")), *GetArg(TEXT("comment_match")));
+    else if (ToolName == TEXT("SPAWN_NODE"))            Command = FString::Printf(TEXT("SPAWN_NODE|%s|%s|%s|%s|%s|%s"),   *GetArg(TEXT("asset_path")), *GetArg(TEXT("node_class")), *GetArg(TEXT("comment")), *GetArg(TEXT("pos_x")), *GetArg(TEXT("pos_y")), *GetArg(TEXT("graph_name")));
+    else if (ToolName == TEXT("CONNECT_PINS"))          Command = FString::Printf(TEXT("CONNECT_PINS|%s|%s|%s|%s|%s|%s"), *GetArg(TEXT("asset_path")), *GetArg(TEXT("source_node_id")), *GetArg(TEXT("source_pin")), *GetArg(TEXT("target_node_id")), *GetArg(TEXT("target_pin")), *GetArg(TEXT("graph_name")));
+    else if (ToolName == TEXT("DISCONNECT_PINS"))       Command = FString::Printf(TEXT("DISCONNECT_PINS|%s|%s|%s|%s|%s|%s"), *GetArg(TEXT("asset_path")), *GetArg(TEXT("source_node_id")), *GetArg(TEXT("source_pin")), *GetArg(TEXT("target_node_id")), *GetArg(TEXT("target_pin")), *GetArg(TEXT("graph_name")));
+    else if (ToolName == TEXT("DELETE_NODE"))           Command = FString::Printf(TEXT("DELETE_NODE|%s|%s|%s"),           *GetArg(TEXT("asset_path")), *GetArg(TEXT("node_id")), *GetArg(TEXT("graph_name")));
+    else if (ToolName == TEXT("CLEAR_NODES"))           Command = FString::Printf(TEXT("CLEAR_NODES|%s|%s|%s"),           *GetArg(TEXT("asset_path")), *GetArg(TEXT("comment_match")), *GetArg(TEXT("graph_name")));
     else if (ToolName == TEXT("SET_PIN_DEFAULT"))       Command = FString::Printf(TEXT("SET_PIN_DEFAULT|%s|%s|%s|%s"),    *GetArg(TEXT("asset_path")), *GetArg(TEXT("node_id")), *GetArg(TEXT("pin_name")), *GetArg(TEXT("value")));
-    else if (ToolName == TEXT("GET_NODE_PINS"))         Command = FString::Printf(TEXT("GET_NODE_PINS|%s|%s"),             *GetArg(TEXT("asset_path")), *GetArg(TEXT("node_id")));
-    else if (ToolName == TEXT("LIST_NODES"))            Command = FString::Printf(TEXT("LIST_NODES|%s"),                   *GetArg(TEXT("asset_path")));
+    else if (ToolName == TEXT("GET_NODE_PINS"))         Command = FString::Printf(TEXT("GET_NODE_PINS|%s|%s|%s"),         *GetArg(TEXT("asset_path")), *GetArg(TEXT("node_id")), *GetArg(TEXT("graph_name")));
+    else if (ToolName == TEXT("LIST_NODES"))            Command = FString::Printf(TEXT("LIST_NODES|%s|%s"),               *GetArg(TEXT("asset_path")), *GetArg(TEXT("graph_name")));
+    else if (ToolName == TEXT("LIST_GRAPHS"))           Command = FString::Printf(TEXT("LIST_GRAPHS|%s"),                 *GetArg(TEXT("asset_path")));
+    else if (ToolName == TEXT("CREATE_FUNCTION_GRAPH")) Command = FString::Printf(TEXT("CREATE_FUNCTION_GRAPH|%s|%s"),    *GetArg(TEXT("asset_path")), *GetArg(TEXT("function_name")));
+    else if (ToolName == TEXT("CREATE_MACRO_GRAPH"))    Command = FString::Printf(TEXT("CREATE_MACRO_GRAPH|%s|%s"),       *GetArg(TEXT("asset_path")), *GetArg(TEXT("macro_name")));
     else if (ToolName == TEXT("COMPILE"))               Command = FString::Printf(TEXT("COMPILE|%s"),                      *GetArg(TEXT("asset_path")));
     else if (ToolName == TEXT("SAVE_BLUEPRINT"))        Command = FString::Printf(TEXT("SAVE_BLUEPRINT|%s"),               *GetArg(TEXT("asset_path")));
     else if (ToolName == TEXT("SPAWN_VARIABLE"))        Command = FString::Printf(TEXT("SPAWN_VARIABLE|%s|%s|%s|%s"),     *GetArg(TEXT("asset_path")), *GetArg(TEXT("variable_name")), *GetArg(TEXT("variable_type")), *GetArg(TEXT("category")));

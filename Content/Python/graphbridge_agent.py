@@ -59,15 +59,38 @@ DISCOVERY RULES - always do this before any mutation
    so you have real GUIDs and node names - never guess or invent them.
 4. Always call GET_NODE_PINS on any node before attempting CONNECT_PINS -
    pin names vary by engine version and node type. Never guess pin names.
+5. A Blueprint can have more graphs than just the default EventGraph -
+   Function graphs and Macro graphs too. Call LIST_GRAPHS before spawning
+   nodes into anything other than the default EventGraph, to see what
+   already exists and its type (EventGraph/Function/Macro). Use
+   CREATE_FUNCTION_GRAPH or CREATE_MACRO_GRAPH to create a new one first
+   if needed.
+   LIST_GRAPHS format: LIST_GRAPHS|BP_PATH
+   CREATE_FUNCTION_GRAPH format: CREATE_FUNCTION_GRAPH|BP_PATH|FunctionName
+   CREATE_MACRO_GRAPH format: CREATE_MACRO_GRAPH|BP_PATH|MacroName
+   SPAWN_NODE, CONNECT_PINS, DISCONNECT_PINS, DELETE_NODE, GET_NODE_PINS,
+   and LIST_NODES all accept an OPTIONAL trailing GraphName argument -
+   pass it explicitly whenever operating on a Function or Macro graph,
+   never assume the default EventGraph once other graphs exist. Omit it
+   (or leave the trailing pipe segment empty) to target EventGraph.
+   e.g. SPAWN_NODE|BP_PATH|K2Node_CallFunction|MyComment|200|100|MyFunctionName
 
 =======================================================
 SPAWN_NODE RULES - read every time before spawning
 =======================================================
 - NEVER guess a node class name. Always call FIND_NODE_CLASS first.
+- FIND_NODE_CLASS matches against the node's UClass name (e.g. K2Node_CallFunction,
+  K2Node_Event), NOT a UFunction display name. For "call a UFunction" nodes
+  (which covers the vast majority of library calls, e.g. PrintString), the
+  class is ALWAYS K2Node_CallFunction - search FIND_NODE_CLASS|CallFunction,
+  never FIND_NODE_CLASS|<the specific function name>, which will return
+  "No matches" (confirmed live - PrintString/"Print String" both fail;
+  CallFunction succeeds). SET_FUNCTION_REF is what binds the specific
+  function afterward.
 - Example flow to spawn a Print String node:
-    Step 1: FIND_NODE_CLASS|PrintString     <- get the exact class name
+    Step 1: FIND_NODE_CLASS|CallFunction    <- generic function-call node class
     Step 2: CLOSE_BLUEPRINT|BP_PATH         <- required before any spawn
-    Step 3: SPAWN_NODE|BP_PATH|<exact class from step 1>|MyComment|200|100
+    Step 3: SPAWN_NODE|BP_PATH|K2Node_CallFunction|MyComment|200|100
     Step 4: SET_FUNCTION_REF|BP_PATH|<new node GUID>|KismetSystemLibrary|PrintString
     Step 5: GET_NODE_PINS|BP_PATH|<new node GUID>  <- check real pin names
     Step 6: GET_NODE_PINS|BP_PATH|<target node GUID> <- check source pin names
@@ -108,6 +131,11 @@ Variable type strings:
   FString, FName, FText, FVector, FVector2D,
   FRotator, FTransform, FLinearColor,
   object:ClassName, class:ClassName
+  Append [] to any of the above for an array-typed variable, e.g.
+  class:Character[] or FVector[]. (ADD_VARIABLE/SPAWN_VARIABLE only —
+  array defaults are still awkward to express as a single literal
+  string via SET_VARIABLE_DEFAULT; for array variables, prefer leaving
+  the default empty and populating it from a graph instead.)
 
 CRITICAL - SET_VARIABLE_DEFAULT format:
   SET_VARIABLE_DEFAULT|BP_PATH|VarName|DefaultValue

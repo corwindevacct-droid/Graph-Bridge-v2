@@ -20,12 +20,16 @@
 #include "EdGraphSchema_K2_Actions.h"
 #include "K2Node.h"
 #include "K2Node_CallFunction.h"
+#include "K2Node_CustomEvent.h"
 #include "K2Node_Event.h"
+#include "K2Node_MakeArray.h"
 #include "K2Node_InputAction.h"
 #include "EnhancedInputActionDelegateBinding.h"
 #include "K2Node_VariableGet.h"
 #include "K2Node_EditablePinBase.h"
 #include "K2Node_SpawnActorFromClass.h"
+#include "K2Node_FunctionEntry.h"
+#include "K2Node_Tunnel.h"
 #include "AnimGraphNode_Base.h"
 #include "AnimGraphNode_StateMachine.h"
 #include "AnimationStateMachineGraph.h"
@@ -33,6 +37,10 @@
 #include "AnimStateNode.h"
 #include "AnimStateNodeBase.h"
 #include "AnimStateTransitionNode.h"
+#include "AnimGraphNode_BlendSpacePlayer.h"
+#include "AnimGraphNode_TransitionResult.h"
+#include "AnimGraphNode_Slot.h"
+#include "AnimGraphNode_Root.h"
 #include "NiagaraSystemFactoryNew.h"
 #include "NiagaraEmitterFactoryNew.h"
 #include "NiagaraSystem.h"
@@ -367,8 +375,10 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommand(FString Command, ix::We
 
     if (Op == TEXT("SPAWN_NODE") && P.Num() >= 6)
     {
+        // Trailing GraphName is optional — SPAWN_NODE|BPPath|NodeClass|Comment|X|Y|GraphName
+        FString GraphName = P.Num() >= 7 ? P[6] : TEXT("");
         FString Result = SpawnNode(P[1], P[2], P[3],
-            FCString::Atoi(*P[4]), FCString::Atoi(*P[5]));
+            FCString::Atoi(*P[4]), FCString::Atoi(*P[5]), GraphName);
         bool bOk = !Result.IsEmpty() && !Result.StartsWith(TEXT("ERR:"));
         SendResponse(Sender, bOk, Op,
             bOk ? FString::Printf(TEXT("Node spawned: %s"), *Result)
@@ -391,26 +401,33 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommand(FString Command, ix::We
     }
     else if (Op == TEXT("CONNECT_PINS") && P.Num() >= 6)
     {
-        FString Err = ConnectPins(P[1], P[2], P[3], P[4], P[5]);
+        // Trailing GraphName is optional — CONNECT_PINS|...|SourcePin|TargetNode|TargetPin|GraphName
+        FString GraphName = P.Num() >= 7 ? P[6] : TEXT("");
+        FString Err = ConnectPins(P[1], P[2], P[3], P[4], P[5], GraphName);
         bool bOk = Err.IsEmpty();
         SendResponse(Sender, bOk, Op,
             bOk ? TEXT("Pins connected") : Err, TEXT(""));
     }
     else if (Op == TEXT("DISCONNECT_PINS") && P.Num() >= 6)
     {
-        bool bOk = DisconnectPins(P[1], P[2], P[3], P[4], P[5]);
+        FString GraphName = P.Num() >= 7 ? P[6] : TEXT("");
+        bool bOk = DisconnectPins(P[1], P[2], P[3], P[4], P[5], GraphName);
         SendResponse(Sender, bOk, Op,
             bOk ? TEXT("Pins disconnected") : TEXT("Disconnect failed"), TEXT(""));
     }
     else if (Op == TEXT("DELETE_NODE") && P.Num() >= 3)
     {
-        bool bOk = DeleteNode(P[1], P[2]);
+        // Trailing GraphName is optional — DELETE_NODE|BPPath|NodeId|GraphName
+        FString GraphName = P.Num() >= 4 ? P[3] : TEXT("");
+        bool bOk = DeleteNode(P[1], P[2], GraphName);
         SendResponse(Sender, bOk, Op,
             bOk ? TEXT("Node deleted") : TEXT("Delete failed"), TEXT(""));
     }
     else if (Op == TEXT("CLEAR_NODES") && P.Num() >= 3)
     {
-        bool bOk = ClearNodes(P[1], P[2]);
+        // Trailing GraphName is optional — CLEAR_NODES|BPPath|CommentMatch|GraphName
+        FString GraphName = P.Num() >= 4 ? P[3] : TEXT("");
+        bool bOk = ClearNodes(P[1], P[2], GraphName);
         SendResponse(Sender, bOk, Op,
             bOk ? TEXT("Nodes cleared") : TEXT("Clear failed"), TEXT(""));
     }
@@ -420,9 +437,26 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommand(FString Command, ix::We
         SendResponse(Sender, bOk, Op,
             bOk ? TEXT("Default set") : TEXT("Set default failed"), TEXT(""));
     }
+    else if (Op == TEXT("ADD_ARRAY_PIN") && P.Num() >= 3)
+    {
+        // ADD_ARRAY_PIN|BPPath|NodeGUID
+        // K2Node_MakeArray only ever spawns with a single wildcard input pin
+        // [0] — the "+" button that adds more in the real editor calls
+        // AddInputPin(), which no existing opcode exposed. Needed because
+        // Array_Add's dual-wildcard (TargetArray + NewItem, mutually type-
+        // dependent) pins do not reliably retype even when both are wired
+        // to concrete sources — confirmed live: building a 2+ element
+        // literal array via MakeArray's own pins is the robust path.
+        FString Err = AddArrayPin(P[1], P[2]);
+        bool bOk = Err.IsEmpty();
+        SendResponse(Sender, bOk, Op,
+            bOk ? TEXT("Array pin added") : Err, TEXT(""));
+    }
     else if (Op == TEXT("GET_NODE_PINS") && P.Num() >= 3)
     {
-        FString Pins = GetNodePins(P[1], P[2]);
+        // Trailing GraphName is optional — GET_NODE_PINS|BPPath|NodeId|GraphName
+        FString GraphName = P.Num() >= 4 ? P[3] : TEXT("");
+        FString Pins = GetNodePins(P[1], P[2], GraphName);
         bool bOk = !Pins.IsEmpty();
         SendResponse(Sender, bOk, Op,
             bOk ? TEXT("Pins found") : TEXT("Node not found"), Pins);
@@ -500,9 +534,10 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommand(FString Command, ix::We
     }
     else if (Op == TEXT("LIST_NODES") && P.Num() >= 2)
     {
-        // LIST_NODES|BPPath
+        // LIST_NODES|BPPath|GraphName(optional)
         // Returns: GUID:Title:Comment|GUID:Title:Comment|...
-        FString Results = ListNodes(P[1]);
+        FString GraphName = P.Num() >= 3 ? P[2] : TEXT("");
+        FString Results = ListNodes(P[1], GraphName);
         bool bOk = !Results.IsEmpty();
         SendResponse(Sender, bOk, Op,
             bOk ? TEXT("Nodes listed") : TEXT("No nodes or BP not found"), Results);
@@ -551,6 +586,25 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommand(FString Command, ix::We
             bOk ? TEXT("Event reference set") : Err, TEXT(""));
     }
 
+    else if (Op == TEXT("SET_CUSTOM_EVENT_NAME") && P.Num() >= 4)
+    {
+        // SET_CUSTOM_EVENT_NAME|BPPath|NodeId|EventName
+        // K2Node_CustomEvent nodes spawn with CustomFunctionName "None" and
+        // no opcode could name them — SET_EVENT_REF requires binding to an
+        // EXISTING function on the parent class chain, which a user-defined
+        // custom event by definition isn't. Needed for anything that must
+        // call a Latent node (e.g. K2Node_PlayMontage) from outside this
+        // Blueprint's own graph: latent nodes are illegal inside plain
+        // CREATE_FUNCTION function graphs (confirmed live: "Event node ...
+        // registers net ... in a non-event graph"), so the callable entry
+        // point has to be a named Custom Event living in the main EventGraph
+        // instead — this command is what makes that name callable.
+        FString Err = SetCustomEventName(P[1], P[2], P[3]);
+        bool bOk = Err.IsEmpty();
+        SendResponse(Sender, bOk, Op,
+            bOk ? TEXT("Custom event named") : Err, TEXT(""));
+    }
+
     else if (Op == TEXT("SET_VARIABLE_REF") && P.Num() >= 4)
     {
         // SET_VARIABLE_REF|BPPath|NodeId|VarName
@@ -559,6 +613,25 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommand(FString Command, ix::We
         bool bOk = SetVariableRef(P[1], P[2], P[3], VarRefErr);
         SendResponse(Sender, bOk, Op,
             bOk ? TEXT("Variable reference set") : VarRefErr, TEXT(""));
+    }
+
+    else if (Op == TEXT("SET_EXTERNAL_VARIABLE_REF") && P.Num() >= 5)
+    {
+        // SET_EXTERNAL_VARIABLE_REF|BPPath|NodeId|OwnerClassName|VarName
+        // Like SET_VARIABLE_REF, but binds a K2Node_Variable to a property on
+        // an ARBITRARY class (e.g. TargetArmLength on SpringArmComponent),
+        // not just this Blueprint's own class hierarchy. SET_VARIABLE_REF
+        // always creates a self-context reference, which cannot express the
+        // common "get a component reference, then set/get a property on it"
+        // pattern (e.g. wiring a Tick-driven camera zoom into
+        // SpringArmComponent::TargetArmLength) since that property does not
+        // live on the Character's own class. The resulting node exposes a
+        // "Target" self pin that must be wired (via CONNECT_PINS) to the
+        // component reference (e.g. a Get CameraBoom node's output).
+        FString Err = SetExternalVariableRef(P[1], P[2], P[3], P[4]);
+        bool bOk = Err.IsEmpty();
+        SendResponse(Sender, bOk, Op,
+            bOk ? TEXT("External variable reference set") : Err, TEXT(""));
     }
 
     else if (Op == TEXT("CLOSE_BLUEPRINT") && P.Num() >= 2)
@@ -935,7 +1008,27 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommand(FString Command, ix::We
                 : (Result.IsEmpty() ? TEXT("Add variable failed") : Result.RightChop(4)),
             bOk ? Result : TEXT(""));
     }
-    else if (Op == TEXT("SET_VARIABLE_TYPE") && P.Num() >= 4)
+    else
+    {
+        // See ExecuteAtomicCommandExtended's declaration comment: this chain
+        // hit MSVC's C1061 nesting-depth limit, split here purely to shorten
+        // it -- no logic moved, just relocated.
+        ExecuteAtomicCommandExtended(Command, Op, P, Sender);
+    }
+
+#else
+    SendResponse(Sender, false, Op, TEXT("GraphBridge commands require an editor build"), TEXT(""));
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// Command router, part 2 — see ExecuteAtomicCommandExtended's header comment.
+// ---------------------------------------------------------------------------
+void UGraphBridgeAutomationLibrary::ExecuteAtomicCommandExtended(const FString& Command, const FString& Op,
+    const TArray<FString>& P, ix::WebSocket* Sender)
+{
+#if WITH_EDITOR
+    if (Op == TEXT("SET_VARIABLE_TYPE") && P.Num() >= 4)
     {
         // SET_VARIABLE_TYPE|BPPath|VarName|NewType
         // Retypes an existing Blueprint member variable.
@@ -1276,6 +1369,75 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommand(FString Command, ix::We
             bOk ? TEXT("Transitions listed") : Result.RightChop(4),
             bOk ? Result : TEXT(""));
     }
+    else if (Op == TEXT("GET_ANIM_NODE_PINS") && P.Num() >= 3)
+    {
+        // GET_ANIM_NODE_PINS|BPPath|NodeGUID
+        FString Result = GetAnimNodePins(P[1], P[2]);
+        SendResponse(Sender, true, Op, TEXT("Pins found"), Result);
+    }
+    else if (Op == TEXT("CONNECT_ANIM_PINS") && P.Num() >= 6)
+    {
+        // CONNECT_ANIM_PINS|BPPath|NodeGUIDA|PinNameA|NodeGUIDB|PinNameB
+        FString Result = ConnectAnimPins(P[1], P[2], P[3], P[4], P[5]);
+        bool bOk = Result.IsEmpty();
+        SendResponse(Sender, bOk, Op,
+            bOk ? TEXT("Anim pins connected") : Result.RightChop(4),
+            TEXT(""));
+    }
+    else if (Op == TEXT("LIST_ANIM_GRAPH_NODES") && P.Num() >= 3)
+    {
+        // LIST_ANIM_GRAPH_NODES|BPPath|GraphName
+        FString Result = ListAnimGraphNodes(P[1], P[2]);
+        bool bOk = !Result.StartsWith(TEXT("ERR:"));
+        SendResponse(Sender, bOk, Op,
+            bOk ? TEXT("Anim graph nodes listed") : Result.RightChop(4),
+            bOk ? Result : TEXT(""));
+    }
+    else if (Op == TEXT("LIST_STATE_GRAPH_NODES") && P.Num() >= 3)
+    {
+        // LIST_STATE_GRAPH_NODES|BPPath|StateOrTransitionGUID
+        FString Result = ListStateGraphNodes(P[1], P[2]);
+        bool bOk = !Result.StartsWith(TEXT("ERR:"));
+        SendResponse(Sender, bOk, Op,
+            bOk ? TEXT("State graph nodes listed") : Result.RightChop(4),
+            bOk ? Result : TEXT(""));
+    }
+    else if (Op == TEXT("SPAWN_NODE_ANCHORED") && P.Num() >= 6)
+    {
+        // SPAWN_NODE_ANCHORED|BPPath|AnchorNodeGUID|NodeClass|Comment|X|Y
+        FString Result = SpawnNodeAnchored(P[1], P[2], P[3], P[4], FCString::Atoi(*P[5]), P.Num() >= 7 ? FCString::Atoi(*P[6]) : 0);
+        bool bOk = !Result.StartsWith(TEXT("ERR:"));
+        SendResponse(Sender, bOk, Op,
+            bOk ? FString::Printf(TEXT("Node spawned: %s"), *Result) : Result.RightChop(4),
+            bOk ? Result : TEXT(""));
+    }
+    else if (Op == TEXT("CREATE_BLEND_SPACE_PLAYER_ANCHORED") && P.Num() >= 6)
+    {
+        // CREATE_BLEND_SPACE_PLAYER_ANCHORED|BPPath|AnchorNodeGUID|BlendSpaceAssetPath|X|Y
+        FString Result = CreateBlendSpacePlayerAnchored(P[1], P[2], P[3], FCString::Atoi(*P[4]), FCString::Atoi(*P[5]));
+        bool bOk = !Result.StartsWith(TEXT("ERR:"));
+        SendResponse(Sender, bOk, Op,
+            bOk ? FString::Printf(TEXT("BlendSpacePlayer spawned: %s"), *Result) : Result.RightChop(4),
+            bOk ? Result : TEXT(""));
+    }
+    else if (Op == TEXT("SET_TRANSITION_CONDITION") && P.Num() >= 5)
+    {
+        // SET_TRANSITION_CONDITION|BPPath|TransitionNodeGUID|VarName|bNegate(0/1)
+        FString Result = SetTransitionCondition(P[1], P[2], P[3], FCString::Atoi(*P[4]) != 0);
+        bool bOk = Result.IsEmpty();
+        SendResponse(Sender, bOk, Op,
+            bOk ? TEXT("Transition condition set") : Result.RightChop(4),
+            TEXT(""));
+    }
+    else if (Op == TEXT("ADD_ANIM_SLOT_NODE") && P.Num() >= 6)
+    {
+        // ADD_ANIM_SLOT_NODE|BPPath|GraphName|SlotName|X|Y
+        FString Result = AddAnimSlotNode(P[1], P[2], P[3], FCString::Atoi(*P[4]), FCString::Atoi(*P[5]));
+        bool bOk = !Result.StartsWith(TEXT("ERR:"));
+        SendResponse(Sender, bOk, Op,
+            bOk ? FString::Printf(TEXT("Slot node spawned: %s"), *Result) : Result.RightChop(4),
+            bOk ? Result : TEXT(""));
+    }
     else if (Op == TEXT("CREATE_NIAGARA_SYSTEM") && P.Num() >= 2)
     {
         // CREATE_NIAGARA_SYSTEM|AssetPath
@@ -1373,6 +1535,42 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommand(FString Command, ix::We
             bOk ? FString::Printf(TEXT("Anim Montage created at '%s'"), *Result) : Result.RightChop(4),
             bOk ? Result : TEXT(""));
     }
+    else if (Op == TEXT("GET_ANIM_PIN_CONNECTIONS") && P.Num() >= 4)
+    {
+        // GET_ANIM_PIN_CONNECTIONS|BPPath|NodeGUID|PinName
+        FString Result = GetAnimPinConnections(P[1], P[2], P[3]);
+        bool bOk = !Result.StartsWith(TEXT("ERR:"));
+        SendResponse(Sender, bOk, Op,
+            bOk ? TEXT("Pin connections listed") : Result.RightChop(4),
+            bOk ? Result : TEXT(""));
+    }
+    else if (Op == TEXT("EDIT_BLEND_SPACE_SAMPLE") && P.Num() >= 5)
+    {
+        // EDIT_BLEND_SPACE_SAMPLE|BlendSpaceAssetPath|AnimSequencePath|NewX|NewY
+        FString Result = EditBlendSpaceSample(P[1], P[2], FCString::Atof(*P[3]), FCString::Atof(*P[4]));
+        bool bOk = Result.IsEmpty();
+        SendResponse(Sender, bOk, Op,
+            bOk ? TEXT("Sample repositioned") : Result.RightChop(4),
+            TEXT(""));
+    }
+    else if (Op == TEXT("SET_BLEND_SPACE_PLAYER_ASSET") && P.Num() >= 4)
+    {
+        // SET_BLEND_SPACE_PLAYER_ASSET|BPPath|NodeGUID|BlendSpaceAssetPath
+        FString Result = SetBlendSpacePlayerAsset(P[1], P[2], P[3]);
+        bool bOk = Result.IsEmpty();
+        SendResponse(Sender, bOk, Op,
+            bOk ? TEXT("BlendSpacePlayer asset set") : Result.RightChop(4),
+            TEXT(""));
+    }
+    else if (Op == TEXT("ADD_BLEND_SPACE_SAMPLE") && P.Num() >= 5)
+    {
+        // ADD_BLEND_SPACE_SAMPLE|BlendSpaceAssetPath|AnimSequencePath|X|Y
+        FString Result = AddBlendSpaceSample(P[1], P[2], FCString::Atof(*P[3]), FCString::Atof(*P[4]));
+        bool bOk = !Result.StartsWith(TEXT("ERR:"));
+        SendResponse(Sender, bOk, Op,
+            bOk ? FString::Printf(TEXT("Sample added at index %s"), *Result) : Result.RightChop(4),
+            bOk ? Result : TEXT(""));
+    }
     else if (Op == TEXT("CREATE_BLEND_SPACE") && P.Num() >= 3)
     {
         // CREATE_BLEND_SPACE|AssetPath|SkeletonPath
@@ -1390,6 +1588,37 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommand(FString Command, ix::We
         bool bOk = Err.IsEmpty();
         SendResponse(Sender, bOk, Op,
             bOk ? TEXT("Skeleton socket added") : Err.RightChop(4), TEXT(""));
+    }
+    // ------------------------------------------------------------------
+    // Multi-graph support — Function & Macro graphs (v1.15)
+    // ------------------------------------------------------------------
+    else if (Op == TEXT("LIST_GRAPHS") && P.Num() >= 2)
+    {
+        // LIST_GRAPHS|BPPath
+        // Returns pipe-delimited "GraphName~GraphType" entries.
+        FString Result = ListGraphs(P[1]);
+        bool bOk = !Result.StartsWith(TEXT("ERR:"));
+        SendResponse(Sender, bOk, Op,
+            bOk ? TEXT("Graphs listed") : Result.RightChop(4),
+            bOk ? Result : TEXT(""));
+    }
+    else if (Op == TEXT("CREATE_FUNCTION_GRAPH") && P.Num() >= 3)
+    {
+        // CREATE_FUNCTION_GRAPH|BPPath|FunctionName
+        FString Result = CreateFunctionGraph(P[1], P[2]);
+        bool bOk = !Result.StartsWith(TEXT("ERR:"));
+        SendResponse(Sender, bOk, Op,
+            bOk ? FString::Printf(TEXT("Function graph '%s' created"), *P[2]) : Result.RightChop(4),
+            bOk ? Result : TEXT(""));
+    }
+    else if (Op == TEXT("CREATE_MACRO_GRAPH") && P.Num() >= 3)
+    {
+        // CREATE_MACRO_GRAPH|BPPath|MacroName
+        FString Result = CreateMacroGraph(P[1], P[2]);
+        bool bOk = !Result.StartsWith(TEXT("ERR:"));
+        SendResponse(Sender, bOk, Op,
+            bOk ? FString::Printf(TEXT("Macro graph '%s' created"), *P[2]) : Result.RightChop(4),
+            bOk ? Result : TEXT(""));
     }
     else
     {
@@ -1559,11 +1788,21 @@ FString UGraphBridgeAutomationLibrary::SpawnEventNode(
 }
 
 FString UGraphBridgeAutomationLibrary::SpawnNode(FString BlueprintPath, FString NodeClass,
-    FString Comment, int32 X, int32 Y)
+    FString Comment, int32 X, int32 Y, FString GraphName)
 {
     UBlueprint* Blueprint = GetBlueprintByPath(BlueprintPath);
     if (!Blueprint)
         return FString::Printf(TEXT("ERR:Blueprint not found at '%s'"), *BlueprintPath);
+
+    if (!GraphName.IsEmpty())
+    {
+        UEdGraph* Graph = FindGraphByName(Blueprint, GraphName);
+        if (!Graph)
+            return FString::Printf(
+                TEXT("ERR:Graph '%s' not found — run LIST_GRAPHS to see available graphs"), *GraphName);
+        return SpawnNodeOnGraph(Blueprint, Graph, NodeClass, Comment, X, Y);
+    }
+
     if (!Blueprint->UbergraphPages.Num())
         return TEXT("ERR:Blueprint has no EventGraph pages");
 
@@ -1574,7 +1813,9 @@ FString UGraphBridgeAutomationLibrary::SpawnNode(FString BlueprintPath, FString 
 // FindGraphByName
 // "EventGraph" (or any UbergraphPages name match) resolves to the main event
 // graph. Anything else is matched by name against Blueprint->FunctionGraphs
-// (created via CREATE_FUNCTION, or any other user function graph).
+// (created via CREATE_FUNCTION/CREATE_FUNCTION_GRAPH, or any other user
+// function graph), then Blueprint->MacroGraphs (created via
+// CREATE_MACRO_GRAPH) — searched in that order.
 // ---------------------------------------------------------------------------
 UEdGraph* UGraphBridgeAutomationLibrary::FindGraphByName(UBlueprint* Blueprint, const FString& GraphName)
 {
@@ -1591,6 +1832,36 @@ UEdGraph* UGraphBridgeAutomationLibrary::FindGraphByName(UBlueprint* Blueprint, 
         if (Graph && Graph->GetName().Equals(GraphName, ESearchCase::IgnoreCase))
             return Graph;
 
+    for (UEdGraph* Graph : Blueprint->MacroGraphs)
+        if (Graph && Graph->GetName().Equals(GraphName, ESearchCase::IgnoreCase))
+            return Graph;
+
+    return nullptr;
+}
+
+// ---------------------------------------------------------------------------
+// FindNodeInGraph — see header comment. Combines FindNodeById's GUID lookup
+// and FindNodeByName's comment/title lookup (with the same
+// return-null-on-ambiguity convention), but scoped to a single graph instead
+// of Blueprint->UbergraphPages.
+// ---------------------------------------------------------------------------
+UEdGraphNode* UGraphBridgeAutomationLibrary::FindNodeInGraph(UEdGraph* Graph, const FString& NodeId)
+{
+    if (!Graph) return nullptr;
+
+    TArray<UEdGraphNode*> Matches;
+    for (UEdGraphNode* Node : Graph->Nodes)
+    {
+        if (!Node) continue;
+        if (Node->NodeGuid.ToString() == NodeId) return Node;
+        if (Node->NodeComment == NodeId ||
+            Node->GetNodeTitle(ENodeTitleType::FullTitle).ToString() == NodeId)
+        {
+            Matches.Add(Node);
+        }
+    }
+
+    if (Matches.Num() == 1) return Matches[0];
     return nullptr;
 }
 
@@ -1844,27 +2115,49 @@ FString UGraphBridgeAutomationLibrary::SetNodePosition(FString BlueprintPath, FS
 // The caller (ExecuteAtomicCommand) uses IsEmpty() to determine success and
 // forwards the error string to SendResponse so the AI can self-correct.
 FString UGraphBridgeAutomationLibrary::ConnectPins(FString BlueprintPath,
-    FString NodeA, FString PinA, FString NodeB, FString PinB)
+    FString NodeA, FString PinA, FString NodeB, FString PinB, FString GraphName)
 {
     UBlueprint* Blueprint = GetBlueprintByPath(BlueprintPath);
     if (!Blueprint)
         return FString::Printf(TEXT("Blueprint not found at '%s'"), *BlueprintPath);
-    if (!Blueprint->UbergraphPages.Num())
-        return TEXT("Blueprint has no EventGraph pages");
 
-    UEdGraph* Graph = Blueprint->UbergraphPages[0];
+    UEdGraph* Graph = nullptr;
+    UEdGraphNode* SourceNode = nullptr;
+    UEdGraphNode* TargetNode = nullptr;
+
+    if (!GraphName.IsEmpty())
+    {
+        Graph = FindGraphByName(Blueprint, GraphName);
+        if (!Graph)
+            return FString::Printf(TEXT("Graph '%s' not found — run LIST_GRAPHS to see available graphs"), *GraphName);
+
+        SourceNode = FindNodeInGraph(Graph, NodeA);
+        if (!SourceNode)
+            return FString::Printf(TEXT("Source node not found: '%s' in graph '%s'"), *NodeA, *GraphName);
+
+        TargetNode = FindNodeInGraph(Graph, NodeB);
+        if (!TargetNode)
+            return FString::Printf(TEXT("Target node not found: '%s' in graph '%s'"), *NodeB, *GraphName);
+    }
+    else
+    {
+        if (!Blueprint->UbergraphPages.Num())
+            return TEXT("Blueprint has no EventGraph pages");
+        Graph = Blueprint->UbergraphPages[0];
+
+        SourceNode = FindNodeById(Blueprint, NodeA);
+        if (!SourceNode) SourceNode = FindNodeByName(Blueprint, NodeA);
+        if (!SourceNode)
+            return FString::Printf(TEXT("Source node not found: '%s' — run LIST_NODES to get valid GUIDs"), *NodeA);
+
+        TargetNode = FindNodeById(Blueprint, NodeB);
+        if (!TargetNode) TargetNode = FindNodeByName(Blueprint, NodeB);
+        if (!TargetNode)
+            return FString::Printf(TEXT("Target node not found: '%s' — run LIST_NODES to get valid GUIDs"), *NodeB);
+    }
+
     const UEdGraphSchema_K2* Schema = Cast<const UEdGraphSchema_K2>(Graph->GetSchema());
     if (!Schema) return TEXT("Could not get K2 schema");
-
-    UEdGraphNode* SourceNode = FindNodeById(Blueprint, NodeA);
-    if (!SourceNode) SourceNode = FindNodeByName(Blueprint, NodeA);
-    if (!SourceNode)
-        return FString::Printf(TEXT("Source node not found: '%s' — run LIST_NODES to get valid GUIDs"), *NodeA);
-
-    UEdGraphNode* TargetNode = FindNodeById(Blueprint, NodeB);
-    if (!TargetNode) TargetNode = FindNodeByName(Blueprint, NodeB);
-    if (!TargetNode)
-        return FString::Printf(TEXT("Target node not found: '%s' — run LIST_NODES to get valid GUIDs"), *NodeB);
 
     // Build available pin list for helpful error messages
     auto PinList = [](UEdGraphNode* Node) -> FString {
@@ -1908,26 +2201,65 @@ FString UGraphBridgeAutomationLibrary::ConnectPins(FString BlueprintPath,
     SourceNode->Modify();
     TargetNode->Modify();
     Schema->TryCreateConnection(SourcePin, TargetPin);
+
+    // Explicitly notify both nodes of the new connection. Wildcard/array-
+    // dependent pins (e.g. Array_Length's TargetArray, meta=(ArrayParm=...))
+    // only retype themselves in response to this callback. In the real
+    // Blueprint editor this fires as a side effect of the drag-and-drop
+    // connection UI; TryCreateConnection alone does not reliably trigger it
+    // for nodes spawned via this bridge's NewObject+template-duplication
+    // pipeline — confirmed live: connecting a concretely-typed Actor array
+    // into Array_Length's TargetArray pin left it at "undetermined type"
+    // after TryCreateConnection alone, with the compiler asking to "connect
+    // something to Length to imply a specific type" (the retyping consumer
+    // path also never fired). Calling this explicitly on both endpoints
+    // mirrors what the editor does and is a no-op for ordinary non-wildcard
+    // pins.
+    // NotifyPinConnectionListChanged is declared on UK2Node, NOT the generic
+    // UEdGraphNode base (confirmed by a real compile error: "is not a member
+    // of 'UEdGraphNode'") — every node this bridge spawns in a K2 graph is a
+    // UK2Node in practice, so this cast is safe; guarded with an if in case
+    // a future caller ever passes a non-K2 graph node.
+    if (UK2Node* SourceK2 = Cast<UK2Node>(SourceNode))
+        SourceK2->NotifyPinConnectionListChanged(SourcePin);
+    if (UK2Node* TargetK2 = Cast<UK2Node>(TargetNode))
+        TargetK2->NotifyPinConnectionListChanged(TargetPin);
+
     FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
     return TEXT(""); // empty = success
 }
 
 bool UGraphBridgeAutomationLibrary::DisconnectPins(FString BlueprintPath,
-    FString NodeA, FString PinA, FString NodeB, FString PinB)
+    FString NodeA, FString PinA, FString NodeB, FString PinB, FString GraphName)
 {
     UBlueprint* Blueprint = GetBlueprintByPath(BlueprintPath);
     if (!Blueprint) return false;
-    if (!Blueprint->UbergraphPages.Num()) return false;
 
-    UEdGraph* Graph = Blueprint->UbergraphPages[0];
+    UEdGraph* Graph = nullptr;
+    UEdGraphNode* SourceNode = nullptr;
+    UEdGraphNode* TargetNode = nullptr;
+
+    if (!GraphName.IsEmpty())
+    {
+        Graph = FindGraphByName(Blueprint, GraphName);
+        if (!Graph) return false;
+        SourceNode = FindNodeInGraph(Graph, NodeA);
+        TargetNode = FindNodeInGraph(Graph, NodeB);
+    }
+    else
+    {
+        if (!Blueprint->UbergraphPages.Num()) return false;
+        Graph = Blueprint->UbergraphPages[0];
+
+        SourceNode = FindNodeById(Blueprint, NodeA);
+        if (!SourceNode) SourceNode = FindNodeByName(Blueprint, NodeA);
+        TargetNode = FindNodeById(Blueprint, NodeB);
+        if (!TargetNode) TargetNode = FindNodeByName(Blueprint, NodeB);
+    }
+    if (!SourceNode || !TargetNode) return false;
+
     const UEdGraphSchema_K2* Schema = Cast<const UEdGraphSchema_K2>(Graph->GetSchema());
     if (!Schema) return false;
-
-    UEdGraphNode* SourceNode = FindNodeById(Blueprint, NodeA);
-    if (!SourceNode) SourceNode = FindNodeByName(Blueprint, NodeA);
-    UEdGraphNode* TargetNode = FindNodeById(Blueprint, NodeB);
-    if (!TargetNode) TargetNode = FindNodeByName(Blueprint, NodeB);
-    if (!SourceNode || !TargetNode) return false;
 
     UEdGraphPin* SourcePin = SourceNode->FindPin(PinA);
     UEdGraphPin* TargetPin = TargetNode->FindPin(PinB);
@@ -1960,12 +2292,22 @@ bool UGraphBridgeAutomationLibrary::DisconnectPins(FString BlueprintPath,
 // its EditorStateMachineGraph sub-graph — skipping it (the original bug)
 // would silently orphan that sub-graph in the package instead of deleting it.
 // ---------------------------------------------------------------------------
-bool UGraphBridgeAutomationLibrary::DeleteNode(FString BlueprintPath, FString NodeId)
+bool UGraphBridgeAutomationLibrary::DeleteNode(FString BlueprintPath, FString NodeId, FString GraphName)
 {
     UBlueprint* Blueprint = GetBlueprintByPath(BlueprintPath);
     if (!Blueprint) return false;
 
-    UEdGraphNode* Node = FindNodeByIdAllGraphs(Blueprint, NodeId);
+    UEdGraphNode* Node = nullptr;
+    if (!GraphName.IsEmpty())
+    {
+        UEdGraph* Graph = FindGraphByName(Blueprint, GraphName);
+        if (!Graph) return false;
+        Node = FindNodeInGraph(Graph, NodeId);
+    }
+    else
+    {
+        Node = FindNodeAnywhere(Blueprint, NodeId);
+    }
     if (!Node) return false;
 
     const FScopedTransaction Transaction(NSLOCTEXT("GraphBridge", "DeleteNode", "GraphBridge: Delete Node"));
@@ -1974,16 +2316,27 @@ bool UGraphBridgeAutomationLibrary::DeleteNode(FString BlueprintPath, FString No
     return true;
 }
 
-bool UGraphBridgeAutomationLibrary::ClearNodes(FString BlueprintPath, FString CommentMatch)
+bool UGraphBridgeAutomationLibrary::ClearNodes(FString BlueprintPath, FString CommentMatch, FString GraphName)
 {
     UBlueprint* Blueprint = GetBlueprintByPath(BlueprintPath);
     if (!Blueprint) return false;
 
     TArray<UEdGraphNode*> ToRemove;
-    for (UEdGraph* Graph : Blueprint->UbergraphPages)
+    if (!GraphName.IsEmpty())
+    {
+        UEdGraph* Graph = FindGraphByName(Blueprint, GraphName);
+        if (!Graph) return false;
         for (UEdGraphNode* Node : Graph->Nodes)
             if (Node && Node->NodeComment.Contains(CommentMatch))
                 ToRemove.Add(Node);
+    }
+    else
+    {
+        for (UEdGraph* Graph : Blueprint->UbergraphPages)
+            for (UEdGraphNode* Node : Graph->Nodes)
+                if (Node && Node->NodeComment.Contains(CommentMatch))
+                    ToRemove.Add(Node);
+    }
 
     if (ToRemove.Num() == 0) return false;
 
@@ -2009,7 +2362,12 @@ bool UGraphBridgeAutomationLibrary::SetPinDefault(FString BlueprintPath,
     UBlueprint* Blueprint = GetBlueprintByPath(BlueprintPath);
     if (!Blueprint) return false;
 
-    UEdGraphNode* Node = FindNodeById(Blueprint, NodeId);
+    // FindNodeById only walks UbergraphPages — confirmed live this silently
+    // fails for any node in a custom function graph (spawned via
+    // SPAWN_NODE_IN_GRAPH), AnimGraph, or state machine, even though those
+    // are all reachable via GET_ANIM_NODE_PINS/CONNECT_ANIM_PINS already.
+    // FindNodeAnywhere is the same broad search SetVariableRef already uses.
+    UEdGraphNode* Node = FindNodeAnywhere(Blueprint, NodeId);
     if (!Node) Node = FindNodeByName(Blueprint, NodeId);
     if (!Node) return false;
 
@@ -2076,13 +2434,23 @@ bool UGraphBridgeAutomationLibrary::SetPinDefault(FString BlueprintPath,
     return true;
 }
 
-FString UGraphBridgeAutomationLibrary::GetNodePins(FString BlueprintPath, FString NodeName)
+FString UGraphBridgeAutomationLibrary::GetNodePins(FString BlueprintPath, FString NodeName, FString GraphName)
 {
     UBlueprint* Blueprint = GetBlueprintByPath(BlueprintPath);
     if (!Blueprint) return TEXT("");
 
-    UEdGraphNode* Node = FindNodeByName(Blueprint, NodeName);
-    if (!Node) Node = FindNodeById(Blueprint, NodeName);
+    UEdGraphNode* Node = nullptr;
+    if (!GraphName.IsEmpty())
+    {
+        UEdGraph* Graph = FindGraphByName(Blueprint, GraphName);
+        if (!Graph) return TEXT("");
+        Node = FindNodeInGraph(Graph, NodeName);
+    }
+    else
+    {
+        Node = FindNodeByName(Blueprint, NodeName);
+        if (!Node) Node = FindNodeById(Blueprint, NodeName);
+    }
     if (!Node) return TEXT("");
 
     TArray<FString> PinDescs;
@@ -2156,7 +2524,9 @@ FString UGraphBridgeAutomationLibrary::GetPinDefault(
     if (!Blueprint)
         return FString::Printf(TEXT("ERR:Blueprint not found at '%s'"), *BlueprintPath);
 
-    UEdGraphNode* Node = FindNodeById(Blueprint, NodeId);
+    // See SetPinDefault — same FindNodeById→FindNodeAnywhere fix, for the
+    // same reason (function graphs / AnimGraph / state machines).
+    UEdGraphNode* Node = FindNodeAnywhere(Blueprint, NodeId);
     if (!Node) Node = FindNodeByName(Blueprint, NodeId);
     if (!Node)
         return FString::Printf(
@@ -2357,8 +2727,23 @@ bool UGraphBridgeAutomationLibrary::SaveBlueprint(FString BlueprintPath)
     return bSuccess;
 }
 
-FEdGraphPinType UGraphBridgeAutomationLibrary::ResolveTypeString(const FString& TypeString)
+FEdGraphPinType UGraphBridgeAutomationLibrary::ResolveTypeString(const FString& InTypeString)
 {
+    // Array container support: a trailing "[]" (e.g. "class:Character[]")
+    // requests an array of the base type. No existing caller used a type
+    // string ending in "[]" before this was added, so this is purely
+    // additive — added because ADD_VARIABLE/SPAWN_VARIABLE had no way to
+    // create an array-typed member variable at all (confirmed live: every
+    // branch below only ever sets PinCategory, never ContainerType, so
+    // container was always Array's default None/single-value).
+    FString TypeString = InTypeString;
+    bool bIsArray = false;
+    if (TypeString.EndsWith(TEXT("[]")))
+    {
+        TypeString = TypeString.LeftChop(2);
+        bIsArray = true;
+    }
+
     FEdGraphPinType PinType;
     PinType.PinCategory = UEdGraphSchema_K2::PC_Wildcard;
 
@@ -2417,6 +2802,9 @@ FEdGraphPinType UGraphBridgeAutomationLibrary::ResolveTypeString(const FString& 
         PinType.PinSubCategoryObject = FindFirstObject<UClass>(*ClassName, EFindFirstObjectOptions::None);
     }
 
+    if (bIsArray && PinType.PinCategory != UEdGraphSchema_K2::PC_Wildcard)
+        PinType.ContainerType = EPinContainerType::Array;
+
     return PinType;
 }
 
@@ -2466,13 +2854,25 @@ bool UGraphBridgeAutomationLibrary::SetVariableDefault(FString BlueprintPath,
     return true;
 }
 
-FString UGraphBridgeAutomationLibrary::ListNodes(FString BlueprintPath)
+FString UGraphBridgeAutomationLibrary::ListNodes(FString BlueprintPath, FString GraphName)
 {
     UBlueprint* Blueprint = GetBlueprintByPath(BlueprintPath);
     if (!Blueprint) return TEXT("");
 
+    TArray<UEdGraph*> GraphsToList;
+    if (!GraphName.IsEmpty())
+    {
+        UEdGraph* Graph = FindGraphByName(Blueprint, GraphName);
+        if (!Graph) return TEXT("");
+        GraphsToList.Add(Graph);
+    }
+    else
+    {
+        GraphsToList = Blueprint->UbergraphPages;
+    }
+
     TArray<FString> Entries;
-    for (UEdGraph* Graph : Blueprint->UbergraphPages)
+    for (UEdGraph* Graph : GraphsToList)
     {
         for (UEdGraphNode* Node : Graph->Nodes)
         {
@@ -2640,7 +3040,7 @@ FString UGraphBridgeAutomationLibrary::SetFunctionRef(FString BlueprintPath,
     if (!Blueprint)
         return FString::Printf(TEXT("Blueprint not found at '%s'"), *BlueprintPath);
 
-    UEdGraphNode* Node = FindNodeById(Blueprint, NodeId);
+    UEdGraphNode* Node = FindNodeAnywhere(Blueprint, NodeId);
     if (!Node) Node = FindNodeByName(Blueprint, NodeId);
     if (!Node)
         return FString::Printf(TEXT("Node not found: '%s' — run LIST_NODES to get valid GUIDs"), *NodeId);
@@ -2692,7 +3092,7 @@ bool UGraphBridgeAutomationLibrary::SetVariableRef(FString BlueprintPath,
     UBlueprint* Blueprint = GetBlueprintByPath(BlueprintPath);
     if (!Blueprint) { OutError = FString::Printf(TEXT("Blueprint not found at '%s'"), *BlueprintPath); return false; }
 
-    UEdGraphNode* Node = FindNodeById(Blueprint, NodeId);
+    UEdGraphNode* Node = FindNodeAnywhere(Blueprint, NodeId);
     if (!Node) Node = FindNodeByName(Blueprint, NodeId);
     if (!Node) { OutError = FString::Printf(TEXT("Node not found: '%s' — run LIST_NODES to get valid GUIDs"), *NodeId); return false; }
 
@@ -2779,6 +3179,57 @@ bool UGraphBridgeAutomationLibrary::SetVariableRef(FString BlueprintPath,
 
     FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// SetExternalVariableRef — binds a K2Node_Variable to a property on an
+// ARBITRARY class, not just this Blueprint's own class hierarchy (see
+// SET_EXTERNAL_VARIABLE_REF comment at the dispatch site for why this is
+// needed alongside SetVariableRef, which is self-context only).
+// ---------------------------------------------------------------------------
+FString UGraphBridgeAutomationLibrary::SetExternalVariableRef(FString BlueprintPath,
+    FString NodeId, FString OwnerClassName, FString VarName)
+{
+    UBlueprint* Blueprint = GetBlueprintByPath(BlueprintPath);
+    if (!Blueprint)
+        return FString::Printf(TEXT("ERR:Blueprint not found at '%s'"), *BlueprintPath);
+
+    UEdGraphNode* Node = FindNodeAnywhere(Blueprint, NodeId);
+    if (!Node) Node = FindNodeByName(Blueprint, NodeId);
+    if (!Node)
+        return FString::Printf(TEXT("ERR:Node not found: '%s' — run LIST_NODES to get valid GUIDs"), *NodeId);
+
+    UK2Node_Variable* VarNode = Cast<UK2Node_Variable>(Node);
+    if (!VarNode)
+        return TEXT("ERR:node is not a K2Node_Variable — spawn a K2Node_VariableGet or K2Node_VariableSet first");
+
+    UClass* OwnerClass = FindFirstObject<UClass>(*OwnerClassName, EFindFirstObjectOptions::None);
+    if (!OwnerClass)
+        OwnerClass = FindFirstObject<UClass>(*FString::Printf(TEXT("U%s"), *OwnerClassName),
+            EFindFirstObjectOptions::None);
+    if (!OwnerClass)
+        return FString::Printf(TEXT("ERR:Class '%s' not found"), *OwnerClassName);
+
+    FProperty* VarProperty = FindFProperty<FProperty>(OwnerClass, *VarName);
+    if (!VarProperty)
+        return FString::Printf(TEXT("ERR:Property '%s' not found on class '%s'"), *VarName, *OwnerClassName);
+
+    const FScopedTransaction Transaction(
+        NSLOCTEXT("GraphBridge", "SetExternalVariableRef", "GraphBridge: Set External Variable Reference"));
+    VarNode->Modify();
+
+    // bIsConsideredSelfContext=false is the whole point here — it produces a
+    // node with a "Target" input pin (wire it via CONNECT_PINS to whatever
+    // object reference owns the property, e.g. a Get CameraBoom node),
+    // exactly matching what dragging off a component pin and choosing
+    // "Set <Property>" does in the Blueprint editor.
+    FMemberReference MemberRef;
+    MemberRef.SetFromField<FProperty>(VarProperty, /*bIsConsideredSelfContext=*/false, OwnerClass);
+    VarNode->VariableReference = MemberRef;
+    VarNode->ReconstructNode();
+
+    FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
+    return TEXT("");
 }
 
 // ---------------------------------------------------------------------------
@@ -2976,6 +3427,66 @@ FString UGraphBridgeAutomationLibrary::SetEventRef(FString BlueprintPath,
     EventNode->EventReference.SetFromField<UFunction>(Function, false);
     EventNode->bOverrideFunction = true;
     EventNode->ReconstructNode();
+    FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
+    return TEXT(""); // empty = success
+}
+
+// ---------------------------------------------------------------------------
+// SetCustomEventName — names a K2Node_CustomEvent so it becomes a real,
+// externally-callable UFunction after compile. See SET_CUSTOM_EVENT_NAME
+// dispatch comment for why this is needed alongside SetEventRef.
+// ---------------------------------------------------------------------------
+FString UGraphBridgeAutomationLibrary::SetCustomEventName(FString BlueprintPath,
+    FString NodeId, FString EventName)
+{
+    UBlueprint* Blueprint = GetBlueprintByPath(BlueprintPath);
+    if (!Blueprint)
+        return FString::Printf(TEXT("ERR:Blueprint not found at '%s'"), *BlueprintPath);
+
+    UEdGraphNode* Node = FindNodeAnywhere(Blueprint, NodeId);
+    if (!Node) Node = FindNodeByName(Blueprint, NodeId);
+    if (!Node)
+        return FString::Printf(TEXT("ERR:Node not found: '%s' — run LIST_NODES to get valid GUIDs"), *NodeId);
+
+    UK2Node_CustomEvent* EventNode = Cast<UK2Node_CustomEvent>(Node);
+    if (!EventNode)
+        return FString::Printf(TEXT("ERR:Node is not a K2Node_CustomEvent (it is %s)"),
+            *Node->GetClass()->GetName());
+
+    const FScopedTransaction Transaction(
+        NSLOCTEXT("GraphBridge", "SetCustomEventName", "GraphBridge: Set Custom Event Name"));
+    EventNode->Modify();
+    EventNode->CustomFunctionName = FBlueprintEditorUtils::FindUniqueKismetName(Blueprint, EventName);
+    EventNode->ReconstructNode();
+    FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
+    return TEXT(""); // empty = success
+}
+
+// ---------------------------------------------------------------------------
+// AddArrayPin — appends one more wildcard input pin to a K2Node_MakeArray,
+// mirroring the "+" affordance in the real Blueprint editor. See
+// ADD_ARRAY_PIN dispatch comment for why this is needed.
+// ---------------------------------------------------------------------------
+FString UGraphBridgeAutomationLibrary::AddArrayPin(FString BlueprintPath, FString NodeId)
+{
+    UBlueprint* Blueprint = GetBlueprintByPath(BlueprintPath);
+    if (!Blueprint)
+        return FString::Printf(TEXT("ERR:Blueprint not found at '%s'"), *BlueprintPath);
+
+    UEdGraphNode* Node = FindNodeAnywhere(Blueprint, NodeId);
+    if (!Node) Node = FindNodeByName(Blueprint, NodeId);
+    if (!Node)
+        return FString::Printf(TEXT("ERR:Node not found: '%s' — run LIST_NODES to get valid GUIDs"), *NodeId);
+
+    UK2Node_MakeArray* MakeArrayNode = Cast<UK2Node_MakeArray>(Node);
+    if (!MakeArrayNode)
+        return FString::Printf(TEXT("ERR:Node is not a K2Node_MakeArray (it is %s)"),
+            *Node->GetClass()->GetName());
+
+    const FScopedTransaction Transaction(
+        NSLOCTEXT("GraphBridge", "AddArrayPin", "GraphBridge: Add Array Pin"));
+    MakeArrayNode->Modify();
+    MakeArrayNode->AddInputPin();
     FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
     return TEXT(""); // empty = success
 }
@@ -3872,6 +4383,25 @@ FString UGraphBridgeAutomationLibrary::CreateBlueprint(FString AssetPath, FStrin
             TEXT("ERR:FKismetEditorUtilities::CreateBlueprint returned null for parent '%s'"),
             *ParentClass->GetName());
 
+    // FKismetEditorUtilities::CreateBlueprint does NOT always add a default
+    // EventGraph — confirmed live it's skipped for non-Actor parent classes
+    // (e.g. AnimNotify/AnimNotifyState), unlike the Content Browser's "New
+    // Blueprint Class" UI action (UBlueprintFactory::FactoryCreateNew), which
+    // explicitly adds one after this same CreateBlueprint call. Without an
+    // Ubergraph page, SPAWN_NODE ("Blueprint has no EventGraph pages") and
+    // ADD_IMC_TO_CHARACTER-style event lookups have nowhere to put nodes, so
+    // mirror the factory's own follow-up step here for parity. Guarded by
+    // UbergraphPages.Num()==0 so this is a no-op for parent types (Actor,
+    // Character, ...) that already get one — matches CanCreateBlueprintOfClass
+    // having already passed above, so this parent class does support graphs.
+    if (NewBP->UbergraphPages.Num() == 0)
+    {
+        UEdGraph* NewGraph = FBlueprintEditorUtils::CreateNewGraph(
+            NewBP, UEdGraphSchema_K2::GN_EventGraph, UEdGraph::StaticClass(), UEdGraphSchema_K2::StaticClass());
+        FBlueprintEditorUtils::AddUbergraphPage(NewBP, NewGraph);
+        NewBP->LastEditedDocuments.Add(NewGraph);
+    }
+
     FAssetRegistryModule::AssetCreated(NewBP);
     NewPackage->MarkPackageDirty();
 
@@ -4444,7 +4974,7 @@ FString UGraphBridgeAutomationLibrary::AddIMCToCharacter(
                     "Add it first: SPAWN_NODE|BPPath|K2Node_Event|BeginPlay|0|0 "
                     "then SET_EVENT_REF|BPPath|<guid>|ReceiveBeginPlay");
 
-    // --- Resolve the three functions ---
+    // --- Resolve the two plain functions (GetSub is handled separately below) ---
     auto FindUFunction = [](const TCHAR* ShortClass, const TCHAR* FuncName) -> UFunction*
     {
         UClass* C = FindFirstObject<UClass>(ShortClass, EFindFirstObjectOptions::None);
@@ -4454,24 +4984,30 @@ FString UGraphBridgeAutomationLibrary::AddIMCToCharacter(
     };
 
     UFunction* FnGetPC  = FindUFunction(TEXT("GameplayStatics"),        TEXT("GetPlayerController"));
-    UFunction* FnGetSub = FindUFunction(TEXT("SubsystemBlueprintLibrary"), TEXT("GetLocalPlayerSubsystem")); // VERIFY
     UFunction* FnAddIMC = FindUFunction(TEXT("EnhancedInputLocalPlayerSubsystem"), TEXT("AddMappingContext"));
 
     if (!FnGetPC)
         return TEXT("ERR:UGameplayStatics::GetPlayerController not found — is the Engine module loaded?");
-    if (!FnGetSub)
-        return TEXT("ERR:USubsystemBlueprintLibrary::GetLocalPlayerSubsystem not found. " // VERIFY
-                    "Ensure the Engine module is loaded.");
     if (!FnAddIMC)
         return TEXT("ERR:UEnhancedInputLocalPlayerSubsystem::AddMappingContext not found — "
                     "is the EnhancedInput plugin enabled for this project?");
 
-    // Resolve UEnhancedInputLocalPlayerSubsystem class for the Class pin
+    // Resolve UEnhancedInputLocalPlayerSubsystem class up front — required
+    // (not optional) since K2Node_GetSubsystemFromPC::Initialize() needs it
+    // to produce a correctly-typed ReturnValue pin.
     UClass* EISubClass = FindFirstObject<UClass>(
         TEXT("EnhancedInputLocalPlayerSubsystem"), EFindFirstObjectOptions::None);
     if (!EISubClass)
         EISubClass = FindFirstObject<UClass>(
             TEXT("UEnhancedInputLocalPlayerSubsystem"), EFindFirstObjectOptions::None);
+    if (!EISubClass)
+        return TEXT("ERR:UEnhancedInputLocalPlayerSubsystem class not found — "
+                    "is the EnhancedInput plugin enabled for this project?");
+
+    UClass* GetSubFromPCClass = FindFirstObject<UClass>(
+        TEXT("K2Node_GetSubsystemFromPC"), EFindFirstObjectOptions::None);
+    if (!GetSubFromPCClass)
+        return TEXT("ERR:K2Node_GetSubsystemFromPC class not found — is the BlueprintGraph module loaded?");
 
     const UEdGraphSchema_K2* Schema = Cast<const UEdGraphSchema_K2>(Graph->GetSchema());
     if (!Schema) return TEXT("ERR:Could not get K2 schema");
@@ -4497,14 +5033,46 @@ FString UGraphBridgeAutomationLibrary::AddIMCToCharacter(
     };
 
     UK2Node_CallFunction* GetPCNode  = SpawnCallNode(FnGetPC,  BaseX,       BaseY);
-    UK2Node_CallFunction* GetSubNode = SpawnCallNode(FnGetSub, BaseX + 380, BaseY);
+
+    // GetSub uses K2Node_GetSubsystemFromPC, NOT a generic K2Node_CallFunction
+    // targeting USubsystemBlueprintLibrary::GetLocalPlayerSubsystem. Confirmed
+    // live: that generic function's ReturnValue pin is statically typed to
+    // the base ULocalPlayerSubsystem regardless of what the Class input pin's
+    // default is set to (it is a plain TSubclassOf param, NOT a
+    // DeterminesOutputType wildcard) — so a downstream connection expecting
+    // IEnhancedInputSubsystemInterface always fails schema validation
+    // ("...is not compatible with Enhanced Input Subsystem Interface
+    // Interface"), no matter what default value or ReconstructNode() call is
+    // made. K2Node_GetSubsystemFromPC is the dedicated node this bridge's own
+    // SET_SUBSYSTEM_CLASS command already supports (Initialize(Class) +
+    // ReconstructNode() genuinely re-types ReturnValue) — mirrored here
+    // directly rather than going through a second WebSocket round-trip.
+    UK2Node_GetSubsystem* GetSubTemplate = NewObject<UK2Node_GetSubsystem>(
+        GetTransientPackage(), GetSubFromPCClass, NAME_None, RF_Transactional);
+    GetSubTemplate->Initialize(EISubClass);
+    FEdGraphSchemaAction_K2NewNode SubAction;
+    SubAction.NodeTemplate = GetSubTemplate;
+    UK2Node_GetSubsystem* GetSubNode = Cast<UK2Node_GetSubsystem>(
+        SubAction.PerformAction(Graph, nullptr, FVector2f((float)(BaseX + 380), (float)BaseY), false));
+
     UK2Node_CallFunction* AddIMCNode = SpawnCallNode(FnAddIMC, BaseX + 760, BaseY);
 
     if (!GetPCNode || !GetSubNode || !AddIMCNode)
         return TEXT("ERR:Failed to spawn one or more Blueprint nodes. "
                     "Try CLOSE_BLUEPRINT first to release the editor viewport.");
 
-    // Wire exec chain: BeginPlay.Then → GetPC → GetSub → AddIMC
+    // Wire exec chain: BeginPlay.Then → AddIMC directly. GetPlayerController
+    // and GetLocalPlayerSubsystem are BOTH BlueprintPure in this engine
+    // version (confirmed live via GET_NODE_PINS — neither has an execute/then
+    // pin at all), so they never participate in the exec chain; a pure node
+    // is evaluated automatically whenever its output feeds a wired input pin.
+    // The original code assumed all three were exec-having nodes and tried
+    // to wire BeginPlay→GetPC→GetSub→AddIMC, which silently no-op'd on every
+    // link (TryWire's Output&&Input guard skipped connection whenever either
+    // pure node's nonexistent execute/then pin came back null) — the net
+    // effect was AddMappingContext's execute pin was NEVER connected to
+    // anything, so this command silently failed to make Enhanced Input work
+    // at runtime despite reporting success.
     auto TryWire = [&](UEdGraphPin* Output, UEdGraphPin* Input)
     {
         if (Output && Input)
@@ -4512,22 +5080,18 @@ FString UGraphBridgeAutomationLibrary::AddIMCToCharacter(
     };
 
     TryWire(BeginPlayNode->FindPin(UEdGraphSchema_K2::PN_Then),
-            GetPCNode->FindPin(UEdGraphSchema_K2::PN_Execute));
-    TryWire(GetPCNode->FindPin(UEdGraphSchema_K2::PN_Then),
-            GetSubNode->FindPin(UEdGraphSchema_K2::PN_Execute));
-    TryWire(GetSubNode->FindPin(UEdGraphSchema_K2::PN_Then),
             AddIMCNode->FindPin(UEdGraphSchema_K2::PN_Execute));
 
-    // GetPC.ReturnValue → GetSub.PlayerController // VERIFY: pin name "PlayerController"
+    // GetPC.ReturnValue → GetSub.PlayerController
+    // Confirmed live via GET_NODE_PINS that K2Node_GetSubsystemFromPC's input
+    // pin is named "PlayerController" (not "ContextObject" — that name
+    // belongs to the generic CallFunction node this was replaced with).
+    // GetSubNode's Class is already resolved by Initialize(EISubClass) above,
+    // so ReturnValue is genuinely typed to EnhancedInputLocalPlayerSubsystem
+    // from the moment the node is created — no separate Class-pin/
+    // ReconstructNode step needed here.
     TryWire(GetPCNode->FindPin(UEdGraphSchema_K2::PN_ReturnValue),
             GetSubNode->FindPin(TEXT("PlayerController")));
-
-    // Set GetSub.Class pin to UEnhancedInputLocalPlayerSubsystem // VERIFY: pin name "Class"
-    if (UEdGraphPin* ClassPin = GetSubNode->FindPin(TEXT("Class")))
-    {
-        if (EISubClass)
-            ClassPin->DefaultObject = EISubClass;
-    }
 
     // GetSub.ReturnValue → AddIMC.self (Target)  // VERIFY: "self" vs "Target" in UE 5.7
     UEdGraphPin* AddIMCTarget = AddIMCNode->FindPin(UEdGraphSchema_K2::PN_Self);
@@ -4548,6 +5112,20 @@ FString UGraphBridgeAutomationLibrary::AddIMCToCharacter(
         IndexPin->DefaultValue = TEXT("0");
 
     FBlueprintEditorUtils::MarkBlueprintAsModified(BP);
+
+    // Verify the wiring actually took, rather than trusting TryWire's silent
+    // no-op-on-null-pin behavior (exactly the class of bug that made this
+    // command previously report success while leaving AddMappingContext's
+    // execute pin completely disconnected — see comments above).
+    UEdGraphPin* ExecPin = AddIMCNode->FindPin(UEdGraphSchema_K2::PN_Execute);
+    if (!ExecPin || ExecPin->LinkedTo.Num() == 0)
+        return TEXT("ERR:Failed to wire BeginPlay exec into AddMappingContext — "
+                    "pin names may have changed in this engine version. "
+                    "Nodes were spawned; inspect them with LIST_NODES/GET_NODE_PINS.");
+    if (!AddIMCTarget || AddIMCTarget->LinkedTo.Num() == 0)
+        return TEXT("ERR:Failed to wire GetLocalPlayerSubsystem result into "
+                    "AddMappingContext's target pin — pin names may have changed "
+                    "in this engine version.");
 
     UE_LOG(LogGraphBridge, Log,
         TEXT("GraphBridge AddIMCToCharacter: wired '%s' (priority %d) in BeginPlay of '%s'"),
@@ -5149,6 +5727,112 @@ FString UGraphBridgeAutomationLibrary::CreateFunction(FString BlueprintPath, FSt
     UE_LOG(LogGraphBridge, Log, TEXT("GraphBridge CreateFunction: '%s' in '%s'"),
         *UniqueName.ToString(), *BlueprintPath);
     return UniqueName.ToString();
+}
+
+// ---------------------------------------------------------------------------
+// ListGraphs
+// Command: LIST_GRAPHS|BPPath
+// Returns pipe-delimited "GraphName~GraphType" entries for every graph on
+// the Blueprint (GraphType: EventGraph|Function|Macro).
+// ---------------------------------------------------------------------------
+FString UGraphBridgeAutomationLibrary::ListGraphs(FString BlueprintPath)
+{
+    UBlueprint* Blueprint = GetBlueprintByPath(BlueprintPath);
+    if (!Blueprint)
+        return FString::Printf(TEXT("ERR:Blueprint not found at '%s'"), *BlueprintPath);
+
+    TArray<FString> Entries;
+    for (UEdGraph* Graph : Blueprint->UbergraphPages)
+        if (Graph)
+            Entries.Add(FString::Printf(TEXT("%s~EventGraph"), *Graph->GetName()));
+    for (UEdGraph* Graph : Blueprint->FunctionGraphs)
+        if (Graph)
+            Entries.Add(FString::Printf(TEXT("%s~Function"), *Graph->GetName()));
+    for (UEdGraph* Graph : Blueprint->MacroGraphs)
+        if (Graph)
+            Entries.Add(FString::Printf(TEXT("%s~Macro"), *Graph->GetName()));
+
+    return FString::Join(Entries, TEXT("|"));
+}
+
+// ---------------------------------------------------------------------------
+// CreateFunctionGraph
+// Command: CREATE_FUNCTION_GRAPH|BPPath|FunctionName
+// Reuses CreateFunction's graph-creation logic (not duplicated) but returns
+// the new graph's K2Node_FunctionEntry GUID instead of the function name —
+// CreateFunction itself is untouched since its existing callers rely on the
+// function-name return value.
+// ---------------------------------------------------------------------------
+FString UGraphBridgeAutomationLibrary::CreateFunctionGraph(FString BlueprintPath, FString FunctionName)
+{
+    FString NameResult = CreateFunction(BlueprintPath, FunctionName);
+    if (NameResult.StartsWith(TEXT("ERR:")))
+        return NameResult;
+
+    UBlueprint* Blueprint = GetBlueprintByPath(BlueprintPath);
+    if (!Blueprint)
+        return FString::Printf(TEXT("ERR:Blueprint not found at '%s'"), *BlueprintPath);
+
+    UEdGraph* Graph = FindGraphByName(Blueprint, NameResult);
+    if (!Graph)
+        return TEXT("ERR:Function graph created but could not be re-located");
+
+    for (UEdGraphNode* Node : Graph->Nodes)
+        if (UK2Node_FunctionEntry* Entry = Cast<UK2Node_FunctionEntry>(Node))
+            return Entry->NodeGuid.ToString();
+
+    return TEXT("ERR:Function graph created but no FunctionEntry node found");
+}
+
+// ---------------------------------------------------------------------------
+// CreateMacroGraph
+// Command: CREATE_MACRO_GRAPH|BPPath|MacroName
+// Mirrors CreateFunction's CreateNewGraph pattern, but registers via
+// FBlueprintEditorUtils::AddMacroGraph instead of AddFunctionGraph. Macro
+// graphs are inlined at the call site rather than compiling to a real
+// UFunction — confirmed against engine source (EdGraphSchema_K2.cpp,
+// CreateMacroGraphTerminators) that their entry point is a UK2Node_Tunnel
+// with bCanHaveOutputs=true (labeled "Inputs" in the editor), NOT a
+// K2Node_FunctionEntry, so this returns that tunnel node's GUID.
+// ---------------------------------------------------------------------------
+FString UGraphBridgeAutomationLibrary::CreateMacroGraph(FString BlueprintPath, FString MacroName)
+{
+    UBlueprint* Blueprint = GetBlueprintByPath(BlueprintPath);
+    if (!Blueprint)
+        return FString::Printf(TEXT("ERR:Blueprint not found at '%s'"), *BlueprintPath);
+
+    if (MacroName.IsEmpty())
+        return TEXT("ERR:MacroName cannot be empty");
+
+    // Guard: duplicate macro graph name
+    for (UEdGraph* Existing : Blueprint->MacroGraphs)
+        if (Existing && Existing->GetName().Equals(MacroName, ESearchCase::IgnoreCase))
+            return FString::Printf(
+                TEXT("ERR:Macro '%s' already exists — use SPAWN_NODE with graph_name to add nodes to it"),
+                *MacroName);
+
+    FName UniqueName = FBlueprintEditorUtils::FindUniqueKismetName(Blueprint, MacroName);
+
+    const FScopedTransaction Transaction(
+        FText::Format(NSLOCTEXT("GraphBridge", "CreateMacroGraph", "GraphBridge: Create Macro Graph ({0})"),
+                      FText::FromString(MacroName)));
+    Blueprint->Modify();
+
+    UEdGraph* NewGraph = FBlueprintEditorUtils::CreateNewGraph(
+        Blueprint, UniqueName, UEdGraph::StaticClass(), UEdGraphSchema_K2::StaticClass());
+    if (!NewGraph)
+        return TEXT("ERR:FBlueprintEditorUtils::CreateNewGraph returned null");
+
+    FBlueprintEditorUtils::AddMacroGraph(Blueprint, NewGraph, /*bIsUserCreated=*/true, nullptr);
+
+    FBlueprintEditorUtils::MarkBlueprintAsModified(Blueprint);
+
+    for (UEdGraphNode* Node : NewGraph->Nodes)
+        if (UK2Node_Tunnel* Tunnel = Cast<UK2Node_Tunnel>(Node))
+            if (Tunnel->bCanHaveOutputs)
+                return Tunnel->NodeGuid.ToString();
+
+    return TEXT("ERR:Macro graph created but no entry tunnel node found");
 }
 
 // ---------------------------------------------------------------------------
@@ -6586,6 +7270,500 @@ FString UGraphBridgeAutomationLibrary::GetAnimStateTransitions(FString Blueprint
 }
 
 // ---------------------------------------------------------------------------
+// GetAnimNodePins
+// Command: GET_ANIM_NODE_PINS|BPPath|NodeGUID
+// See header comment -- uses FindNodeByIdAllGraphs so it also reaches
+// AnimGraph/FunctionGraph nodes that GetNodePins (FindNodeById, Ubergraph
+// only) cannot see.
+// ---------------------------------------------------------------------------
+FString UGraphBridgeAutomationLibrary::GetAnimNodePins(FString BlueprintPath, FString NodeGUID)
+{
+    UBlueprint* Blueprint = GetBlueprintByPath(BlueprintPath);
+    if (!Blueprint) return TEXT("");
+
+    UEdGraphNode* Node = FindNodeAnywhere(Blueprint, NodeGUID);
+    if (!Node) return TEXT("");
+
+    TArray<FString> PinDescs;
+    for (UEdGraphPin* Pin : Node->Pins)
+    {
+        if (!Pin) continue;
+        FString Dir = Pin->Direction == EGPD_Input ? TEXT("IN") : TEXT("OUT");
+        PinDescs.Add(FString::Printf(TEXT("%s:%s"), *Dir, *Pin->PinName.ToString()));
+    }
+    return FString::Join(PinDescs, TEXT(","));
+}
+
+// ---------------------------------------------------------------------------
+// ConnectAnimPins
+// Command: CONNECT_ANIM_PINS|BPPath|NodeGUIDA|PinNameA|NodeGUIDB|PinNameB
+// See header comment -- resolves nodes via FindNodeByIdAllGraphs (reaches
+// FunctionGraphs, where an Animation Blueprint's AnimGraph pages live) and
+// connects via each node's OWN graph schema instead of a hardcoded
+// UEdGraphSchema_K2 cast, so this works for AnimGraph pins (UAnimationGraphSchema)
+// as well as ordinary K2 pins.
+// ---------------------------------------------------------------------------
+FString UGraphBridgeAutomationLibrary::ConnectAnimPins(FString BlueprintPath,
+    FString NodeA, FString PinA, FString NodeB, FString PinB)
+{
+    UBlueprint* Blueprint = GetBlueprintByPath(BlueprintPath);
+    if (!Blueprint)
+        return FString::Printf(TEXT("ERR:Blueprint not found at '%s'"), *BlueprintPath);
+
+    UEdGraphNode* SourceNode = FindNodeAnywhere(Blueprint, NodeA);
+    if (!SourceNode)
+        return FString::Printf(TEXT("ERR:Source node not found: '%s' â€” use CREATE_STATE_MACHINE/GET_ANIM_NODE_PINS output for valid GUIDs"), *NodeA);
+
+    UEdGraphNode* TargetNode = FindNodeAnywhere(Blueprint, NodeB);
+    if (!TargetNode)
+        return FString::Printf(TEXT("ERR:Target node not found: '%s' â€” use CREATE_STATE_MACHINE/GET_ANIM_NODE_PINS output for valid GUIDs"), *NodeB);
+
+    auto PinList = [](UEdGraphNode* Node) -> FString {
+        TArray<FString> Names;
+        for (UEdGraphPin* P : Node->Pins)
+            if (P) Names.Add(FString::Printf(TEXT("%s(%s)"),
+                *P->PinName.ToString(),
+                P->Direction == EGPD_Output ? TEXT("OUT") : TEXT("IN")));
+        return FString::Join(Names, TEXT(", "));
+    };
+
+    UEdGraphPin* SourcePin = SourceNode->FindPin(*PinA);
+    if (!SourcePin)
+        return FString::Printf(TEXT("ERR:Pin '%s' not found on source node '%s'. Available pins: %s"),
+            *PinA, *NodeA, *PinList(SourceNode));
+
+    UEdGraphPin* TargetPin = TargetNode->FindPin(*PinB);
+    if (!TargetPin)
+        return FString::Printf(TEXT("ERR:Pin '%s' not found on target node '%s'. Available pins: %s"),
+            *PinB, *NodeB, *PinList(TargetNode));
+
+    if (SourcePin->Direction != EGPD_Output)
+        return FString::Printf(
+            TEXT("ERR:Pin '%s' on '%s' is an INPUT pin and cannot be a connection source. "
+                 "Swap your node/pin arguments so the OUTPUT pin is first."),
+            *PinA, *NodeA);
+
+    if (TargetPin->Direction != EGPD_Input)
+        return FString::Printf(
+            TEXT("ERR:Pin '%s' on '%s' is an OUTPUT pin and cannot be a connection target. "
+                 "Swap your node/pin arguments so the INPUT pin is second."),
+            *PinB, *NodeB);
+
+    UEdGraph* Graph = SourceNode->GetGraph();
+    if (!Graph)
+        return TEXT("ERR:Source node has no owning graph");
+
+    const UEdGraphSchema* Schema = Graph->GetSchema();
+    if (!Schema)
+        return TEXT("ERR:Could not get graph schema");
+
+    const FScopedTransaction Transaction(
+        NSLOCTEXT("GraphBridge", "ConnectAnimPins", "GraphBridge: Connect Anim Pins"));
+    Graph->Modify();
+    SourceNode->Modify();
+    TargetNode->Modify();
+
+    if (!Schema->TryCreateConnection(SourcePin, TargetPin))
+        return FString::Printf(TEXT("ERR:Schema rejected connection between '%s.%s' and '%s.%s' â€” types are likely incompatible"),
+            *NodeA, *PinA, *NodeB, *PinB);
+
+    // See ConnectPins for why this is needed — wildcard/array-dependent pins
+    // only retype in response to this callback, which TryCreateConnection
+    // alone does not reliably trigger for bridge-spawned nodes.
+    // NotifyPinConnectionListChanged lives on UK2Node, not UEdGraphNode.
+    if (UK2Node* SourceK2 = Cast<UK2Node>(SourceNode))
+        SourceK2->NotifyPinConnectionListChanged(SourcePin);
+    if (UK2Node* TargetK2 = Cast<UK2Node>(TargetNode))
+        TargetK2->NotifyPinConnectionListChanged(TargetPin);
+
+    FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
+
+    UE_LOG(LogGraphBridge, Log, TEXT("GraphBridge ConnectAnimPins: %s.%s -> %s.%s"),
+        *NodeA, *PinA, *NodeB, *PinB);
+
+    return TEXT("");
+}
+
+// ---------------------------------------------------------------------------
+// ListAnimGraphNodes
+// Command: LIST_ANIM_GRAPH_NODES|BPPath|GraphName
+// See header comment.
+// ---------------------------------------------------------------------------
+FString UGraphBridgeAutomationLibrary::ListAnimGraphNodes(FString BlueprintPath, FString GraphName)
+{
+    UBlueprint* Blueprint = GetBlueprintByPath(BlueprintPath);
+    if (!Blueprint)
+        return FString::Printf(TEXT("ERR:Blueprint not found at '%s'"), *BlueprintPath);
+
+    UEdGraph* Graph = FindGraphByName(Blueprint, GraphName);
+    if (!Graph)
+    {
+        TArray<FString> Available;
+        Available.Add(TEXT("EventGraph"));
+        for (UEdGraph* G : Blueprint->FunctionGraphs)
+            if (G) Available.Add(G->GetName());
+        return FString::Printf(
+            TEXT("ERR:Graph '%s' not found. Available graphs: %s"),
+            *GraphName, *FString::Join(Available, TEXT(", ")));
+    }
+
+    TArray<FString> Entries;
+    for (UEdGraphNode* Node : Graph->Nodes)
+    {
+        if (!Node) continue;
+        Entries.Add(FString::Printf(TEXT("%s~%s~%s"),
+            *Node->NodeGuid.ToString(),
+            *Node->GetClass()->GetName(),
+            *Node->GetNodeTitle(ENodeTitleType::ListView).ToString()));
+    }
+    return FString::Join(Entries, TEXT("|"));
+}
+
+// ---------------------------------------------------------------------------
+// FindNodeAnywhere -- see header comment.
+// ---------------------------------------------------------------------------
+UEdGraphNode* UGraphBridgeAutomationLibrary::FindNodeAnywhere(UBlueprint* Blueprint, const FString& NodeId)
+{
+    if (!Blueprint) return nullptr;
+
+    if (UEdGraphNode* Found = FindNodeByIdAllGraphs(Blueprint, NodeId))
+        return Found;
+
+    TArray<UEdGraph*> AllGraphs;
+    AllGraphs.Append(Blueprint->UbergraphPages);
+    AllGraphs.Append(Blueprint->FunctionGraphs);
+
+    for (UEdGraph* Graph : AllGraphs)
+    {
+        if (!Graph) continue;
+        for (UEdGraphNode* Node : Graph->Nodes)
+        {
+            UAnimGraphNode_StateMachineBase* MachineNode = Cast<UAnimGraphNode_StateMachineBase>(Node);
+            if (!MachineNode || !MachineNode->EditorStateMachineGraph) continue;
+
+            for (UEdGraphNode* InnerNode : MachineNode->EditorStateMachineGraph->Nodes)
+            {
+                if (!InnerNode) continue;
+                if (InnerNode->NodeGuid.ToString() == NodeId) return InnerNode;
+
+                UAnimStateNodeBase* AnimNode = Cast<UAnimStateNodeBase>(InnerNode);
+                if (AnimNode && AnimNode->GetBoundGraph())
+                {
+                    for (UEdGraphNode* Sub : AnimNode->GetBoundGraph()->Nodes)
+                        if (Sub && Sub->NodeGuid.ToString() == NodeId) return Sub;
+                }
+            }
+        }
+    }
+    return nullptr;
+}
+
+// ---------------------------------------------------------------------------
+// ListStateGraphNodes
+// Command: LIST_STATE_GRAPH_NODES|BPPath|StateOrTransitionGUID
+// See header comment.
+// ---------------------------------------------------------------------------
+FString UGraphBridgeAutomationLibrary::ListStateGraphNodes(FString BlueprintPath, FString StateOrTransitionGUID)
+{
+    UBlueprint* Blueprint = GetBlueprintByPath(BlueprintPath);
+    if (!Blueprint)
+        return FString::Printf(TEXT("ERR:Blueprint not found at '%s'"), *BlueprintPath);
+
+    UEdGraphNode* Node = FindNodeAnywhere(Blueprint, StateOrTransitionGUID);
+    if (!Node)
+        return FString::Printf(TEXT("ERR:State/transition node not found: '%s'"), *StateOrTransitionGUID);
+
+    UAnimStateNodeBase* AnimNode = Cast<UAnimStateNodeBase>(Node);
+    if (!AnimNode)
+        return FString::Printf(TEXT("ERR:Node '%s' is not a state or transition node (found %s)"),
+            *StateOrTransitionGUID, *Node->GetClass()->GetName());
+
+    if (!AnimNode->GetBoundGraph())
+        return TEXT("ERR:Node has no BoundGraph");
+
+    TArray<FString> Entries;
+    for (UEdGraphNode* N : AnimNode->GetBoundGraph()->Nodes)
+    {
+        if (!N) continue;
+        Entries.Add(FString::Printf(TEXT("%s~%s~%s"),
+            *N->NodeGuid.ToString(), *N->GetClass()->GetName(),
+            *N->GetNodeTitle(ENodeTitleType::ListView).ToString()));
+    }
+    return FString::Join(Entries, TEXT("|"));
+}
+
+// ---------------------------------------------------------------------------
+// SpawnNodeAnchored
+// Command: SPAWN_NODE_ANCHORED|BPPath|AnchorNodeGUID|NodeClass|Comment|X|Y
+// See header comment.
+// ---------------------------------------------------------------------------
+FString UGraphBridgeAutomationLibrary::SpawnNodeAnchored(FString BlueprintPath, FString AnchorNodeGUID,
+    FString NodeClass, FString Comment, int32 X, int32 Y)
+{
+    UBlueprint* Blueprint = GetBlueprintByPath(BlueprintPath);
+    if (!Blueprint)
+        return FString::Printf(TEXT("ERR:Blueprint not found at '%s'"), *BlueprintPath);
+
+    UEdGraphNode* Anchor = FindNodeAnywhere(Blueprint, AnchorNodeGUID);
+    if (!Anchor)
+        return FString::Printf(TEXT("ERR:Anchor node not found: '%s'"), *AnchorNodeGUID);
+
+    UEdGraph* Graph = Anchor->GetGraph();
+    if (!Graph)
+        return TEXT("ERR:Anchor node has no owning graph");
+
+    return SpawnNodeOnGraph(Blueprint, Graph, NodeClass, Comment, X, Y);
+}
+
+// ---------------------------------------------------------------------------
+// CreateBlendSpacePlayerAnchored
+// Command: CREATE_BLEND_SPACE_PLAYER_ANCHORED|BPPath|AnchorNodeGUID|BlendSpaceAssetPath|X|Y
+// See header comment.
+// ---------------------------------------------------------------------------
+FString UGraphBridgeAutomationLibrary::CreateBlendSpacePlayerAnchored(FString BlueprintPath, FString AnchorNodeGUID,
+    FString BlendSpaceAssetPath, int32 X, int32 Y)
+{
+    UBlueprint* Blueprint = GetBlueprintByPath(BlueprintPath);
+    if (!Blueprint)
+        return FString::Printf(TEXT("ERR:Blueprint not found at '%s'"), *BlueprintPath);
+
+    UEdGraphNode* Anchor = FindNodeAnywhere(Blueprint, AnchorNodeGUID);
+    if (!Anchor)
+        return FString::Printf(TEXT("ERR:Anchor node not found: '%s'"), *AnchorNodeGUID);
+
+    UEdGraph* Graph = Anchor->GetGraph();
+    if (!Graph)
+        return TEXT("ERR:Anchor node has no owning graph");
+
+    UBlendSpace* BlendSpace = LoadObject<UBlendSpace>(nullptr, *BlendSpaceAssetPath);
+    if (!BlendSpace)
+        return FString::Printf(TEXT("ERR:Could not load BlendSpace at '%s'"), *BlendSpaceAssetPath);
+
+    const FScopedTransaction Transaction(
+        NSLOCTEXT("GraphBridge", "CreateBlendSpacePlayerAnchored", "GraphBridge: Create Blend Space Player"));
+    Graph->Modify();
+
+    UAnimGraphNode_BlendSpacePlayer* NewNode = NewObject<UAnimGraphNode_BlendSpacePlayer>(
+        Graph, UAnimGraphNode_BlendSpacePlayer::StaticClass(), NAME_None, RF_Transactional);
+    // FAnimNode_BlendSpacePlayer::BlendSpace is private (friended only to
+    // specific UAnimGraphNode_* editor classes, which this automation
+    // library is not) -- use the public setter instead.
+    NewNode->Node.SetBlendSpace(BlendSpace);
+    NewNode->CreateNewGuid();
+    NewNode->NodePosX = X;
+    NewNode->NodePosY = Y;
+    Graph->AddNode(NewNode, /*bFromUI=*/false, /*bSelectNewNode=*/false);
+    NewNode->AllocateDefaultPins();
+    NewNode->PostPlacedNewNode();
+
+    FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
+
+    UE_LOG(LogGraphBridge, Log, TEXT("GraphBridge CreateBlendSpacePlayerAnchored: '%s' anchored on '%s'"),
+        *BlendSpaceAssetPath, *AnchorNodeGUID);
+
+    return NewNode->NodeGuid.ToString();
+}
+
+// ---------------------------------------------------------------------------
+// SetTransitionCondition
+// Command: SET_TRANSITION_CONDITION|BPPath|TransitionNodeGUID|VarName|bNegate
+// See header comment.
+// ---------------------------------------------------------------------------
+FString UGraphBridgeAutomationLibrary::SetTransitionCondition(FString BlueprintPath, FString TransitionNodeGUID,
+    FString VarName, bool bNegate)
+{
+    UBlueprint* Blueprint = GetBlueprintByPath(BlueprintPath);
+    if (!Blueprint)
+        return FString::Printf(TEXT("ERR:Blueprint not found at '%s'"), *BlueprintPath);
+
+    UEdGraphNode* Node = FindNodeAnywhere(Blueprint, TransitionNodeGUID);
+    UAnimStateTransitionNode* TransNode = Cast<UAnimStateTransitionNode>(Node);
+    if (!TransNode)
+        return FString::Printf(TEXT("ERR:Transition node not found: '%s'"), *TransitionNodeGUID);
+    if (!TransNode->BoundGraph)
+        return TEXT("ERR:Transition node has no BoundGraph");
+
+    UAnimGraphNode_TransitionResult* ResultNode = nullptr;
+    for (UEdGraphNode* N : TransNode->BoundGraph->Nodes)
+    {
+        ResultNode = Cast<UAnimGraphNode_TransitionResult>(N);
+        if (ResultNode) break;
+    }
+    if (!ResultNode)
+        return TEXT("ERR:No AnimGraphNode_TransitionResult found in transition's BoundGraph");
+
+    UEdGraphPin* ResultInputPin = nullptr;
+    for (UEdGraphPin* P : ResultNode->Pins)
+    {
+        if (P && P->Direction == EGPD_Input) { ResultInputPin = P; break; }
+    }
+    if (!ResultInputPin)
+        return TEXT("ERR:TransitionResult node has no input pin");
+
+    // Spawn the variable getter anchored in the same BoundGraph.
+    FString VarGetResult = SpawnNodeAnchored(BlueprintPath, ResultNode->NodeGuid.ToString(),
+        TEXT("K2Node_VariableGet"), TEXT(""), ResultNode->NodePosX - 300, ResultNode->NodePosY);
+    if (VarGetResult.StartsWith(TEXT("ERR:")))
+        return VarGetResult;
+
+    FString VarGetError;
+    bool bRefOk = SetVariableRef(BlueprintPath, VarGetResult, VarName, VarGetError);
+    if (!bRefOk)
+        return FString::Printf(TEXT("ERR:SetVariableRef failed for '%s': %s"), *VarName, *VarGetError);
+
+    UEdGraphNode* VarGetNode = FindNodeAnywhere(Blueprint, VarGetResult);
+    if (!VarGetNode)
+        return TEXT("ERR:Could not re-find spawned VariableGet node after SetVariableRef");
+
+    UEdGraphPin* VarGetOutPin = nullptr;
+    for (UEdGraphPin* P : VarGetNode->Pins)
+    {
+        if (P && P->Direction == EGPD_Output) { VarGetOutPin = P; break; }
+    }
+    if (!VarGetOutPin)
+        return TEXT("ERR:VariableGet node has no output pin");
+
+    if (!bNegate)
+    {
+        FString ConnectErr = ConnectAnimPins(BlueprintPath,
+            VarGetNode->NodeGuid.ToString(), VarGetOutPin->PinName.ToString(),
+            ResultNode->NodeGuid.ToString(), ResultInputPin->PinName.ToString());
+        return ConnectErr;
+    }
+
+    // bNegate: insert a "Not Boolean" call node between the getter and the result.
+    FString NotResult = SpawnNodeAnchored(BlueprintPath, ResultNode->NodeGuid.ToString(),
+        TEXT("K2Node_CallFunction"), TEXT(""), ResultNode->NodePosX - 150, ResultNode->NodePosY);
+    if (NotResult.StartsWith(TEXT("ERR:")))
+        return NotResult;
+
+    FString FuncRefErr = SetFunctionRef(BlueprintPath, NotResult, TEXT("KismetMathLibrary"), TEXT("Not_PreBool"));
+    if (!FuncRefErr.IsEmpty())
+        return FString::Printf(TEXT("ERR:SetFunctionRef failed: %s"), *FuncRefErr);
+
+    UEdGraphNode* NotNode = FindNodeAnywhere(Blueprint, NotResult);
+    if (!NotNode)
+        return TEXT("ERR:Could not re-find spawned Not node after SetFunctionRef");
+
+    UEdGraphPin* NotInPin = nullptr;
+    UEdGraphPin* NotOutPin = nullptr;
+    for (UEdGraphPin* P : NotNode->Pins)
+    {
+        if (!P) continue;
+        if (P->Direction == EGPD_Input && !NotInPin && P->PinName != TEXT("self")) NotInPin = P;
+        if (P->Direction == EGPD_Output && !NotOutPin) NotOutPin = P;
+    }
+    if (!NotInPin || !NotOutPin)
+        return TEXT("ERR:Not_PreBool node missing expected pins");
+
+    FString Err1 = ConnectAnimPins(BlueprintPath,
+        VarGetNode->NodeGuid.ToString(), VarGetOutPin->PinName.ToString(),
+        NotNode->NodeGuid.ToString(), NotInPin->PinName.ToString());
+    if (!Err1.IsEmpty()) return Err1;
+
+    FString Err2 = ConnectAnimPins(BlueprintPath,
+        NotNode->NodeGuid.ToString(), NotOutPin->PinName.ToString(),
+        ResultNode->NodeGuid.ToString(), ResultInputPin->PinName.ToString());
+    return Err2;
+}
+
+// ---------------------------------------------------------------------------
+// AddAnimSlotNode
+// Command: ADD_ANIM_SLOT_NODE|BPPath|GraphName|SlotName|X|Y
+// See header comment. Splices a UAnimGraphNode_Slot between whatever
+// currently feeds AnimGraphNode_Root's "Result" pin and Output Pose itself.
+// ---------------------------------------------------------------------------
+FString UGraphBridgeAutomationLibrary::AddAnimSlotNode(FString BlueprintPath, FString GraphName,
+    FString SlotName, int32 X, int32 Y)
+{
+    UBlueprint* Blueprint = GetBlueprintByPath(BlueprintPath);
+    if (!Blueprint)
+        return FString::Printf(TEXT("ERR:Blueprint not found at '%s'"), *BlueprintPath);
+
+    if (SlotName.IsEmpty())
+        return TEXT("ERR:SlotName cannot be empty");
+
+    UEdGraph* Graph = FindGraphByName(Blueprint, GraphName);
+    if (!Graph)
+    {
+        TArray<FString> Available;
+        Available.Add(TEXT("EventGraph"));
+        for (UEdGraph* G : Blueprint->FunctionGraphs)
+            if (G) Available.Add(G->GetName());
+        return FString::Printf(
+            TEXT("ERR:Graph '%s' not found. Available graphs: %s"),
+            *GraphName, *FString::Join(Available, TEXT(", ")));
+    }
+
+    UAnimGraphNode_Root* RootNode = nullptr;
+    for (UEdGraphNode* N : Graph->Nodes)
+    {
+        RootNode = Cast<UAnimGraphNode_Root>(N);
+        if (RootNode) break;
+    }
+    if (!RootNode)
+        return FString::Printf(TEXT("ERR:No AnimGraphNode_Root (Output Pose) found in graph '%s' — is this really an AnimGraph?"), *GraphName);
+
+    UEdGraphPin* ResultPin = RootNode->FindPin(TEXT("Result"));
+    if (!ResultPin)
+        return TEXT("ERR:Output Pose node has no 'Result' pin");
+
+    if (ResultPin->LinkedTo.Num() == 0)
+        return TEXT("ERR:Output Pose's Result pin has nothing connected to splice a Slot node into — connect a pose source first");
+
+    UEdGraphPin* UpstreamPin = ResultPin->LinkedTo[0];
+    UEdGraphNode* UpstreamNode = UpstreamPin ? UpstreamPin->GetOwningNode() : nullptr;
+    if (!UpstreamPin || !UpstreamNode)
+        return TEXT("ERR:Could not resolve the node currently feeding Output Pose's Result pin");
+
+    const FScopedTransaction Transaction(
+        NSLOCTEXT("GraphBridge", "AddAnimSlotNode", "GraphBridge: Add Anim Slot Node"));
+    Graph->Modify();
+    RootNode->Modify();
+    UpstreamNode->Modify();
+
+    // Same manual construction order already proven safe in this file for
+    // other UAnimGraphNode_Base subclasses (CreateStateMachine,
+    // CreateBlendSpacePlayerAnchored) -- NOT SpawnNodeOnGraph's generic
+    // template-duplication path, which explicitly rejects this class family.
+    UAnimGraphNode_Slot* NewNode = NewObject<UAnimGraphNode_Slot>(
+        Graph, UAnimGraphNode_Slot::StaticClass(), NAME_None, RF_Transactional);
+    NewNode->Node.SlotName = FName(*SlotName);
+    NewNode->CreateNewGuid();
+    NewNode->NodePosX = X;
+    NewNode->NodePosY = Y;
+    Graph->AddNode(NewNode, /*bFromUI=*/false, /*bSelectNewNode=*/false);
+    NewNode->AllocateDefaultPins();
+    NewNode->PostPlacedNewNode();
+
+    UEdGraphPin* SlotSourcePin = NewNode->FindPin(TEXT("Source"));
+    UEdGraphPin* SlotPosePin = NewNode->FindPin(TEXT("Pose"));
+    if (!SlotSourcePin || !SlotPosePin)
+        return TEXT("ERR:Slot node created but is missing expected 'Source'/'Pose' pins");
+
+    const UEdGraphSchema* Schema = Graph->GetSchema();
+    if (!Schema)
+        return TEXT("ERR:Could not get graph schema");
+
+    // Break the old Upstream -> Result link, then route Upstream -> Slot.Source
+    // and Slot.Pose -> Result instead.
+    ResultPin->BreakAllPinLinks();
+
+    if (!Schema->TryCreateConnection(UpstreamPin, SlotSourcePin))
+        return FString::Printf(TEXT("ERR:Failed to connect '%s' to the new Slot node's Source pin"), *UpstreamNode->GetClass()->GetName());
+
+    if (!Schema->TryCreateConnection(SlotPosePin, ResultPin))
+        return TEXT("ERR:Failed to connect the new Slot node's Pose pin to Output Pose's Result pin");
+
+    FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
+
+    UE_LOG(LogGraphBridge, Log, TEXT("GraphBridge AddAnimSlotNode: '%s' spliced into '%s' in '%s'"),
+        *SlotName, *GraphName, *BlueprintPath);
+
+    return NewNode->NodeGuid.ToString();
+}
+
+// ---------------------------------------------------------------------------
 // Niagara
 // ---------------------------------------------------------------------------
 
@@ -7336,6 +8514,145 @@ FString UGraphBridgeAutomationLibrary::CreateBlendSpace(FString AssetPath, FStri
 
     UE_LOG(LogGraphBridge, Log, TEXT("GraphBridge CreateBlendSpace: '%s'"), *AssetPath);
     return PackageName + TEXT(".") + AssetName;
+}
+
+// ---------------------------------------------------------------------------
+// AddBlendSpaceSample
+// Command: ADD_BLEND_SPACE_SAMPLE|BlendSpaceAssetPath|AnimSequencePath|X|Y
+// See header comment.
+// ---------------------------------------------------------------------------
+FString UGraphBridgeAutomationLibrary::AddBlendSpaceSample(FString BlendSpaceAssetPath, FString AnimSequencePath,
+    float X, float Y)
+{
+    UBlendSpace* BlendSpace = LoadObject<UBlendSpace>(nullptr, *BlendSpaceAssetPath);
+    if (!BlendSpace)
+        return FString::Printf(TEXT("ERR:BlendSpace not found at '%s'"), *BlendSpaceAssetPath);
+
+    UAnimSequence* Sequence = LoadObject<UAnimSequence>(nullptr, *AnimSequencePath);
+    if (!Sequence)
+        return FString::Printf(TEXT("ERR:AnimSequence not found at '%s'"), *AnimSequencePath);
+
+    const FScopedTransaction Transaction(
+        NSLOCTEXT("GraphBridge", "AddBlendSpaceSample", "GraphBridge: Add Blend Space Sample"));
+    BlendSpace->Modify();
+
+    int32 SampleIndex = BlendSpace->AddSample(Sequence, FVector(X, Y, 0.0f));
+    if (SampleIndex == INDEX_NONE)
+        return FString::Printf(TEXT("ERR:AddSample rejected '%s' at (%f, %f) â€” out of range or duplicate coordinate"),
+            *AnimSequencePath, X, Y);
+
+    BlendSpace->ValidateSampleData();
+    BlendSpace->MarkPackageDirty();
+
+    UE_LOG(LogGraphBridge, Log, TEXT("GraphBridge AddBlendSpaceSample: '%s' at (%f, %f) -> index %d"),
+        *AnimSequencePath, X, Y, SampleIndex);
+
+    return FString::FromInt(SampleIndex);
+}
+
+// ---------------------------------------------------------------------------
+// EditBlendSpaceSample
+// Command: EDIT_BLEND_SPACE_SAMPLE|BlendSpaceAssetPath|AnimSequencePath|NewX|NewY
+// See header comment.
+// ---------------------------------------------------------------------------
+FString UGraphBridgeAutomationLibrary::EditBlendSpaceSample(FString BlendSpaceAssetPath, FString AnimSequencePath,
+    float NewX, float NewY)
+{
+    UBlendSpace* BlendSpace = LoadObject<UBlendSpace>(nullptr, *BlendSpaceAssetPath);
+    if (!BlendSpace)
+        return FString::Printf(TEXT("ERR:BlendSpace not found at '%s'"), *BlendSpaceAssetPath);
+
+    UAnimSequence* Sequence = LoadObject<UAnimSequence>(nullptr, *AnimSequencePath);
+    if (!Sequence)
+        return FString::Printf(TEXT("ERR:AnimSequence not found at '%s'"), *AnimSequencePath);
+
+    const TArray<FBlendSample>& Samples = BlendSpace->GetBlendSamples();
+    int32 FoundIndex = INDEX_NONE;
+    for (int32 i = 0; i < Samples.Num(); ++i)
+    {
+        if (Samples[i].Animation == Sequence) { FoundIndex = i; break; }
+    }
+    if (FoundIndex == INDEX_NONE)
+        return FString::Printf(TEXT("ERR:No existing sample found using animation '%s'"), *AnimSequencePath);
+
+    const FScopedTransaction Transaction(
+        NSLOCTEXT("GraphBridge", "EditBlendSpaceSample", "GraphBridge: Edit Blend Space Sample"));
+    BlendSpace->Modify();
+
+    bool bOk = BlendSpace->EditSampleValue(FoundIndex, FVector(NewX, NewY, 0.0f));
+    if (!bOk)
+        return FString::Printf(TEXT("ERR:EditSampleValue rejected (%f, %f) for sample %d â€” out of range or duplicate coordinate"),
+            NewX, NewY, FoundIndex);
+
+    BlendSpace->ValidateSampleData();
+    BlendSpace->MarkPackageDirty();
+
+    UE_LOG(LogGraphBridge, Log, TEXT("GraphBridge EditBlendSpaceSample: '%s' -> (%f, %f)"),
+        *AnimSequencePath, NewX, NewY);
+
+    return TEXT("");
+}
+
+// ---------------------------------------------------------------------------
+// SetBlendSpacePlayerAsset
+// Command: SET_BLEND_SPACE_PLAYER_ASSET|BPPath|NodeGUID|BlendSpaceAssetPath
+// See header comment.
+// ---------------------------------------------------------------------------
+FString UGraphBridgeAutomationLibrary::SetBlendSpacePlayerAsset(FString BlueprintPath, FString NodeGUID,
+    FString BlendSpaceAssetPath)
+{
+    UBlueprint* Blueprint = GetBlueprintByPath(BlueprintPath);
+    if (!Blueprint)
+        return FString::Printf(TEXT("ERR:Blueprint not found at '%s'"), *BlueprintPath);
+
+    UEdGraphNode* Node = FindNodeAnywhere(Blueprint, NodeGUID);
+    UAnimGraphNode_BlendSpacePlayer* BSPNode = Cast<UAnimGraphNode_BlendSpacePlayer>(Node);
+    if (!BSPNode)
+        return FString::Printf(TEXT("ERR:Node not found or not a BlendSpacePlayer: '%s'"), *NodeGUID);
+
+    UBlendSpace* BlendSpace = LoadObject<UBlendSpace>(nullptr, *BlendSpaceAssetPath);
+    if (!BlendSpace)
+        return FString::Printf(TEXT("ERR:Could not load BlendSpace at '%s'"), *BlendSpaceAssetPath);
+
+    const FScopedTransaction Transaction(
+        NSLOCTEXT("GraphBridge", "SetBlendSpacePlayerAsset", "GraphBridge: Set Blend Space Player Asset"));
+    BSPNode->Modify();
+    BSPNode->Node.SetBlendSpace(BlendSpace);
+    FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
+
+    UE_LOG(LogGraphBridge, Log, TEXT("GraphBridge SetBlendSpacePlayerAsset: '%s' -> '%s'"),
+        *NodeGUID, *BlendSpaceAssetPath);
+
+    return TEXT("");
+}
+
+// ---------------------------------------------------------------------------
+// GetAnimPinConnections
+// Command: GET_ANIM_PIN_CONNECTIONS|BPPath|NodeGUID|PinName
+// See header comment.
+// ---------------------------------------------------------------------------
+FString UGraphBridgeAutomationLibrary::GetAnimPinConnections(FString BlueprintPath, FString NodeGUID, FString PinName)
+{
+    UBlueprint* Blueprint = GetBlueprintByPath(BlueprintPath);
+    if (!Blueprint)
+        return FString::Printf(TEXT("ERR:Blueprint not found at '%s'"), *BlueprintPath);
+
+    UEdGraphNode* Node = FindNodeAnywhere(Blueprint, NodeGUID);
+    if (!Node)
+        return FString::Printf(TEXT("ERR:Node not found: '%s'"), *NodeGUID);
+
+    UEdGraphPin* Pin = Node->FindPin(*PinName);
+    if (!Pin)
+        return FString::Printf(TEXT("ERR:Pin '%s' not found on node '%s'"), *PinName, *NodeGUID);
+
+    TArray<FString> Entries;
+    for (UEdGraphPin* Linked : Pin->LinkedTo)
+    {
+        if (!Linked || !Linked->GetOwningNode()) continue;
+        Entries.Add(FString::Printf(TEXT("%s:%s"),
+            *Linked->GetOwningNode()->NodeGuid.ToString(), *Linked->PinName.ToString()));
+    }
+    return FString::Join(Entries, TEXT(","));
 }
 
 // ---------------------------------------------------------------------------

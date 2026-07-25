@@ -105,6 +105,16 @@ private:
     // -----------------------------------------------------------------------
     static void ExecuteAtomicCommand(FString Command, ix::WebSocket* Sender);
 
+    // ExecuteAtomicCommand's else-if dispatch chain hit MSVC's C1061 "blocks
+    // nested too deeply" limit once it grew past ~116 branches (a single
+    // else-if chain nests one compound-statement level per branch). Split at
+    // roughly the midpoint (right after ADD_VARIABLE) into this second
+    // function purely to keep each chain's nesting depth under the compiler
+    // limit -- no command's logic changed, Op/P/Sender are just forwarded
+    // from ExecuteAtomicCommand's final else. Not exposed to Blueprint.
+    static void ExecuteAtomicCommandExtended(const FString& Command, const FString& Op,
+                                             const TArray<FString>& P, ix::WebSocket* Sender);
+
     // -----------------------------------------------------------------------
     // Response helper — builds the JSON envelope and sends it back
     // -----------------------------------------------------------------------
@@ -127,8 +137,13 @@ private:
     // Graph mutation verbs
     static FString SpawnEventNode(FString BlueprintPath, FString EventFuncName,
                                   FString Comment, int32 X, int32 Y);
+
+    // GraphName: optional. Empty (default) preserves the original behavior
+    // of always targeting UbergraphPages[0]. Non-empty resolves the target
+    // graph via FindGraphByName instead (EventGraph, a Function graph, or a
+    // Macro graph) — subsumes what SPAWN_NODE_IN_GRAPH already did.
     static FString SpawnNode(FString BlueprintPath, FString NodeClass,
-                             FString Comment, int32 X, int32 Y);
+                             FString Comment, int32 X, int32 Y, FString GraphName = TEXT(""));
 
     // Shared node-construction core used by both SpawnNode (always targets
     // UbergraphPages[0]) and SpawnNodeInGraph (targets any named graph).
@@ -136,9 +151,45 @@ private:
                                     FString NodeClass, FString Comment, int32 X, int32 Y);
 
     // Finds a graph by name: "EventGraph" (or a UbergraphPages name match)
-    // resolves to the main event graph; anything else is matched against
-    // Blueprint->FunctionGraphs by GetName(). Returns nullptr if not found.
+    // resolves to the main event graph; otherwise matched by GetName()
+    // against Blueprint->FunctionGraphs, then Blueprint->MacroGraphs (in
+    // that order). Returns nullptr if not found.
     static UEdGraph* FindGraphByName(UBlueprint* Blueprint, const FString& GraphName);
+
+    // Finds a node by GUID, comment, or full title WITHIN a single graph
+    // (not the whole Blueprint) — used by the GraphName-scoped verbs below
+    // so a caller who explicitly names a Function/Macro graph only ever
+    // matches nodes actually inside it. GUID matches are unambiguous and
+    // returned immediately; comment/title matches follow FindNodeByName's
+    // convention of returning nullptr (not a guess) when more than one node
+    // matches within that graph.
+    static UEdGraphNode* FindNodeInGraph(UEdGraph* Graph, const FString& NodeId);
+
+    // LIST_GRAPHS — lists every graph on a Blueprint (UbergraphPages,
+    // FunctionGraphs, MacroGraphs), tagged with its type. Lets the agent
+    // discover what graphs exist before deciding where to operate.
+    // Returns pipe-delimited "GraphName~GraphType" entries (GraphType:
+    // EventGraph|Function|Macro), "ERR:..." on failure.
+    static FString ListGraphs(FString BlueprintPath);
+
+    // CREATE_FUNCTION_GRAPH — thin wrapper around CreateFunction (identical
+    // graph-creation logic — reused rather than duplicated) that instead
+    // returns the new graph's K2Node_FunctionEntry node's GUID, so a caller
+    // can immediately act on the entry node. CreateFunction itself is left
+    // untouched (its own callers rely on it returning the function name).
+    // Returns the new K2Node_FunctionEntry node's GUID on success,
+    // "ERR:..." on failure.
+    static FString CreateFunctionGraph(FString BlueprintPath, FString FunctionName);
+
+    // CREATE_MACRO_GRAPH — creates a new macro graph via
+    // FBlueprintEditorUtils::AddMacroGraph. Macro graphs are inlined at the
+    // call site (not a real UFunction), can have multiple exec pins, and
+    // can contain latent nodes — modeled as a distinct graph type from
+    // CreateFunctionGraph, not just "another function". Their entry point
+    // is a UK2Node_Tunnel with bCanHaveOutputs=true (created by the schema's
+    // CreateMacroGraphTerminators), NOT a K2Node_FunctionEntry.
+    // Returns the new entry tunnel node's GUID on success, "ERR:..." on failure.
+    static FString CreateMacroGraph(FString BlueprintPath, FString MacroName);
 
     // SPAWN_NODE_IN_GRAPH — like SpawnNode, but targets any named graph
     // (EventGraph or a custom function graph created via CREATE_FUNCTION).
@@ -199,18 +250,29 @@ private:
     // destroyed, same as the "Delete" command in the World Outliner).
     // Returns empty string on success, "ERR:..." on failure.
     static FString DeleteLevelActor(FString ActorLabel);
+    // GraphName: optional (see SpawnNode). Empty preserves the original
+    // UbergraphPages[0]-only behavior; non-empty resolves via
+    // FindGraphByName and scopes the node lookup to just that graph.
     static bool    DisconnectPins(FString BlueprintPath,
                                   FString NodeA, FString PinA,
-                                  FString NodeB, FString PinB);
+                                  FString NodeB, FString PinB, FString GraphName = TEXT(""));
     // Returns empty string on success, error description on failure
     static FString ConnectPins(FString BlueprintPath,
                                FString NodeA, FString PinA,
-                               FString NodeB, FString PinB);
-    static bool    DeleteNode(FString BlueprintPath, FString NodeId);
-    static bool    ClearNodes(FString BlueprintPath, FString CommentMatch);
+                               FString NodeB, FString PinB, FString GraphName = TEXT(""));
+    // GraphName: optional. Empty preserves the original FindNodeAnywhere
+    // (broadest search — Ubergraph/Function/AnimGraph/state machines/bound
+    // graphs) default; non-empty scopes the lookup to just that graph.
+    static bool    DeleteNode(FString BlueprintPath, FString NodeId, FString GraphName = TEXT(""));
+    // GraphName: optional. Empty preserves the original UbergraphPages-only
+    // behavior; non-empty scopes the comment match to just that graph.
+    static bool    ClearNodes(FString BlueprintPath, FString CommentMatch, FString GraphName = TEXT(""));
     static bool    SetPinDefault(FString BlueprintPath,
                                  FString NodeId, FString PinName, FString DefaultValue);
-    static FString GetNodePins(FString BlueprintPath, FString NodeName);
+    // GraphName: optional. Empty preserves the original FindNodeByName/
+    // FindNodeById (UbergraphPages-only) lookup; non-empty scopes it to
+    // just that graph.
+    static FString GetNodePins(FString BlueprintPath, FString NodeName, FString GraphName = TEXT(""));
 
     // GET_PIN_CONNECTIONS — returns comma-separated NODEGUID:PinName entries
     // for every pin linked to the named pin. Returns "ERR:..." on failure,
@@ -240,7 +302,9 @@ private:
     static FString ListVariables(FString BlueprintPath);
 
     // Discovery helpers
-    static FString ListNodes(FString BlueprintPath);
+    // GraphName: optional. Empty preserves the original UbergraphPages-only
+    // behavior; non-empty (resolved via FindGraphByName) lists just that graph.
+    static FString ListNodes(FString BlueprintPath, FString GraphName = TEXT(""));
     static FString FindNodeClass(FString PartialName);
     static FString ListAssets(FString Filter);
 
@@ -261,6 +325,18 @@ private:
     static FString SetEventRef(FString BlueprintPath,
                                FString NodeId, FString FunctionName);
 
+    // SET_CUSTOM_EVENT_NAME — names a K2Node_CustomEvent (whose
+    // CustomFunctionName defaults to "None" and isn't reachable via
+    // SetEventRef, which requires binding to an existing parent-class
+    // function). Returns empty string on success, "ERR:..." on failure.
+    static FString SetCustomEventName(FString BlueprintPath,
+                                      FString NodeId, FString EventName);
+
+    // ADD_ARRAY_PIN — adds one more wildcard input pin to a K2Node_MakeArray
+    // (mirrors the "+" button in the editor). Returns empty string on
+    // success, "ERR:..." on failure.
+    static FString AddArrayPin(FString BlueprintPath, FString NodeId);
+
     // Component addition — adds a USCS_Node to the Blueprint's SCS and compiles.
     // ComponentClass: C++ name e.g. "ProjectileMovementComponent" or BP asset path.
     // Returns empty string on success, error description on failure.
@@ -273,6 +349,13 @@ private:
     static bool    SetVariableRef(FString BlueprintPath,
                                   FString NodeId, FString VarName,
                                   FString& OutError);
+
+    // SET_EXTERNAL_VARIABLE_REF — like SetVariableRef, but binds to a property
+    // on an arbitrary class (not just this Blueprint's own hierarchy), e.g.
+    // TargetArmLength on SpringArmComponent. Produces a non-self-context node
+    // with a "Target" pin. Returns empty string on success, "ERR:..." on failure.
+    static FString SetExternalVariableRef(FString BlueprintPath, FString NodeId,
+                                          FString OwnerClassName, FString VarName);
 
 
 
@@ -615,6 +698,121 @@ private:
     static FString GetAnimStateTransitions(FString BlueprintPath, FString StateNodeGUID);
 
     // ------------------------------------------------------------------
+    // Anim Graph pin wiring (v1.14) -- the generic GET_NODE_PINS/CONNECT_PINS
+    // pair only ever searches UbergraphPages (GetNodePins/FindNodeById) or
+    // just UbergraphPages[0] (ConnectPins), and ConnectPins hardcodes a cast
+    // to UEdGraphSchema_K2. Neither reaches an Animation Blueprint's AnimGraph
+    // (which lives in Blueprint->FunctionGraphs under UAnimationGraphSchema,
+    // not UEdGraphSchema_K2) or works with that schema's TryCreateConnection.
+    // These two commands fill that gap using the already-existing, broader
+    // FindNodeByIdAllGraphs (which does walk FunctionGraphs) plus the
+    // node's OWN graph schema (Node->GetGraph()->GetSchema()) instead of a
+    // hardcoded K2 cast, so the exact same code path works for both regular
+    // K2 pins and Anim Graph pins (e.g. wiring a state machine's Pose output
+    // into AnimGraphNode_Root's Result input).
+    // ------------------------------------------------------------------
+
+    // GET_ANIM_NODE_PINS -- like GET_NODE_PINS, but finds the node via
+    // FindNodeByIdAllGraphs so it also reaches AnimGraph/FunctionGraph nodes
+    // (e.g. AnimGraphNode_Root, AnimGraphNode_StateMachine). Returns
+    // comma-separated "IN:PinName"/"OUT:PinName" entries, "" if not found.
+    static FString GetAnimNodePins(FString BlueprintPath, FString NodeGUID);
+
+    // CONNECT_ANIM_PINS -- like CONNECT_PINS, but resolves both nodes via
+    // FindNodeByIdAllGraphs and connects through each node's own graph
+    // schema (Node->GetGraph()->GetSchema()->TryCreateConnection) rather
+    // than a hardcoded UEdGraphSchema_K2 cast on UbergraphPages[0] -- this is
+    // what makes it usable on Anim Graph pins. Returns empty string on
+    // success, "ERR:..." on failure.
+    static FString ConnectAnimPins(FString BlueprintPath,
+                                   FString NodeA, FString PinA,
+                                   FString NodeB, FString PinB);
+
+    // LIST_ANIM_GRAPH_NODES -- like LIST_NODES, but for a named FunctionGraphs
+    // graph (typically "AnimGraph"), reached via the existing FindGraphByName.
+    // Needed because AnimGraph nodes (AnimGraphNode_Root, AnimGraphNode_StateMachine,
+    // etc.) never show up in LIST_NODES (which only walks UbergraphPages) and
+    // their NodeGuid can't be read from Python (protected property), so this is
+    // the only way to discover e.g. AnimGraphNode_Root's GUID to wire something
+    // into it. Returns pipe-delimited "GUID~ClassName~NodeTitle" entries,
+    // "ERR:..." on failure.
+    static FString ListAnimGraphNodes(FString BlueprintPath, FString GraphName);
+
+    // FindNodeAnywhere -- broader than FindNodeByIdAllGraphs: also recurses
+    // into every state machine's EditorStateMachineGraph, and from there
+    // into each UAnimStateNodeBase's BoundGraph (a state's inner animation
+    // graph, e.g. where a BlendSpacePlayer lives) and each
+    // UAnimStateTransitionNode's BoundGraph (the transition rule graph).
+    // This is what lets GET_ANIM_NODE_PINS/CONNECT_ANIM_PINS/SPAWN_NODE_ANCHORED
+    // operate on nodes nested inside a state, not just top-level AnimGraph nodes.
+    static UEdGraphNode* FindNodeAnywhere(UBlueprint* Blueprint, const FString& NodeId);
+
+    // LIST_STATE_GRAPH_NODES -- lists nodes (GUID~ClassName~NodeTitle,
+    // pipe-delimited) inside a state's or transition's BoundGraph. GUID is
+    // the state/transition node's own GUID (from LIST_ANIM_STATES /
+    // GET_ANIM_STATE_TRANSITIONS) -- NOT a state machine GUID.
+    static FString ListStateGraphNodes(FString BlueprintPath, FString StateOrTransitionGUID);
+
+    // SPAWN_NODE_ANCHORED -- like SPAWN_NODE_IN_GRAPH, but resolves the
+    // target graph as "whatever graph AnchorNodeGUID lives in" (via
+    // FindNodeAnywhere) instead of by graph name -- this is what makes it
+    // possible to spawn an ordinary K2Node (e.g. a VariableGet) inside a
+    // state's BoundGraph or a transition's rule graph, neither of which has
+    // a name FindGraphByName can resolve. Still runs through the same
+    // SpawnNodeOnGraph (so the AnimGraphNode_Base crash-guard still applies
+    // -- use CREATE_BLEND_SPACE_PLAYER_ANCHORED for that node type instead).
+    static FString SpawnNodeAnchored(FString BlueprintPath, FString AnchorNodeGUID,
+                                     FString NodeClass, FString Comment, int32 X, int32 Y);
+
+    // CREATE_BLEND_SPACE_PLAYER_ANCHORED -- bespoke-safe construction of a
+    // UAnimGraphNode_BlendSpacePlayer (mirrors CreateStateMachine's manual
+    // NewObject+AddNode+AllocateDefaultPins+PostPlacedNewNode pattern --
+    // confirmed safe for this class the same way: it's a plain leaf node
+    // with no InnerGraph/bespoke-setup dependency the way
+    // UAnimGraphNode_CallFunction has, so the generic crash risk the
+    // SPAWN_NODE guard warns about does not apply here). Target graph is
+    // resolved via FindNodeAnywhere(AnchorNodeGUID), same as SpawnNodeAnchored.
+    // Sets the node's BlendSpace asset reference directly. Returns the new
+    // node's GUID on success, "ERR:..." on failure.
+    static FString CreateBlendSpacePlayerAnchored(FString BlueprintPath, FString AnchorNodeGUID,
+                                                  FString BlendSpaceAssetPath, int32 X, int32 Y);
+
+    // SET_TRANSITION_CONDITION -- wires a boolean variable straight into a
+    // UAnimStateTransitionNode's rule graph result. The rule BoundGraph
+    // already contains an AnimGraphNode_TransitionResult node (created by
+    // AddAnimTransition's SpawnNodeFromTemplate, same as a state's
+    // AnimGraphNode_StateResult) -- this spawns a K2Node_VariableGet for
+    // VarName inside that same BoundGraph (via SpawnNodeAnchored, anchored
+    // on the TransitionResult node itself) and connects its output straight
+    // into the TransitionResult's boolean input pin.
+    // bNegate: if true, inserts a "NOT Boolean" node between the variable
+    // and the result (for the reverse-direction transition on the same bool).
+    // Returns empty string on success, "ERR:..." on failure.
+    static FString SetTransitionCondition(FString BlueprintPath, FString TransitionNodeGUID,
+                                          FString VarName, bool bNegate);
+
+    // ADD_ANIM_SLOT_NODE -- inserts a UAnimGraphNode_Slot into an Animation
+    // Blueprint's AnimGraph, spliced between whatever is currently feeding
+    // AnimGraphNode_Root's "Result" pin and Output Pose itself. NOT built on
+    // SpawnNodeOnGraph -- that path explicitly rejects UAnimGraphNode_Base
+    // subclasses (see the rejection comment in SpawnNodeOnGraph). Instead
+    // mirrors the manual NewObject+AddNode+AllocateDefaultPins+PostPlacedNewNode
+    // sequence already proven safe in this file for other AnimGraphNode_Base
+    // subclasses (CreateStateMachine, CreateBlendSpacePlayerAnchored).
+    // GraphName resolved via the same FindGraphByName lookup ListAnimGraphNodes/
+    // GetAnimNodePins already use for AnimGraph pages (Blueprint->FunctionGraphs
+    // for an Animation Blueprint, not a bespoke GetAnimationGraphs() call).
+    // Confirmed against installed engine source (AnimGraphNode_Base.cpp,
+    // AnimNode_Root.h, AnimNode_Slot.h): the new node's output pose pin is
+    // named "Pose", its pass-through input is named "Source" (FAnimNode_Slot's
+    // FPoseLink member name), and Output Pose's input is named "Result"
+    // (FAnimNode_Root's FPoseLink member name) -- pose-link pins are always
+    // named after their reflected C++ property.
+    // Returns the new Slot node's GUID on success, "ERR:..." on failure.
+    static FString AddAnimSlotNode(FString BlueprintPath, FString GraphName,
+                                   FString SlotName, int32 X, int32 Y);
+
+    // ------------------------------------------------------------------
     // Niagara — scoped to what's confirmed real in this engine version
     // (v1.12). Does NOT support adding modules/renderers to an emitter or
     // building a VFX system from scratch — no confirmed API exists for
@@ -751,6 +949,42 @@ private:
     // pattern as CreateAnimMontage.
     // Returns the canonical asset path on success, "ERR:..." on failure.
     static FString CreateBlendSpace(FString AssetPath, FString SkeletonPath);
+
+    // ADD_BLEND_SPACE_SAMPLE -- wraps UBlendSpace::AddSample(UAnimSequence*, FVector),
+    // the real non-interactive sample-authoring API (confirmed against
+    // Engine/Classes/Animation/BlendSpace.h). SampleValue Z is always 0 for a
+    // standard 2D blend space. Calls ValidateSampleData() afterward so the
+    // triangulation is rebuilt immediately, matching what the editor UI does
+    // after adding a sample by hand.
+    // Returns the new sample's index (as a string) on success, "ERR:..." on failure.
+    static FString AddBlendSpaceSample(FString BlendSpaceAssetPath, FString AnimSequencePath,
+                                       float X, float Y);
+
+    // EDIT_BLEND_SPACE_SAMPLE -- wraps UBlendSpace::EditSampleValue(int32, FVector),
+    // for repositioning an EXISTING sample (found by its current animation
+    // asset reference, since that's the stable identifier a caller has --
+    // sample index isn't guaranteed stable across edits) to precise
+    // coordinates. Calls ValidateSampleData() afterward, same as AddBlendSpaceSample.
+    // Returns empty string on success, "ERR:..." on failure.
+    static FString EditBlendSpaceSample(FString BlendSpaceAssetPath, FString AnimSequencePath,
+                                        float NewX, float NewY);
+
+    // SET_BLEND_SPACE_PLAYER_ASSET -- retargets an EXISTING
+    // UAnimGraphNode_BlendSpacePlayer (found via FindNodeAnywhere, so this
+    // reaches state-bound-graph nodes) onto a different BlendSpace asset via
+    // the same public SetBlendSpace() setter CreateBlendSpacePlayerAnchored
+    // uses. Keeps all existing pin connections (X/Y/Pose) intact -- only the
+    // asset reference changes. Returns empty string on success, "ERR:..." on
+    // failure.
+    static FString SetBlendSpacePlayerAsset(FString BlueprintPath, FString NodeGUID,
+                                            FString BlendSpaceAssetPath);
+
+    // GET_ANIM_PIN_CONNECTIONS -- like GET_PIN_CONNECTIONS, but resolves the
+    // node via FindNodeAnywhere so it reaches AnimGraph/state/transition
+    // nested nodes too. Returns comma-separated "NODEGUID:PinName" entries
+    // for everything linked to the given pin (direction-agnostic), "" if
+    // the pin exists but has no links, "ERR:..." on failure.
+    static FString GetAnimPinConnections(FString BlueprintPath, FString NodeGUID, FString PinName);
 
     // ADD_SKELETON_SOCKET — NOTE: USkeleton::AddSocket() does not exist —
     // confirmed by searching the actual engine source that no such function

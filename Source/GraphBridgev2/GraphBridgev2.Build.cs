@@ -45,6 +45,7 @@ public class GraphBridgev2 : ModuleRules
                 // UAnimGraphNode_Base — used only to reject Anim Graph node classes
                 // in SpawnNodeOnGraph's safety guard (see GraphBridgeAutomationLibrary.cpp).
                 "AnimGraph",
+                "AnimGraphRuntime",
                 // Niagara system/emitter creation and Stack Editor module
                 // inspection (CREATE_NIAGARA_SYSTEM/EMITTER, LIST_NIAGARA_MODULES,
                 // SET_NIAGARA_MODULE_INPUT). Runtime + Editor module both needed:

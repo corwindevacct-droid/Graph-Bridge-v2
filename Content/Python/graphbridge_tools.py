@@ -134,11 +134,27 @@ async def cmd_nodes(bridge: UnrealBridge, args: list[str]):
         print(f"    guid:    {n['guid']}")
 
 
+async def cmd_graphs(bridge: UnrealBridge, args: list[str]):
+    """List all graphs (EventGraph, Function, Macro) on a Blueprint."""
+    if not args:
+        print("Usage: python tools.py graphs <BP_PATH>")
+        return
+    bp_path = args[0]
+    graphs = await bridge.list_graphs(bp_path)
+    if not graphs:
+        print(f"No graphs found in {bp_path}")
+        return
+    print(f"\n{len(graphs)} graph(s) in {bp_path}:\n")
+    for g in graphs:
+        print(f"  [{g['type']}] {g['name']}")
+
+
 COMMANDS = {
     "find": cmd_find,
     "path": cmd_path,
     "pins": cmd_pins,
     "nodes": cmd_nodes,
+    "graphs": cmd_graphs,
     "discover": cmd_discover,
 }
 
@@ -150,6 +166,7 @@ Commands:
   path     <term> [term2 ...]    Same as find — print full asset paths
   pins     <BP_PATH> <node> ...  Show pins on one or more graph nodes
   nodes    <BP_PATH>             List all nodes in a Blueprint EventGraph
+  graphs   <BP_PATH>             List all graphs (EventGraph/Function/Macro) on a Blueprint
   discover [term] [term2 ...]    Search for node UClasses; saves discovered_nodes.txt
 """
 
