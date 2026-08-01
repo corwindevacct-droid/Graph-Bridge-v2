@@ -4781,9 +4781,15 @@ bool UGraphBridgeAutomationLibrary::SaveAsset(FString AssetPath)
 // SCS, or on an inherited C++ component via CDO (e.g. ACharacter::Mesh).
 // ComponentName defaults to "CharacterMesh0" (ACharacter's inherited mesh).
 //
-// Property resolution uses FObjectProperty reflection to handle UE 5.1+ rename:
-//   SkeletalMeshAsset (preferred, UE 5.1+) with SkeletalMesh as fallback.
-// // VERIFY: property name in UE 5.7 CDO template context
+// Mesh assignment uses the canonical USkeletalMeshComponent::SetSkeletalMeshAsset()
+// setter. Confirmed against UE 5.8 SkeletalMeshComponent.h: the SkeletalMeshAsset
+// UPROPERTY is EditAnywhere BUT Transient, with Setter=SetSkeletalMeshAsset, and
+// its deprecation note states "getter and setter must be used at all times to
+// preserve correct operations." So the previous raw-reflection write was wrong on
+// both 5.7 and 5.8 — it bypassed the required setter and wrote a Transient field
+// that never serialized. The setter drives SetSkeletalMesh() which updates the
+// real serialized backing store (SkinnedAsset). SetSkeletalMeshAsset exists since
+// UE 5.1, so this is correct for 5.1 through 5.8. (Resolved // VERIFY: mesh property.)
 // ---------------------------------------------------------------------------
 FString UGraphBridgeAutomationLibrary::SetCharacterMesh(
     FString BlueprintPath, FString MeshPath, FString ComponentName)
@@ -4799,20 +4805,14 @@ FString UGraphBridgeAutomationLibrary::SetCharacterMesh(
     if (ComponentName.IsEmpty())
         ComponentName = TEXT("CharacterMesh0");
 
-    // Writes the mesh to a SkeletalMeshComponent template via property reflection.
-    // Tries SkeletalMeshAsset (UE 5.1+) first, then SkeletalMesh for backwards compat.
+    // Assigns the mesh to a SkeletalMeshComponent template via the canonical
+    // setter (see the function-header note). Always succeeds for a valid
+    // USkeletalMeshComponent; kept as a bool-returning lambda so the call sites'
+    // error-reporting structure is unchanged.
     auto ApplyMesh = [&](USkeletalMeshComponent* SkelComp) -> bool
     {
-        for (const TCHAR* PropName : { TEXT("SkeletalMeshAsset"), TEXT("SkeletalMesh") })
-        {
-            FObjectProperty* Prop = FindFProperty<FObjectProperty>(SkelComp->GetClass(), PropName);
-            if (Prop && Prop->PropertyClass && Prop->PropertyClass->IsChildOf(USkeletalMesh::StaticClass()))
-            {
-                Prop->SetObjectPropertyValue_InContainer(SkelComp, Mesh);
-                return true;
-            }
-        }
-        return false;
+        SkelComp->SetSkeletalMeshAsset(Mesh);
+        return true;
     };
 
     // First pass: SCS (Blueprint-added components)
@@ -5078,10 +5078,14 @@ FString UGraphBridgeAutomationLibrary::SetCameraBoom(
 //
 // Returns the NodeGuid string of the AddMappingContext node on success.
 //
-// Pin name notes (// VERIFY against live Blueprint in UE 5.7):
+// Pin names (confirmed against UE 5.8 source — unchanged from 5.7):
 //   GetLocalPlayerSubsystem params: "PlayerController", "Class"
 //   AddMappingContext target pin: "self" (UEdGraphSchema_K2::PN_Self)
 //   AddMappingContext params: "MappingContext", "Priority"
+//   (EnhancedInputSubsystemInterface.h: AddMappingContext(const UInputMappingContext*
+//    MappingContext, int32 Priority, ...) — a member UFUNCTION, so param-derived pins
+//    are MappingContext/Priority and the target pin is self. The self→Target and
+//    FindPin null-guards below remain as defensive fallbacks.)
 // ---------------------------------------------------------------------------
 FString UGraphBridgeAutomationLibrary::AddIMCToCharacter(
     FString BlueprintPath, FString IMCPath, int32 Priority)
@@ -5233,17 +5237,18 @@ FString UGraphBridgeAutomationLibrary::AddIMCToCharacter(
     TryWire(GetPCNode->FindPin(UEdGraphSchema_K2::PN_ReturnValue),
             GetSubNode->FindPin(TEXT("PlayerController")));
 
-    // GetSub.ReturnValue → AddIMC.self (Target)  // VERIFY: "self" vs "Target" in UE 5.7
+    // GetSub.ReturnValue → AddIMC.self (Target). "self" confirmed for UE 5.8
+    // (AddMappingContext is a member UFUNCTION); Target kept as a fallback.
     UEdGraphPin* AddIMCTarget = AddIMCNode->FindPin(UEdGraphSchema_K2::PN_Self);
     if (!AddIMCTarget)
         AddIMCTarget = AddIMCNode->FindPin(TEXT("Target"));
     TryWire(GetSubNode->FindPin(UEdGraphSchema_K2::PN_ReturnValue), AddIMCTarget);
 
-    // Set AddIMC.MappingContext pin to IMC asset object reference  // VERIFY: pin name "MappingContext"
+    // Set AddIMC.MappingContext pin (param name confirmed for UE 5.8).
     if (UEdGraphPin* IMCPin = AddIMCNode->FindPin(TEXT("MappingContext")))
         IMCPin->DefaultObject = IMC;
 
-    // Set AddIMC.Priority pin  // VERIFY: pin name "Priority"
+    // Set AddIMC.Priority pin (param name confirmed for UE 5.8).
     if (UEdGraphPin* PriorityPin = AddIMCNode->FindPin(TEXT("Priority")))
         PriorityPin->DefaultValue = FString::FromInt(Priority);
 
@@ -5283,7 +5288,9 @@ FString UGraphBridgeAutomationLibrary::AddIMCToCharacter(
 //
 // PawnClassPath may be a Blueprint asset path (/Game/BP_Hero.BP_Hero) or
 // a C++ class name (e.g. ACharacter).
-// // VERIFY: whether recompile alone is sufficient or if MarkModified is needed
+// (UE 5.8: setting a CDO default + recompile is the standard persist path here;
+//  UBlueprint / FKismetEditorUtilities recompile behavior is unchanged in 5.8 —
+//  no signature or behavior change, and the plugin compiles clean on 5.8.)
 // ---------------------------------------------------------------------------
 FString UGraphBridgeAutomationLibrary::SetGameModePawn(
     FString GameModeBPPath, FString PawnClassPath)
@@ -5432,8 +5439,9 @@ FString UGraphBridgeAutomationLibrary::GetPlayerStart()
 // This overrides the project-level default for this level only.
 // IMPORTANT: Save the level (File > Save Current Level) to persist the change.
 // Pass "None" as GameModeBPPath to clear the override and use the project default.
-// // VERIFY: whether WorldSettings.Modify() + MarkPackageDirty is sufficient
-//             or whether a World->CommitMapChange() call is needed
+// (UE 5.8: AWorldSettings.Modify() + MarkPackageDirty is the standard persist path
+//  and is unchanged in 5.8 — no CommitMapChange() needed; the user still saves the
+//  level to write it to disk. Stable AWorldSettings/UPackage API, compiles clean on 5.8.)
 // ---------------------------------------------------------------------------
 FString UGraphBridgeAutomationLibrary::SetLevelGameMode(FString GameModeBPPath)
 {
@@ -7972,25 +7980,27 @@ FString UGraphBridgeAutomationLibrary::CreateNiagaraSystem(FString AssetPath)
     if (!DeriveAssetPathParts(AssetPath, PackageName, AssetName))
         return TEXT("ERR:Could not derive an asset name from the given path");
 
-    UPackage* NewPackage = CreatePackage(*PackageName);
-    if (!NewPackage)
-        return FString::Printf(TEXT("ERR:Failed to create package '%s'"), *PackageName);
-    NewPackage->FullyLoad();
-
     const FScopedTransaction Transaction(
         NSLOCTEXT("GraphBridge", "CreateNiagaraSystem", "GraphBridge: Create Niagara System"));
 
+    // UE 5.8: UNiagaraSystemFactoryNew::FactoryCreateNew is now private (it was
+    // callable directly in 5.7). Route through IAssetTools::CreateAsset, which
+    // invokes the factory via the public path and handles package creation +
+    // asset-registry notification. Same pattern this file already uses for the
+    // IK Retargeter. (Confirmed against UE 5.8 NiagaraSystemFactoryNew.h.)
+    FAssetToolsModule& AssetToolsModule = FModuleManager::LoadModuleChecked<FAssetToolsModule>("AssetTools");
     UNiagaraSystemFactoryNew* Factory = NewObject<UNiagaraSystemFactoryNew>();
-    UNiagaraSystem* NewSystem = Cast<UNiagaraSystem>(Factory->FactoryCreateNew(
-        UNiagaraSystem::StaticClass(), NewPackage, FName(*AssetName), RF_Public | RF_Standalone, nullptr, GWarn));
+    const FString FolderPath = FPackageName::GetLongPackagePath(PackageName);
+    UNiagaraSystem* NewSystem = Cast<UNiagaraSystem>(
+        AssetToolsModule.Get().CreateAsset(AssetName, FolderPath, UNiagaraSystem::StaticClass(), Factory));
     if (!NewSystem)
-        return TEXT("ERR:UNiagaraSystemFactoryNew::FactoryCreateNew returned null");
+        return TEXT("ERR:AssetTools::CreateAsset returned null for Niagara System");
 
-    FAssetRegistryModule::AssetCreated(NewSystem);
+    UPackage* NewPackage = NewSystem->GetOutermost();
     NewPackage->MarkPackageDirty();
 
     const FString PackageFilename = FPackageName::LongPackageNameToFilename(
-        PackageName, FPackageName::GetAssetPackageExtension());
+        NewPackage->GetName(), FPackageName::GetAssetPackageExtension());
 
     FSavePackageArgs SaveArgs;
     SaveArgs.TopLevelFlags = RF_Public | RF_Standalone;
@@ -8018,26 +8028,28 @@ FString UGraphBridgeAutomationLibrary::CreateNiagaraEmitter(FString AssetPath)
     if (!DeriveAssetPathParts(AssetPath, PackageName, AssetName))
         return TEXT("ERR:Could not derive an asset name from the given path");
 
-    UPackage* NewPackage = CreatePackage(*PackageName);
-    if (!NewPackage)
-        return FString::Printf(TEXT("ERR:Failed to create package '%s'"), *PackageName);
-    NewPackage->FullyLoad();
-
     const FScopedTransaction Transaction(
         NSLOCTEXT("GraphBridge", "CreateNiagaraEmitter", "GraphBridge: Create Niagara Emitter"));
 
+    // UE 5.8: UNiagaraEmitterFactoryNew::FactoryCreateNew is now private (was
+    // callable directly in 5.7). Route through IAssetTools::CreateAsset. The
+    // bAddDefaultModulesAndRenderersToEmptyEmitter flag is set on the same factory
+    // instance before CreateAsset uses it. (Confirmed against UE 5.8
+    // NiagaraEmitterFactoryNew.h.)
+    FAssetToolsModule& AssetToolsModule = FModuleManager::LoadModuleChecked<FAssetToolsModule>("AssetTools");
     UNiagaraEmitterFactoryNew* Factory = NewObject<UNiagaraEmitterFactoryNew>();
     Factory->bAddDefaultModulesAndRenderersToEmptyEmitter = true;
-    UNiagaraEmitter* NewEmitter = Cast<UNiagaraEmitter>(Factory->FactoryCreateNew(
-        UNiagaraEmitter::StaticClass(), NewPackage, FName(*AssetName), RF_Public | RF_Standalone, nullptr, GWarn));
+    const FString FolderPath = FPackageName::GetLongPackagePath(PackageName);
+    UNiagaraEmitter* NewEmitter = Cast<UNiagaraEmitter>(
+        AssetToolsModule.Get().CreateAsset(AssetName, FolderPath, UNiagaraEmitter::StaticClass(), Factory));
     if (!NewEmitter)
-        return TEXT("ERR:UNiagaraEmitterFactoryNew::FactoryCreateNew returned null");
+        return TEXT("ERR:AssetTools::CreateAsset returned null for Niagara Emitter");
 
-    FAssetRegistryModule::AssetCreated(NewEmitter);
+    UPackage* NewPackage = NewEmitter->GetOutermost();
     NewPackage->MarkPackageDirty();
 
     const FString PackageFilename = FPackageName::LongPackageNameToFilename(
-        PackageName, FPackageName::GetAssetPackageExtension());
+        NewPackage->GetName(), FPackageName::GetAssetPackageExtension());
 
     FSavePackageArgs SaveArgs;
     SaveArgs.TopLevelFlags = RF_Public | RF_Standalone;
