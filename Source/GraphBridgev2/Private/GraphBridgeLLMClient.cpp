@@ -393,11 +393,24 @@ TArray<TSharedPtr<FJsonValue>> FGraphBridgeLLMClient::BuildToolSchemas() const
         }));
 
     Add(MakeTool(TEXT("ADD_MONTAGE_NOTIFY"),
-        TEXT("Add a notify to an Animation Montage."),
+        TEXT("Add a single-frame UAnimNotify to an Animation Montage. ")
+        TEXT("For a begin/end window (e.g. a weapon hitbox active-frames span), ")
+        TEXT("use ADD_MONTAGE_NOTIFY_STATE instead."),
         {
             {TEXT("asset_path"),   TEXT("Content path to the montage")},
-            {TEXT("notify_class"), TEXT("Class of the notify")},
+            {TEXT("notify_class"), TEXT("Class of the notify (a UAnimNotify subclass)")},
             {TEXT("trigger_time"), TEXT("Trigger time in seconds")}
+        }));
+
+    Add(MakeTool(TEXT("ADD_MONTAGE_NOTIFY_STATE"),
+        TEXT("Add a UAnimNotifyState (a begin/end window) to an Animation Montage. ")
+        TEXT("Use this for hit-detection windows and any other effect with a duration; ")
+        TEXT("use ADD_MONTAGE_NOTIFY for single-frame events."),
+        {
+            {TEXT("asset_path"),   TEXT("Content path to the montage")},
+            {TEXT("notify_class"), TEXT("Class of the notify state (a UAnimNotifyState subclass)")},
+            {TEXT("start_time"),   TEXT("Window start time in seconds")},
+            {TEXT("duration"),     TEXT("Window length in seconds (must be > 0)")}
         }));
 
     Add(MakeTool(TEXT("REMOVE_MONTAGE_NOTIFY"),
@@ -966,6 +979,7 @@ FString FGraphBridgeLLMClient::DispatchToolCall(const FString& ToolName, const T
     else if (ToolName == TEXT("REMOVE_MONTAGE_SECTION"))Command = FString::Printf(TEXT("REMOVE_MONTAGE_SECTION|%s|%s"),    *GetArg(TEXT("asset_path")), *GetArg(TEXT("section_name")));
     else if (ToolName == TEXT("SET_MONTAGE_SLOT"))      Command = FString::Printf(TEXT("SET_MONTAGE_SLOT|%s|%s|%s"),       *GetArg(TEXT("asset_path")), *GetArg(TEXT("slot_index")), *GetArg(TEXT("slot_name")));
     else if (ToolName == TEXT("ADD_MONTAGE_NOTIFY"))    Command = FString::Printf(TEXT("ADD_MONTAGE_NOTIFY|%s|%s|%s"),     *GetArg(TEXT("asset_path")), *GetArg(TEXT("notify_class")), *GetArg(TEXT("trigger_time")));
+    else if (ToolName == TEXT("ADD_MONTAGE_NOTIFY_STATE")) Command = FString::Printf(TEXT("ADD_MONTAGE_NOTIFY_STATE|%s|%s|%s|%s"), *GetArg(TEXT("asset_path")), *GetArg(TEXT("notify_class")), *GetArg(TEXT("start_time")), *GetArg(TEXT("duration")));
     else if (ToolName == TEXT("REMOVE_MONTAGE_NOTIFY")) Command = FString::Printf(TEXT("REMOVE_MONTAGE_NOTIFY|%s|%s"),     *GetArg(TEXT("asset_path")), *GetArg(TEXT("notify_index")));
     else if (ToolName == TEXT("LIST_DATATABLE_ROWS"))   Command = FString::Printf(TEXT("LIST_DATATABLE_ROWS|%s"),           *GetArg(TEXT("asset_path")));
     else if (ToolName == TEXT("ADD_DATATABLE_ROW"))     Command = FString::Printf(TEXT("ADD_DATATABLE_ROW|%s|%s"),          *GetArg(TEXT("asset_path")), *GetArg(TEXT("row_name")));

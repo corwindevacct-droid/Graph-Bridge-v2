@@ -383,6 +383,11 @@ private:
     static FString RemoveMontageSection(FString AssetPath, FString SectionName);
     static FString SetMontageSlot(FString AssetPath, int32 SlotIndex, FString NewSlotName);
     static FString AddMontageNotify(FString AssetPath, FString NotifyClassName, float TimeSeconds);
+    // Adds a UAnimNotifyState (a begin/end window) rather than a single-frame
+    // UAnimNotify. Separate function because the two are sibling classes with
+    // different FAnimNotifyEvent fields — see the .cpp for why this isn't a
+    // duration flag on AddMontageNotify.
+    static FString AddMontageNotifyState(FString AssetPath, FString NotifyClassName, float StartSeconds, float DurationSeconds);
     static FString RemoveMontageNotify(FString AssetPath, int32 NotifyIndex);
 
     // ------------------------------------------------------------------

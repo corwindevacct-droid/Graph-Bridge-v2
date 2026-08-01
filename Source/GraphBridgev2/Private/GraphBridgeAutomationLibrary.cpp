@@ -84,6 +84,7 @@
 #include "Animation/AnimInstance.h"
 #include "Animation/AnimMontage.h"
 #include "Animation/AnimNotifies/AnimNotify.h"
+#include "Animation/AnimNotifies/AnimNotifyState.h"
 #include "Animation/BlendSpace.h"
 #include "UObject/SavePackage.h"
 #include "Subsystems/AssetEditorSubsystem.h"
@@ -758,9 +759,20 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommand(FString Command, ix::We
         SendResponse(Sender, bOk, Op,
             bOk ? TEXT("Notify added") : Err, TEXT(""));
     }
+    else if (Op == TEXT("ADD_MONTAGE_NOTIFY_STATE") && P.Num() >= 5)
+    {
+        // ADD_MONTAGE_NOTIFY_STATE|AssetPath|NotifyStateClass|StartSeconds|DurationSeconds
+        // For begin/end windows (e.g. weapon hitbox active frames). A plain
+        // single-frame notify goes through ADD_MONTAGE_NOTIFY instead.
+        FString Err = AddMontageNotifyState(
+            P[1], P[2], FCString::Atof(*P[3]), FCString::Atof(*P[4]));
+        bool bOk = Err.IsEmpty();
+        SendResponse(Sender, bOk, Op,
+            bOk ? TEXT("Notify state added") : Err, TEXT(""));
+    }
     else if (Op == TEXT("REMOVE_MONTAGE_NOTIFY") && P.Num() >= 3)
     {
-        // REMOVE_MONTAGE_NOTIFY|AssetPath|NotifyIndex
+        // REMOVE_MONTAGE_NOTIFY|AssetPath|NotifyIndex (works for both kinds)
         FString Err = RemoveMontageNotify(P[1], FCString::Atoi(*P[2]));
         bool bOk = Err.IsEmpty();
         SendResponse(Sender, bOk, Op,
@@ -3917,8 +3929,132 @@ FString UGraphBridgeAutomationLibrary::AddMontageNotify(
 }
 
 // ---------------------------------------------------------------------------
+// AddMontageNotifyState
+// Command: ADD_MONTAGE_NOTIFY_STATE|AssetPath|NotifyStateClass|StartSeconds|DurationSeconds
+//
+// NotifyStateClass: short class name of a UAnimNotifyState subclass,
+//                   e.g. "MeleeHitboxNotifyState"
+//
+// This is deliberately a SEPARATE opcode from ADD_MONTAGE_NOTIFY rather than a
+// duration parameter on it. UAnimNotify and UAnimNotifyState are sibling
+// classes, not parent/child, and they populate different FAnimNotifyEvent
+// fields (Notify vs NotifyStateClass + Duration). Overloading one opcode would
+// mean an agent silently gets window semantics just by passing a nonzero
+// duration — a failure mode that is hard to notice. Two names, two meanings.
+//
+// Placement follows UAnimationBlueprintLibrary::AddAnimationNotifyStateEvent
+// (Engine/Source/Editor/AnimationBlueprintLibrary). Link() alone is NOT enough
+// for a state notify: the end of the window is a second linkable element, so
+// SetDuration() and an explicit EndLink.Link() are both required, followed by
+// RefreshCacheData() to rebuild the editor's notify-track layout.
+// ---------------------------------------------------------------------------
+FString UGraphBridgeAutomationLibrary::AddMontageNotifyState(
+    FString AssetPath, FString NotifyClassName, float StartSeconds, float DurationSeconds)
+{
+    UAnimMontage* Montage = LoadObject<UAnimMontage>(nullptr, *AssetPath);
+    if (!Montage)
+        return FString::Printf(TEXT("ERR:AnimMontage not found at '%s'"), *AssetPath);
+
+    if (StartSeconds < 0.f)
+        return TEXT("ERR:StartSeconds must be >= 0");
+
+    // A zero-length window is almost always a caller mistake (they wanted
+    // ADD_MONTAGE_NOTIFY), so reject it loudly instead of creating a state
+    // notify that begins and ends on the same frame.
+    if (DurationSeconds <= 0.f)
+        return FString::Printf(
+            TEXT("ERR:DurationSeconds must be > 0 for a notify state (got %.4f). ")
+            TEXT("Use ADD_MONTAGE_NOTIFY for a single-frame notify."),
+            DurationSeconds);
+
+    const float MontageLength = Montage->GetPlayLength();
+    if (StartSeconds > MontageLength)
+        return FString::Printf(
+            TEXT("ERR:StartSeconds %.4f is beyond montage length %.4f"),
+            StartSeconds, MontageLength);
+
+    if (NotifyClassName.IsEmpty() || NotifyClassName == TEXT("None"))
+        return TEXT("ERR:NotifyStateClass is required (a marker-only notify state is meaningless)");
+
+    // Search UAnimNotifyState, not UAnimNotify — they are siblings, so a state
+    // class never satisfies IsChildOf(UAnimNotify::StaticClass()).
+    UClass* NotifyClass = nullptr;
+    for (TObjectIterator<UClass> It; It; ++It)
+    {
+        if (It->IsChildOf(UAnimNotifyState::StaticClass()) &&
+            It->GetName() == NotifyClassName)
+        {
+            NotifyClass = *It;
+            break;
+        }
+    }
+    if (!NotifyClass)
+    {
+        // Distinguish "wrong opcode" from "class doesn't exist" — this is the
+        // single most likely caller error.
+        for (TObjectIterator<UClass> It; It; ++It)
+        {
+            if (It->IsChildOf(UAnimNotify::StaticClass()) &&
+                It->GetName() == NotifyClassName)
+            {
+                return FString::Printf(
+                    TEXT("ERR:'%s' is a UAnimNotify, not a UAnimNotifyState. ")
+                    TEXT("Use ADD_MONTAGE_NOTIFY instead."), *NotifyClassName);
+            }
+        }
+        return FString::Printf(
+            TEXT("ERR:AnimNotifyState class '%s' not found"), *NotifyClassName);
+    }
+
+    if (NotifyClass->HasAnyClassFlags(CLASS_Abstract))
+        return FString::Printf(
+            TEXT("ERR:AnimNotifyState class '%s' is abstract"), *NotifyClassName);
+
+    const FScopedTransaction Transaction(
+        NSLOCTEXT("GraphBridge", "AddMontageNotifyState", "GraphBridge: Add Montage Notify State"));
+    Montage->Modify();
+
+    UAnimNotifyState* StateInstance = NewObject<UAnimNotifyState>(
+        Montage, NotifyClass, NAME_None, RF_Transactional);
+    if (!StateInstance)
+        return FString::Printf(
+            TEXT("ERR:Failed to instantiate notify state class '%s'"), *NotifyClassName);
+
+    const int32 NewIdx = Montage->Notifies.Add(FAnimNotifyEvent());
+    FAnimNotifyEvent& NewEvent = Montage->Notifies[NewIdx];
+
+    NewEvent.NotifyStateClass = StateInstance;
+    NewEvent.Notify           = nullptr;
+    NewEvent.TrackIndex       = 0;
+    NewEvent.Guid             = FGuid::NewGuid();
+    NewEvent.NotifyName       = FName(*StateInstance->GetNotifyName());
+
+    // Order matters: Link() sets the start, SetDuration() derives the end time,
+    // then EndLink.Link() anchors that end to the montage timeline.
+    NewEvent.Link(Montage, FMath::Max(StartSeconds, 0.01f));
+    NewEvent.TriggerTimeOffset =
+        GetTriggerTimeOffsetForType(Montage->CalculateOffsetForNotify(StartSeconds));
+    NewEvent.SetDuration(DurationSeconds);
+    NewEvent.EndLink.Link(Montage, NewEvent.EndLink.GetTime());
+
+    // Rebuilds AnimNotifyTracks so the window is drawn on the right row in the
+    // Montage editor. Also creates a track if none exists and shuffles the
+    // notify to a free row if track 0 already has something overlapping.
+    Montage->RefreshCacheData();
+    Montage->MarkPackageDirty();
+
+    UE_LOG(LogGraphBridge, Log,
+        TEXT("GraphBridge AddMontageNotifyState: '%s' at %.4fs for %.4fs (index %d)"),
+        *NotifyClassName, StartSeconds, DurationSeconds, NewIdx);
+    return TEXT("");
+}
+
+// ---------------------------------------------------------------------------
 // RemoveMontageNotify
 // Command: REMOVE_MONTAGE_NOTIFY|AssetPath|NotifyIndex
+//
+// Works for both plain notifies and notify states: it removes by index into
+// Montage->Notifies, which holds both kinds in the same array.
 // ---------------------------------------------------------------------------
 FString UGraphBridgeAutomationLibrary::RemoveMontageNotify(
     FString AssetPath, int32 NotifyIndex)
@@ -3936,6 +4072,10 @@ FString UGraphBridgeAutomationLibrary::RemoveMontageNotify(
         NSLOCTEXT("GraphBridge", "RemoveMontageNotify", "GraphBridge: Remove Montage Notify"));
     Montage->Modify();
     Montage->Notifies.RemoveAt(NotifyIndex);
+
+    // Rebuild the editor track layout so a removed notify (especially a state
+    // window, which occupies a span) doesn't leave a stale row behind.
+    Montage->RefreshCacheData();
     Montage->MarkPackageDirty();
 
     UE_LOG(LogGraphBridge, Log, TEXT("GraphBridge RemoveMontageNotify: removed index %d"), NotifyIndex);

@@ -924,6 +924,46 @@ class UnrealBridge:
         return await self._send_command(
             f"CREATE_ANIM_MONTAGE|{asset_path}|{skeleton_path}|{anim_sequence_path}")
 
+    async def add_montage_notify(self, asset_path: str, notify_class: str,
+                                  time_seconds: float) -> dict | None:
+        """
+        Add a single-frame UAnimNotify to a montage at time_seconds.
+
+        notify_class is a short class name (e.g. "AnimNotify_PlaySound"), or
+        "None" for an untriggered marker notify.
+
+        For a begin/end window (weapon hitboxes, invulnerability spans, etc.)
+        use add_montage_notify_state() instead — UAnimNotify and
+        UAnimNotifyState are sibling classes, and this call will not accept a
+        notify-state class.
+        """
+        return await self._send_command(
+            f"ADD_MONTAGE_NOTIFY|{asset_path}|{notify_class}|{time_seconds}")
+
+    async def add_montage_notify_state(self, asset_path: str, notify_class: str,
+                                        start_seconds: float,
+                                        duration_seconds: float) -> dict | None:
+        """
+        Add a UAnimNotifyState (a begin/end window) to a montage, spanning
+        start_seconds .. start_seconds + duration_seconds.
+
+        notify_class is a short class name of a UAnimNotifyState subclass,
+        e.g. "MeleeHitboxNotifyState". duration_seconds must be > 0; a
+        zero-length window is rejected, since that almost always means
+        add_montage_notify() was intended.
+        """
+        return await self._send_command(
+            f"ADD_MONTAGE_NOTIFY_STATE|{asset_path}|{notify_class}"
+            f"|{start_seconds}|{duration_seconds}")
+
+    async def remove_montage_notify(self, asset_path: str, notify_index: int) -> dict | None:
+        """
+        Remove a notify from a montage by index. Works for both plain notifies
+        and notify states — both live in the same Notifies array.
+        """
+        return await self._send_command(
+            f"REMOVE_MONTAGE_NOTIFY|{asset_path}|{notify_index}")
+
     async def create_blend_space(self, asset_path: str, skeleton_path: str) -> dict | None:
         """
         Create a BlendSpace on the given skeleton.

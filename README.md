@@ -176,7 +176,13 @@ is available on both — MCP is just a second way to reach the identical dispatc
 
 **Components & Input:** `ADD_COMPONENT`, `SET_INPUT_ACTION`, `SET_FUNCTION_REF`, `SET_EVENT_REF`, `CREATE_INPUT_ACTION`, `CREATE_IMC`, `ADD_IMC_MAPPING`, `ADD_IMC_TO_CHARACTER`
 
-**Animation:** `SET_ANIM_CLASS`, `SET_MONTAGE_SLOT`, `ADD_MONTAGE_SECTION`, `ADD_MONTAGE_NOTIFY`, `LIST_BLENDSPACES`, `LIST_SKELETON_SOCKETS`, `ADD_SKELETON_SOCKET`
+**Animation:** `SET_ANIM_CLASS`, `SET_MONTAGE_SLOT`, `ADD_MONTAGE_SECTION`, `ADD_MONTAGE_NOTIFY`, `ADD_MONTAGE_NOTIFY_STATE`, `LIST_BLENDSPACES`, `LIST_SKELETON_SOCKETS`, `ADD_SKELETON_SOCKET`
+
+> `ADD_MONTAGE_NOTIFY` adds a single-frame `UAnimNotify`.
+> `ADD_MONTAGE_NOTIFY_STATE` adds a `UAnimNotifyState` — a begin/end window with a
+> required `duration > 0`, used for things like weapon-hitbox active frames.
+> The two are separate opcodes because `UAnimNotify` and `UAnimNotifyState` are
+> sibling classes, so neither call accepts the other's class.
 
 **Level & Actors:** `SPAWN_ACTOR_IN_LEVEL`, `LIST_LEVEL_ACTORS`, `SET_ACTOR_TRANSFORM`, `DELETE_LEVEL_ACTOR`, `GET_PLAYER_START`, `SET_LEVEL_GAMEMODE`
 
