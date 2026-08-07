@@ -228,10 +228,51 @@ TArray<TSharedPtr<FJsonValue>> FGraphBridgeLLMClient::BuildToolSchemas() const
 
     Add(MakeTool(TEXT("CREATE_FUNCTION_GRAPH"),
         TEXT("Create a new custom function graph in a Blueprint. Compiles to a real callable UFunction "
-             "with its own call frame — cannot contain latent nodes. Returns the new FunctionEntry node's GUID."),
+             "with its own call frame — cannot contain latent nodes. Returns the new FunctionEntry node's GUID. "
+             "The function is created PARAMETERLESS: to give it arguments or a return value, follow up with "
+             "ADD_FUNCTION_PARAM before calling it with any."),
         {
             {TEXT("asset_path"),    TEXT("Content-browser path to the Blueprint")},
             {TEXT("function_name"), TEXT("Name for the new function")}
+        }));
+
+    Add(MakeTool(TEXT("ADD_FUNCTION_PARAM"),
+        TEXT("Add typed parameter(s) to an existing function graph's signature. "
+             "Required follow-up to CREATE_FUNCTION_GRAPH, which makes parameterless functions. "
+             "Only works on function graphs — not the EventGraph and not macros; "
+             "for a Custom Event use ADD_CUSTOM_EVENT_PARAM instead."),
+        {
+            {TEXT("asset_path"),     TEXT("Content-browser path to the Blueprint")},
+            {TEXT("function_name"),  TEXT("Name of the function graph")},
+            {TEXT("direction"),      TEXT("'in' for an argument, 'out' for a return value")},
+            {TEXT("params"),         TEXT("Comma-separated Type:Name pairs, e.g. 'float:DamageAmount,bool:bWasCritical'")}
+        }));
+
+    Add(MakeTool(TEXT("REMOVE_FUNCTION_PARAM"),
+        TEXT("Remove a parameter from a function graph's signature by name."),
+        {
+            {TEXT("asset_path"),    TEXT("Content-browser path to the Blueprint")},
+            {TEXT("function_name"), TEXT("Name of the function graph")},
+            {TEXT("direction"),     TEXT("'in' or 'out' — which side the parameter is on")},
+            {TEXT("param_name"),    TEXT("Name of the parameter to remove")}
+        }));
+
+    Add(MakeTool(TEXT("ADD_CUSTOM_EVENT_PARAM"),
+        TEXT("Add typed parameter(s) to a Custom Event node. Takes the event's node id, not a graph name, "
+             "because a Custom Event is a single node rather than its own graph. "
+             "The event must already have been named with SET_CUSTOM_EVENT_NAME."),
+        {
+            {TEXT("asset_path"),    TEXT("Content-browser path to the Blueprint")},
+            {TEXT("node_id"),       TEXT("GUID of the K2Node_CustomEvent")},
+            {TEXT("params"),        TEXT("Comma-separated Type:Name pairs, e.g. 'float:DamageAmount'")}
+        }));
+
+    Add(MakeTool(TEXT("REMOVE_CUSTOM_EVENT_PARAM"),
+        TEXT("Remove a parameter from a Custom Event node by name."),
+        {
+            {TEXT("asset_path"),    TEXT("Content-browser path to the Blueprint")},
+            {TEXT("node_id"),       TEXT("GUID of the K2Node_CustomEvent")},
+            {TEXT("param_name"),    TEXT("Name of the parameter to remove")}
         }));
 
     Add(MakeTool(TEXT("CREATE_MACRO_GRAPH"),
@@ -954,6 +995,10 @@ FString FGraphBridgeLLMClient::DispatchToolCall(const FString& ToolName, const T
     else if (ToolName == TEXT("LIST_NODES"))            Command = FString::Printf(TEXT("LIST_NODES|%s|%s"),               *GetArg(TEXT("asset_path")), *GetArg(TEXT("graph_name")));
     else if (ToolName == TEXT("LIST_GRAPHS"))           Command = FString::Printf(TEXT("LIST_GRAPHS|%s"),                 *GetArg(TEXT("asset_path")));
     else if (ToolName == TEXT("CREATE_FUNCTION_GRAPH")) Command = FString::Printf(TEXT("CREATE_FUNCTION_GRAPH|%s|%s"),    *GetArg(TEXT("asset_path")), *GetArg(TEXT("function_name")));
+    else if (ToolName == TEXT("ADD_FUNCTION_PARAM"))       Command = FString::Printf(TEXT("ADD_FUNCTION_PARAM|%s|%s|%s|%s"),       *GetArg(TEXT("asset_path")), *GetArg(TEXT("function_name")), *GetArg(TEXT("direction")), *GetArg(TEXT("params")));
+    else if (ToolName == TEXT("REMOVE_FUNCTION_PARAM"))    Command = FString::Printf(TEXT("REMOVE_FUNCTION_PARAM|%s|%s|%s|%s"),    *GetArg(TEXT("asset_path")), *GetArg(TEXT("function_name")), *GetArg(TEXT("direction")), *GetArg(TEXT("param_name")));
+    else if (ToolName == TEXT("ADD_CUSTOM_EVENT_PARAM"))   Command = FString::Printf(TEXT("ADD_CUSTOM_EVENT_PARAM|%s|%s|%s"),      *GetArg(TEXT("asset_path")), *GetArg(TEXT("node_id")), *GetArg(TEXT("params")));
+    else if (ToolName == TEXT("REMOVE_CUSTOM_EVENT_PARAM"))Command = FString::Printf(TEXT("REMOVE_CUSTOM_EVENT_PARAM|%s|%s|%s"),   *GetArg(TEXT("asset_path")), *GetArg(TEXT("node_id")), *GetArg(TEXT("param_name")));
     else if (ToolName == TEXT("CREATE_MACRO_GRAPH"))    Command = FString::Printf(TEXT("CREATE_MACRO_GRAPH|%s|%s"),       *GetArg(TEXT("asset_path")), *GetArg(TEXT("macro_name")));
     else if (ToolName == TEXT("COMPILE"))               Command = FString::Printf(TEXT("COMPILE|%s"),                      *GetArg(TEXT("asset_path")));
     else if (ToolName == TEXT("SAVE_BLUEPRINT"))        Command = FString::Printf(TEXT("SAVE_BLUEPRINT|%s"),               *GetArg(TEXT("asset_path")));

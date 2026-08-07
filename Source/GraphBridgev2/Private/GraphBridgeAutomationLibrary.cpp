@@ -29,6 +29,7 @@
 #include "K2Node_EditablePinBase.h"
 #include "K2Node_SpawnActorFromClass.h"
 #include "K2Node_FunctionEntry.h"
+#include "K2Node_FunctionResult.h"
 #include "K2Node_Tunnel.h"
 #include "AnimGraphNode_Base.h"
 #include "AnimGraphNode_StateMachine.h"
@@ -1335,6 +1336,40 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommandExtended(const FString& 
         bool bOk = Err.IsEmpty();
         SendResponse(Sender, bOk, Op,
             bOk ? TEXT("Event dispatcher created") : Err.RightChop(4), TEXT(""));
+    }
+    else if (Op == TEXT("ADD_FUNCTION_PARAM") && P.Num() >= 5)
+    {
+        // ADD_FUNCTION_PARAM|BPPath|FunctionGraphName|Direction|Type:Name,...
+        // Direction is "in" (entry node) or "out" (result node).
+        FString Err = AddFunctionParam(P[1], P[2], P[3], P[4]);
+        bool bOk = Err.IsEmpty();
+        SendResponse(Sender, bOk, Op,
+            bOk ? TEXT("Function parameter(s) added") : Err.RightChop(4), TEXT(""));
+    }
+    else if (Op == TEXT("REMOVE_FUNCTION_PARAM") && P.Num() >= 5)
+    {
+        // REMOVE_FUNCTION_PARAM|BPPath|FunctionGraphName|Direction|ParamName
+        FString Err = RemoveFunctionParam(P[1], P[2], P[3], P[4]);
+        bool bOk = Err.IsEmpty();
+        SendResponse(Sender, bOk, Op,
+            bOk ? TEXT("Function parameter removed") : Err.RightChop(4), TEXT(""));
+    }
+    else if (Op == TEXT("ADD_CUSTOM_EVENT_PARAM") && P.Num() >= 4)
+    {
+        // ADD_CUSTOM_EVENT_PARAM|BPPath|EventNodeId|Type:Name,...
+        // The event must already be named via SET_CUSTOM_EVENT_NAME.
+        FString Err = AddCustomEventParam(P[1], P[2], P[3]);
+        bool bOk = Err.IsEmpty();
+        SendResponse(Sender, bOk, Op,
+            bOk ? TEXT("Custom event parameter(s) added") : Err.RightChop(4), TEXT(""));
+    }
+    else if (Op == TEXT("REMOVE_CUSTOM_EVENT_PARAM") && P.Num() >= 4)
+    {
+        // REMOVE_CUSTOM_EVENT_PARAM|BPPath|EventNodeId|ParamName
+        FString Err = RemoveCustomEventParam(P[1], P[2], P[3]);
+        bool bOk = Err.IsEmpty();
+        SendResponse(Sender, bOk, Op,
+            bOk ? TEXT("Custom event parameter removed") : Err.RightChop(4), TEXT(""));
     }
     else if (Op == TEXT("CREATE_STATE_MACHINE") && P.Num() >= 6)
     {
@@ -7184,6 +7219,409 @@ FString UGraphBridgeAutomationLibrary::CreateEventDispatcher(FString BlueprintPa
 
     UE_LOG(LogGraphBridge, Log, TEXT("GraphBridge CreateEventDispatcher: '%s' (%d params) in '%s'"),
         *Name.ToString(), Params.Num(), *BlueprintPath);
+    return TEXT("");
+}
+
+// ---------------------------------------------------------------------------
+// Function / Custom Event parameters (v1.13)
+//
+// Same underlying mechanism CreateEventDispatcher uses for its signature graph
+// (UK2Node_EditablePinBase::CreateUserDefinedPin), applied to ordinary function
+// graphs and to Custom Event nodes. CreateEventDispatcher itself is untouched.
+//
+// Engine facts confirmed against UE 5.7 source before writing this:
+//  * FBlueprintEditorUtils::GetEntryAndResultNodes only ever looks for
+//    UK2Node_FunctionEntry/UK2Node_Tunnel nodes *inside a graph*, so it does
+//    NOT resolve a bare Custom Event. But UK2Node_CustomEvent derives from
+//    UK2Node_Event -> UK2Node_EditablePinBase, so the node is cast and used
+//    directly instead.
+//  * A function graph is NOT guaranteed to have a result node — the engine's
+//    own comment notes "the entry node is guaranteed to be there on graph
+//    creation, but the result isn't". FindOrCreateFunctionResultNode() is the
+//    engine's helper for exactly this, and is what the editor's own
+//    "Add New Output" button uses (FBaseBlueprintGraphActionDetails::
+//    AttemptToCreateResultNode).
+//  * A function may have SEVERAL result nodes (multiple return paths). The
+//    editor adds the pin to every one via GetAllResultNodes(); doing anything
+//    less produces a graph that fails to compile.
+// ---------------------------------------------------------------------------
+
+
+
+// ---------------------------------------------------------------------------
+// AddFunctionParam
+// Command: ADD_FUNCTION_PARAM|BlueprintPath|FunctionGraphName|Direction|Type:Name,...
+// ---------------------------------------------------------------------------
+FString UGraphBridgeAutomationLibrary::AddFunctionParam(
+    FString BlueprintPath, FString FunctionGraphName, FString Direction, FString CommaSeparatedParams)
+{
+    UBlueprint* Blueprint = GetBlueprintByPath(BlueprintPath);
+    if (!Blueprint)
+        return FString::Printf(TEXT("ERR:Blueprint not found at '%s'"), *BlueprintPath);
+
+    const bool bIsIn  = Direction.Equals(TEXT("in"),  ESearchCase::IgnoreCase);
+    const bool bIsOut = Direction.Equals(TEXT("out"), ESearchCase::IgnoreCase);
+    if (!bIsIn && !bIsOut)
+        return FString::Printf(TEXT("ERR:Direction must be 'in' or 'out' (got '%s')"), *Direction);
+
+    // Resolve the function graph
+    UEdGraph* Graph = FindGraphByName(Blueprint, FunctionGraphName);
+    if (!Graph)
+        return FString::Printf(TEXT("ERR:Graph '%s' not found"), *FunctionGraphName);
+    if (Blueprint->UbergraphPages.Contains(Graph))
+        return FString::Printf(
+            TEXT("ERR:'%s' is an Event Graph, which has no signature. ")
+            TEXT("Use ADD_CUSTOM_EVENT_PARAM on a Custom Event node instead."), *FunctionGraphName);
+    if (Blueprint->MacroGraphs.Contains(Graph))
+        return FString::Printf(
+            TEXT("ERR:'%s' is a Macro graph; ADD_FUNCTION_PARAM only works on function graphs"),
+            *FunctionGraphName);
+    if (!Blueprint->FunctionGraphs.Contains(Graph))
+        return FString::Printf(
+            TEXT("ERR:'%s' is not a function graph (delegate signature graphs are managed by CREATE_EVENT_DISPATCHER)"),
+            *FunctionGraphName);
+
+    // Parse parameters: "Type:Name,Type:Name,..."
+    struct FParamSpec { FString Name; FEdGraphPinType PinType; };
+    TArray<FParamSpec> Params;
+    if (!CommaSeparatedParams.IsEmpty())
+    {
+        TArray<FString> Pairs;
+        CommaSeparatedParams.ParseIntoArray(Pairs, TEXT(","), true);
+        for (FString& Pair : Pairs)
+        {
+            Pair.TrimStartAndEndInline();
+            FString TypeStr, NameStr;
+            if (!Pair.Split(TEXT(":"), &TypeStr, &NameStr))
+                return FString::Printf(TEXT("ERR:Malformed parameter '%s' — expected Type:Name"), *Pair);
+            TypeStr.TrimStartAndEndInline();
+            NameStr.TrimStartAndEndInline();
+            if (NameStr.IsEmpty())
+                return FString::Printf(TEXT("ERR:Malformed parameter '%s' — empty parameter name"), *Pair);
+
+            FEdGraphPinType PinType = ResolveTypeString(TypeStr);
+            if (PinType.PinCategory == UEdGraphSchema_K2::PC_Wildcard)
+                return FString::Printf(TEXT("ERR:Unknown parameter type '%s' in '%s'"), *TypeStr, *Pair);
+
+            Params.Add(FParamSpec{ NameStr, PinType });
+        }
+    }
+    else
+    {
+        return TEXT("ERR:Parameter list cannot be empty");
+    }
+
+    TWeakObjectPtr<UK2Node_EditablePinBase> EntryNode, ResultNode;
+    FBlueprintEditorUtils::GetEntryAndResultNodes(Graph, EntryNode, ResultNode);
+    if (!EntryNode.IsValid())
+        return FString::Printf(
+            TEXT("ERR:Function '%s' has no editable entry node"), *FunctionGraphName);
+
+    const FScopedTransaction Transaction(
+        NSLOCTEXT("GraphBridge", "AddFunctionParam", "GraphBridge: Add Function Parameter"));
+    Blueprint->Modify();
+    Graph->Modify();
+
+    // Inputs live on the entry node and flow OUT of it into the body; outputs
+    // live on the result node and flow IN to it from the body.
+    TArray<UK2Node_EditablePinBase*> TargetNodes;
+    const EEdGraphPinDirection PinDir = bIsIn ? EGPD_Output : EGPD_Input;
+
+    if (bIsIn)
+    {
+        TargetNodes.Add(EntryNode.Get());
+    }
+    else
+    {
+        UK2Node_FunctionResult* Result = FBlueprintEditorUtils::FindOrCreateFunctionResultNode(EntryNode.Get());
+        if (!Result)
+            return FString::Printf(
+                TEXT("ERR:Could not find or create a result node for function '%s'"), *FunctionGraphName);
+
+        // Multiple return paths mean multiple result nodes; the pin must go on
+        // every one or the function won't compile.
+        for (UK2Node_FunctionResult* R : Result->GetAllResultNodes())
+            TargetNodes.Add(R);
+
+        if (TargetNodes.Num() == 0)
+            TargetNodes.Add(Result);
+    }
+
+    int32 AddedCount = 0;
+    for (const FParamSpec& P : Params)
+    {
+        for (UK2Node_EditablePinBase* Node : TargetNodes)
+        {
+            bool bExists = false;
+            for (const TSharedPtr<FUserPinInfo>& Pin : Node->UserDefinedPins)
+                if (Pin.IsValid() && Pin->PinName.ToString().Equals(P.Name, ESearchCase::IgnoreCase))
+                    bExists = true;
+            if (bExists)
+                return FString::Printf(
+                    TEXT("ERR:Parameter '%s' already exists on function '%s'"),
+                    *P.Name, *FunctionGraphName);
+        }
+
+        for (UK2Node_EditablePinBase* Node : TargetNodes)
+        {
+            Node->Modify();
+            // bUseUniqueName=false: the caller gets exactly the name it asked
+            // for, since the duplicate check above already ran.
+            UEdGraphPin* NewPin = Node->CreateUserDefinedPin(FName(*P.Name), P.PinType, PinDir, false);
+            if (!NewPin)
+                return FString::Printf(
+                    TEXT("ERR:Failed to add parameter '%s' to function '%s'"),
+                    *P.Name, *FunctionGraphName);
+        }
+        ++AddedCount;
+    }
+
+    FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
+
+    UE_LOG(LogGraphBridge, Log,
+        TEXT("GraphBridge AddFunctionParam: %d %s param(s) on '%s' in '%s'"),
+        AddedCount, bIsIn ? TEXT("in") : TEXT("out"), *FunctionGraphName, *BlueprintPath);
+    return TEXT("");
+}
+
+// ---------------------------------------------------------------------------
+// RemoveFunctionParam
+// Command: REMOVE_FUNCTION_PARAM|BlueprintPath|FunctionGraphName|Direction|ParamName
+// ---------------------------------------------------------------------------
+FString UGraphBridgeAutomationLibrary::RemoveFunctionParam(
+    FString BlueprintPath, FString FunctionGraphName, FString Direction, FString ParamName)
+{
+    UBlueprint* Blueprint = GetBlueprintByPath(BlueprintPath);
+    if (!Blueprint)
+        return FString::Printf(TEXT("ERR:Blueprint not found at '%s'"), *BlueprintPath);
+
+    const bool bIsIn  = Direction.Equals(TEXT("in"),  ESearchCase::IgnoreCase);
+    const bool bIsOut = Direction.Equals(TEXT("out"), ESearchCase::IgnoreCase);
+    if (!bIsIn && !bIsOut)
+        return FString::Printf(TEXT("ERR:Direction must be 'in' or 'out' (got '%s')"), *Direction);
+
+    if (ParamName.IsEmpty())
+        return TEXT("ERR:ParamName cannot be empty");
+
+    // Resolve the function graph
+    UEdGraph* Graph = FindGraphByName(Blueprint, FunctionGraphName);
+    if (!Graph)
+        return FString::Printf(TEXT("ERR:Graph '%s' not found"), *FunctionGraphName);
+    if (Blueprint->UbergraphPages.Contains(Graph))
+        return FString::Printf(
+            TEXT("ERR:'%s' is an Event Graph, which has no signature. ")
+            TEXT("Use REMOVE_CUSTOM_EVENT_PARAM on a Custom Event node instead."), *FunctionGraphName);
+    if (Blueprint->MacroGraphs.Contains(Graph))
+        return FString::Printf(
+            TEXT("ERR:'%s' is a Macro graph; REMOVE_FUNCTION_PARAM only works on function graphs"),
+            *FunctionGraphName);
+    if (!Blueprint->FunctionGraphs.Contains(Graph))
+        return FString::Printf(
+            TEXT("ERR:'%s' is not a function graph (delegate signature graphs are managed by CREATE_EVENT_DISPATCHER)"),
+            *FunctionGraphName);
+
+    TWeakObjectPtr<UK2Node_EditablePinBase> EntryNode, ResultNode;
+    FBlueprintEditorUtils::GetEntryAndResultNodes(Graph, EntryNode, ResultNode);
+    if (!EntryNode.IsValid())
+        return FString::Printf(
+            TEXT("ERR:Function '%s' has no editable entry node"), *FunctionGraphName);
+
+    TArray<UK2Node_EditablePinBase*> TargetNodes;
+    if (bIsIn)
+    {
+        TargetNodes.Add(EntryNode.Get());
+    }
+    else
+    {
+        // Don't create a result node just to remove from it.
+        if (!ResultNode.IsValid())
+            return FString::Printf(
+                TEXT("ERR:Function '%s' has no result node, so it has no out parameters"),
+                *FunctionGraphName);
+
+        if (UK2Node_FunctionResult* Result = Cast<UK2Node_FunctionResult>(ResultNode.Get()))
+        {
+            for (UK2Node_FunctionResult* R : Result->GetAllResultNodes())
+                TargetNodes.Add(R);
+        }
+        if (TargetNodes.Num() == 0)
+            TargetNodes.Add(ResultNode.Get());
+    }
+
+    bool bFoundAnywhere = false;
+    for (UK2Node_EditablePinBase* Node : TargetNodes)
+    {
+        for (const TSharedPtr<FUserPinInfo>& Pin : Node->UserDefinedPins)
+            if (Pin.IsValid() && Pin->PinName.ToString().Equals(ParamName, ESearchCase::IgnoreCase))
+                bFoundAnywhere = true;
+    }
+
+    if (!bFoundAnywhere)
+        return FString::Printf(
+            TEXT("ERR:Parameter '%s' not found as an '%s' param on function '%s'"),
+            *ParamName, *Direction, *FunctionGraphName);
+
+    const FScopedTransaction Transaction(
+        NSLOCTEXT("GraphBridge", "RemoveFunctionParam", "GraphBridge: Remove Function Parameter"));
+    Blueprint->Modify();
+    Graph->Modify();
+
+    for (UK2Node_EditablePinBase* Node : TargetNodes)
+    {
+        Node->Modify();
+        Node->RemoveUserDefinedPinByName(FName(*ParamName));
+    }
+
+    FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
+
+    UE_LOG(LogGraphBridge, Log,
+        TEXT("GraphBridge RemoveFunctionParam: '%s' (%s) from '%s' in '%s'"),
+        *ParamName, *Direction, *FunctionGraphName, *BlueprintPath);
+    return TEXT("");
+}
+
+// ---------------------------------------------------------------------------
+// AddCustomEventParam
+// Command: ADD_CUSTOM_EVENT_PARAM|BlueprintPath|EventNodeId|Type:Name,...
+//
+// All parameters are EGPD_Output: a Custom Event's parameters flow out of the
+// event node into the graph, the same direction a function entry node uses.
+// ---------------------------------------------------------------------------
+FString UGraphBridgeAutomationLibrary::AddCustomEventParam(
+    FString BlueprintPath, FString EventNodeId, FString CommaSeparatedParams)
+{
+    UBlueprint* Blueprint = GetBlueprintByPath(BlueprintPath);
+    if (!Blueprint)
+        return FString::Printf(TEXT("ERR:Blueprint not found at '%s'"), *BlueprintPath);
+
+    UEdGraphNode* Node = FindNodeAnywhere(Blueprint, EventNodeId);
+    if (!Node)
+        return FString::Printf(TEXT("ERR:Node '%s' not found"), *EventNodeId);
+
+    UK2Node_CustomEvent* EventNode = Cast<UK2Node_CustomEvent>(Node);
+    if (!EventNode)
+        return FString::Printf(
+            TEXT("ERR:Node '%s' is a %s, not a K2Node_CustomEvent"),
+            *EventNodeId, *Node->GetClass()->GetName());
+
+    // An unnamed event isn't a real callable event yet, so it must not accept
+    // a signature. SET_CUSTOM_EVENT_NAME has to come first.
+    if (EventNode->CustomFunctionName.IsNone() ||
+        EventNode->CustomFunctionName.ToString().Equals(TEXT("None"), ESearchCase::IgnoreCase))
+        return FString::Printf(
+            TEXT("ERR:Custom Event '%s' has no name yet. ")
+            TEXT("Call SET_CUSTOM_EVENT_NAME before adding parameters."), *EventNodeId);
+
+    // Parse parameters: "Type:Name,Type:Name,..."
+    struct FParamSpec { FString Name; FEdGraphPinType PinType; };
+    TArray<FParamSpec> Params;
+    if (!CommaSeparatedParams.IsEmpty())
+    {
+        TArray<FString> Pairs;
+        CommaSeparatedParams.ParseIntoArray(Pairs, TEXT(","), true);
+        for (FString& Pair : Pairs)
+        {
+            Pair.TrimStartAndEndInline();
+            FString TypeStr, NameStr;
+            if (!Pair.Split(TEXT(":"), &TypeStr, &NameStr))
+                return FString::Printf(TEXT("ERR:Malformed parameter '%s' — expected Type:Name"), *Pair);
+            TypeStr.TrimStartAndEndInline();
+            NameStr.TrimStartAndEndInline();
+            if (NameStr.IsEmpty())
+                return FString::Printf(TEXT("ERR:Malformed parameter '%s' — empty parameter name"), *Pair);
+
+            FEdGraphPinType PinType = ResolveTypeString(TypeStr);
+            if (PinType.PinCategory == UEdGraphSchema_K2::PC_Wildcard)
+                return FString::Printf(TEXT("ERR:Unknown parameter type '%s' in '%s'"), *TypeStr, *Pair);
+
+            Params.Add(FParamSpec{ NameStr, PinType });
+        }
+    }
+    else
+    {
+        return TEXT("ERR:Parameter list cannot be empty");
+    }
+
+    for (const FParamSpec& P : Params)
+    {
+        bool bExists = false;
+        for (const TSharedPtr<FUserPinInfo>& Pin : EventNode->UserDefinedPins)
+            if (Pin.IsValid() && Pin->PinName.ToString().Equals(P.Name, ESearchCase::IgnoreCase))
+                bExists = true;
+        if (bExists)
+            return FString::Printf(
+                TEXT("ERR:Parameter '%s' already exists on custom event '%s'"),
+                *P.Name, *EventNode->CustomFunctionName.ToString());
+    }
+
+    const FScopedTransaction Transaction(
+        NSLOCTEXT("GraphBridge", "AddCustomEventParam", "GraphBridge: Add Custom Event Parameter"));
+    Blueprint->Modify();
+    EventNode->Modify();
+
+    for (const FParamSpec& P : Params)
+    {
+        EventNode->Modify();
+        UEdGraphPin* NewPin = EventNode->CreateUserDefinedPin(
+            FName(*P.Name), P.PinType, EGPD_Output, false);
+        if (!NewPin)
+            return FString::Printf(
+                TEXT("ERR:Failed to add parameter '%s' to custom event '%s'"),
+                *P.Name, *EventNode->CustomFunctionName.ToString());
+    }
+
+    FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
+
+    UE_LOG(LogGraphBridge, Log,
+        TEXT("GraphBridge AddCustomEventParam: %d param(s) on '%s' in '%s'"),
+        Params.Num(), *EventNode->CustomFunctionName.ToString(), *BlueprintPath);
+    return TEXT("");
+}
+
+// ---------------------------------------------------------------------------
+// RemoveCustomEventParam
+// Command: REMOVE_CUSTOM_EVENT_PARAM|BlueprintPath|EventNodeId|ParamName
+// ---------------------------------------------------------------------------
+FString UGraphBridgeAutomationLibrary::RemoveCustomEventParam(
+    FString BlueprintPath, FString EventNodeId, FString ParamName)
+{
+    UBlueprint* Blueprint = GetBlueprintByPath(BlueprintPath);
+    if (!Blueprint)
+        return FString::Printf(TEXT("ERR:Blueprint not found at '%s'"), *BlueprintPath);
+
+    if (ParamName.IsEmpty())
+        return TEXT("ERR:ParamName cannot be empty");
+
+    UEdGraphNode* Node = FindNodeAnywhere(Blueprint, EventNodeId);
+    if (!Node)
+        return FString::Printf(TEXT("ERR:Node '%s' not found"), *EventNodeId);
+
+    UK2Node_CustomEvent* EventNode = Cast<UK2Node_CustomEvent>(Node);
+    if (!EventNode)
+        return FString::Printf(
+            TEXT("ERR:Node '%s' is a %s, not a K2Node_CustomEvent"),
+            *EventNodeId, *Node->GetClass()->GetName());
+
+    bool bFound = false;
+    for (const TSharedPtr<FUserPinInfo>& Pin : EventNode->UserDefinedPins)
+        if (Pin.IsValid() && Pin->PinName.ToString().Equals(ParamName, ESearchCase::IgnoreCase))
+            bFound = true;
+    if (!bFound)
+        return FString::Printf(
+            TEXT("ERR:Parameter '%s' not found on custom event '%s'"),
+            *ParamName, *EventNode->CustomFunctionName.ToString());
+
+    const FScopedTransaction Transaction(
+        NSLOCTEXT("GraphBridge", "RemoveCustomEventParam", "GraphBridge: Remove Custom Event Parameter"));
+    Blueprint->Modify();
+    EventNode->Modify();
+    EventNode->RemoveUserDefinedPinByName(FName(*ParamName));
+
+    FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
+
+    UE_LOG(LogGraphBridge, Log,
+        TEXT("GraphBridge RemoveCustomEventParam: '%s' from '%s' in '%s'"),
+        *ParamName, *EventNode->CustomFunctionName.ToString(), *BlueprintPath);
     return TEXT("");
 }
 

@@ -75,6 +75,25 @@ DISCOVERY RULES - always do this before any mutation
    (or leave the trailing pipe segment empty) to target EventGraph.
    e.g. SPAWN_NODE|BP_PATH|K2Node_CallFunction|MyComment|200|100|MyFunctionName
 
+6. CREATE_FUNCTION_GRAPH creates a PARAMETERLESS function. If the function
+   needs arguments or a return value, ADD_FUNCTION_PARAM is a required
+   follow-up - without it the function has no signature and cannot be
+   called with any argument.
+   ADD_FUNCTION_PARAM format:
+     ADD_FUNCTION_PARAM|BP_PATH|FunctionName|in|Type:Name,Type:Name
+     ADD_FUNCTION_PARAM|BP_PATH|FunctionName|out|Type:Name
+   Direction is "in" (an argument) or "out" (a return value). Types use the
+   same names as ADD_VARIABLE (see "Variable type strings" below).
+   REMOVE_FUNCTION_PARAM|BP_PATH|FunctionName|Direction|ParamName removes one.
+   Only works on Function graphs - EventGraph and Macro graphs are rejected.
+
+   Custom Events are nodes, not graphs, so they use a different opcode that
+   takes the node's GUID:
+     ADD_CUSTOM_EVENT_PARAM|BP_PATH|EventNodeId|Type:Name,Type:Name
+     REMOVE_CUSTOM_EVENT_PARAM|BP_PATH|EventNodeId|ParamName
+   The event MUST be named with SET_CUSTOM_EVENT_NAME first; adding
+   parameters to an unnamed Custom Event fails with ERR:.
+
 =======================================================
 SPAWN_NODE RULES - read every time before spawning
 =======================================================

@@ -130,9 +130,13 @@ private:
     static UBlueprint*   GetBlueprintByPath(FString AssetPath);
     static UEdGraphNode* FindNodeByName(UBlueprint* Blueprint, FString NodeIdentifier);
     static UEdGraphNode* FindNodeById(UBlueprint* Blueprint, FString NodeId);
+    static UEdGraphNode* FindNodeAnywhere(UBlueprint* Blueprint, const FString& NodeId);
 
-    // Type resolution for SPAWN_VARIABLE
+    // Type resolution for SPAWN_VARIABLE, ADD_VARIABLE, and parameter opcodes
     static FEdGraphPinType ResolveTypeString(const FString& TypeString);
+
+    // Graph lookup — resolves EventGraph (any UbergraphPage) or named Function/Macro graph
+    static UEdGraph* FindGraphByName(UBlueprint* Blueprint, const FString& GraphName);
 
     // Graph mutation verbs
     static FString SpawnEventNode(FString BlueprintPath, FString EventFuncName,
@@ -154,7 +158,6 @@ private:
     // resolves to the main event graph; otherwise matched by GetName()
     // against Blueprint->FunctionGraphs, then Blueprint->MacroGraphs (in
     // that order). Returns nullptr if not found.
-    static UEdGraph* FindGraphByName(UBlueprint* Blueprint, const FString& GraphName);
 
     // Finds a node by GUID, comment, or full title WITHIN a single graph
     // (not the whole Blueprint) — used by the GraphName-scoped verbs below
@@ -642,6 +645,36 @@ private:
         FString CommaSeparatedParams);
 
     // ------------------------------------------------------------------
+    // Function / Custom Event parameters (v1.13)
+    // ------------------------------------------------------------------
+    // CREATE_FUNCTION_GRAPH produces a parameterless function; these add the
+    // signature afterward, using the same CreateUserDefinedPin mechanism
+    // CreateEventDispatcher already uses for its signature graph.
+    //
+    // Direction "in"  -> pins on the function ENTRY node as EGPD_Output
+    //                    (inputs flow out of the entry node into the body).
+    // Direction "out" -> pins on the function RESULT node as EGPD_Input.
+    //                    A void function graph has no result node; one is
+    //                    created on demand via
+    //                    FBlueprintEditorUtils::FindOrCreateFunctionResultNode.
+    //
+    // Returns empty string on success, "ERR:..." on failure.
+    static FString AddFunctionParam(FString BlueprintPath, FString FunctionGraphName,
+        FString Direction, FString CommaSeparatedParams);
+    static FString RemoveFunctionParam(FString BlueprintPath, FString FunctionGraphName,
+        FString Direction, FString ParamName);
+
+    // A Custom Event is a single node, not a graph, so these take a node id.
+    // UK2Node_CustomEvent derives from UK2Node_EditablePinBase, so pins are
+    // created directly on the node (GetEntryAndResultNodes does NOT find custom
+    // events — it only looks for FunctionEntry/Tunnel nodes within a graph).
+    // The event must already be named via SET_CUSTOM_EVENT_NAME.
+    static FString AddCustomEventParam(FString BlueprintPath, FString EventNodeId,
+        FString CommaSeparatedParams);
+    static FString RemoveCustomEventParam(FString BlueprintPath, FString EventNodeId,
+        FString ParamName);
+
+    // ------------------------------------------------------------------
     // Animation Blueprint state machines (v1.12)
     // ------------------------------------------------------------------
     // UAnimGraphNode_StateMachine derives from UAnimGraphNode_Base — the
@@ -750,7 +783,6 @@ private:
     // UAnimStateTransitionNode's BoundGraph (the transition rule graph).
     // This is what lets GET_ANIM_NODE_PINS/CONNECT_ANIM_PINS/SPAWN_NODE_ANCHORED
     // operate on nodes nested inside a state, not just top-level AnimGraph nodes.
-    static UEdGraphNode* FindNodeAnywhere(UBlueprint* Blueprint, const FString& NodeId);
 
     // LIST_STATE_GRAPH_NODES -- lists nodes (GUID~ClassName~NodeTitle,
     // pipe-delimited) inside a state's or transition's BoundGraph. GUID is

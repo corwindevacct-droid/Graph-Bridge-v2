@@ -426,8 +426,63 @@ class UnrealBridge:
         this when you want to immediately act on the entry node itself.
         For the graph_name to pass to spawn_node()/etc., use
         create_function() or list_graphs() instead.
+
+        The new function is PARAMETERLESS. To give it arguments or a return
+        value, call add_function_param() before trying to call it with any.
         """
         return await self._send_command(f"CREATE_FUNCTION_GRAPH|{bp_path}|{function_name}")
+
+    async def add_function_param(self, bp_path: str, function_name: str,
+                                  direction: str, params: str) -> dict | None:
+        """
+        Add typed parameter(s) to a function graph's signature.
+
+        direction is "in" (an argument) or "out" (a return value). params is a
+        comma-separated list of Type:Name pairs using the same type names as
+        add_variable(), e.g. "float:DamageAmount,bool:bWasCritical".
+
+        "in" pins land on the function's entry node; "out" pins land on its
+        result node, which is created on demand if the function was void. If
+        the function has several return paths, the pin is added to every result
+        node — otherwise the function would not compile.
+
+        Only valid for function graphs. The EventGraph and macro graphs are
+        rejected; for a Custom Event use add_custom_event_param().
+        """
+        return await self._send_command(
+            f"ADD_FUNCTION_PARAM|{bp_path}|{function_name}|{direction}|{params}")
+
+    async def remove_function_param(self, bp_path: str, function_name: str,
+                                     direction: str, param_name: str) -> dict | None:
+        """
+        Remove a parameter from a function graph's signature by name.
+        direction is "in" or "out" — whichever side the parameter is on.
+        """
+        return await self._send_command(
+            f"REMOVE_FUNCTION_PARAM|{bp_path}|{function_name}|{direction}|{param_name}")
+
+    async def add_custom_event_param(self, bp_path: str, node_id: str,
+                                      params: str) -> dict | None:
+        """
+        Add typed parameter(s) to a Custom Event node.
+
+        Takes the event's node id (from spawn_node()), not a graph name — a
+        Custom Event is a single node, not its own graph. params uses the same
+        "Type:Name,Type:Name" form as add_function_param().
+
+        The event must already have been named via set_custom_event_name();
+        an unnamed event is rejected with ERR:.
+        """
+        return await self._send_command(
+            f"ADD_CUSTOM_EVENT_PARAM|{bp_path}|{node_id}|{params}")
+
+    async def remove_custom_event_param(self, bp_path: str, node_id: str,
+                                         param_name: str) -> dict | None:
+        """
+        Remove a parameter from a Custom Event node by name.
+        """
+        return await self._send_command(
+            f"REMOVE_CUSTOM_EVENT_PARAM|{bp_path}|{node_id}|{param_name}")
 
     async def create_macro_graph(self, bp_path: str, macro_name: str) -> dict | None:
         """
