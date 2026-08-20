@@ -1,0 +1,19 @@
+# Unreal Engine build artifacts
+Binaries/
+Intermediate/
+Saved/
+
+# IDE
+.vs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.pyc
+
+# Asset files (not source)
+*.uasset
+*.umap

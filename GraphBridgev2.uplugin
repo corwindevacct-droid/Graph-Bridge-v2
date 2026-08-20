@@ -1,0 +1,49 @@
+{
+	"FileVersion": 3,
+	"Version": 16,
+	"VersionName": "1.4.1",
+	"FriendlyName": "GraphBridge AI",
+	"Description": "The only Unreal AI bridge that checks its work. Build and verify Blueprints, Animation Blueprints, and full character rigs — from graph logic through skeletal mesh, physics, and IK — with real compile-error and pin-connection checks, not guesses. Works with Claude, GPT, or any WebSocket/MCP-capable AI agent. Requires EnhancedInput and PythonScriptPlugin (both included with Unreal Engine - no separate installation needed).",
+	"Category": "Editor Utilities",
+	"CreatedBy": "Corwin Hicks",
+	"CreatedByURL": "",
+	"DocsURL": "",
+	"MarketplaceURL": "",
+	"SupportURL": "",
+	"CanContainContent": false,
+	"IsBetaVersion": false,
+	"IsExperimentalVersion": false,
+	"Installed": false,
+	"SupportedTargetPlatforms": [
+		"Win64"
+	],
+	"Modules": [
+		{
+			"Name": "GraphBridgev2",
+			"Type": "Editor",
+			"LoadingPhase": "PostEngineInit",
+			"PlatformAllowList": [
+				"Win64"
+			]
+		}
+	],
+	"Plugins": [
+		{
+			"Name": "EnhancedInput",
+			"Enabled": true
+		},
+		{
+			"Name": "PythonScriptPlugin",
+			"Enabled": true
+		},
+		{
+			"Name": "Niagara",
+			"Enabled": true
+		},
+		{
+			"Name": "IKRig",
+			"Enabled": true
+		}
+	],
+	"EngineVersion": "5.8.0"
+}
