@@ -210,6 +210,8 @@ namespace
               { {TEXT("material_path"),TEXT("string")} } },
             { TEXT("CLOSE_MATERIAL"), TEXT("Close the Material Editor for this asset before graph mutation."),
               { {TEXT("material_path"),TEXT("string")} } },
+            { TEXT("CAPTURE_VIEW"), TEXT("Render the scene from a controlled viewpoint and return as PNG image."),
+              { {TEXT("target"),TEXT("string")}, {TEXT("focus"),TEXT("string"),false}, {TEXT("distance"),TEXT("number"),false}, {TEXT("yaw"),TEXT("number"),false}, {TEXT("pitch"),TEXT("number"),false}, {TEXT("res"),TEXT("number"),false}, {TEXT("mode"),TEXT("string"),false}, {TEXT("angles"),TEXT("number"),false}, {TEXT("pin_pose"),TEXT("string"),false} } },
         };
         return Specs;
     }
@@ -493,21 +495,89 @@ TSharedPtr<FJsonObject> FGraphBridgeMCPServer::HandleToolsCall(const TSharedPtr<
 
     const FToolSpec* Spec = FindToolSpec(ToolName);
 
-    auto MakeToolResult = [](const FString& Text, bool bIsError) -> TSharedPtr<FJsonObject>
+    auto MakeToolResult = [](const FString& Message, const FString& Payload, bool bIsError) -> TSharedPtr<FJsonObject>
     {
-        TSharedRef<FJsonObject> TextBlock = MakeShared<FJsonObject>();
-        TextBlock->SetStringField(TEXT("type"), TEXT("text"));
-        TextBlock->SetStringField(TEXT("text"), Text);
+        TArray<TSharedPtr<FJsonValue>> ContentBlocks;
+
+        // Add message text block if present
+        if (!Message.IsEmpty())
+        {
+            TSharedRef<FJsonObject> TextBlock = MakeShared<FJsonObject>();
+            TextBlock->SetStringField(TEXT("type"), TEXT("text"));
+            TextBlock->SetStringField(TEXT("text"), Message);
+            ContentBlocks.Add(MakeShared<FJsonValueObject>(TextBlock));
+        }
+
+        // Check if payload is image data (PNG magic bytes in base64: "iVBORw0K")
+        // or a JSON array of images
+        bool bIsImagePayload = false;
+        TArray<FString> ImageBase64Array;
+
+        if (!Payload.IsEmpty() && !bIsError)
+        {
+            if (Payload.StartsWith(TEXT("[")))
+            {
+                // Parse JSON array of base64 images
+                TSharedRef<TJsonReader<TCHAR>> ArrayReader = TJsonReaderFactory<TCHAR>::Create(Payload);
+                TSharedPtr<FJsonValue> RootValue;
+                if (FJsonSerializer::Deserialize(ArrayReader, RootValue) && RootValue.IsValid() && RootValue->Type == EJson::Array)
+                {
+                    const TArray<TSharedPtr<FJsonValue>>& Array = RootValue->AsArray();
+                    for (const TSharedPtr<FJsonValue>& Item : Array)
+                    {
+                        if (Item.IsValid() && Item->Type == EJson::String)
+                            ImageBase64Array.Add(Item->AsString());
+                    }
+                    bIsImagePayload = ImageBase64Array.Num() > 0;
+                }
+            }
+            else if (Payload.StartsWith(TEXT("iVBORw0K")))
+            {
+                // Single PNG image (PNG magic header in base64)
+                ImageBase64Array.Add(Payload);
+                bIsImagePayload = true;
+            }
+        }
+
+        // Add image blocks if payload contains images
+        if (bIsImagePayload)
+        {
+            for (const FString& Base64Image : ImageBase64Array)
+            {
+                TSharedRef<FJsonObject> ImageBlock = MakeShared<FJsonObject>();
+                ImageBlock->SetStringField(TEXT("type"), TEXT("image"));
+                ImageBlock->SetStringField(TEXT("data"), Base64Image);
+                ImageBlock->SetStringField(TEXT("mimeType"), TEXT("image/png"));
+                ContentBlocks.Add(MakeShared<FJsonValueObject>(ImageBlock));
+            }
+        }
+        else if (!Payload.IsEmpty())
+        {
+            // Non-image payload: add as text
+            TSharedRef<FJsonObject> TextBlock = MakeShared<FJsonObject>();
+            TextBlock->SetStringField(TEXT("type"), TEXT("text"));
+            TextBlock->SetStringField(TEXT("text"), Payload);
+            ContentBlocks.Add(MakeShared<FJsonValueObject>(TextBlock));
+        }
+
+        // Ensure we have at least one content block
+        if (ContentBlocks.Num() == 0)
+        {
+            TSharedRef<FJsonObject> TextBlock = MakeShared<FJsonObject>();
+            TextBlock->SetStringField(TEXT("type"), TEXT("text"));
+            TextBlock->SetStringField(TEXT("text"), bIsError ? TEXT("Error") : TEXT("Success"));
+            ContentBlocks.Add(MakeShared<FJsonValueObject>(TextBlock));
+        }
 
         TSharedRef<FJsonObject> Result = MakeShared<FJsonObject>();
-        Result->SetArrayField(TEXT("content"), { MakeShared<FJsonValueObject>(TextBlock) });
+        Result->SetArrayField(TEXT("content"), ContentBlocks);
         Result->SetBoolField(TEXT("isError"), bIsError);
         return Result;
     };
 
     if (!Spec)
     {
-        return MakeToolResult(FString::Printf(TEXT("Unknown tool: %s"), *ToolName), true);
+        return MakeToolResult(FString::Printf(TEXT("Unknown tool: %s"), *ToolName), TEXT(""), true);
     }
 
     const TSharedPtr<FJsonObject>* ArgumentsPtr = nullptr;
@@ -528,7 +598,7 @@ TSharedPtr<FJsonObject> FGraphBridgeMCPServer::HandleToolsCall(const TSharedPtr<
             {
                 return MakeToolResult(
                     FString::Printf(TEXT("Missing required argument '%s' for tool '%s'"), Arg.Name, Spec->Command),
-                    true);
+                    TEXT(""), true);
             }
             break;
         }
@@ -551,16 +621,12 @@ TSharedPtr<FJsonObject> FGraphBridgeMCPServer::HandleToolsCall(const TSharedPtr<
     TSharedRef<TJsonReader<TCHAR>> ResponseReader = TJsonReaderFactory<TCHAR>::Create(ResponseJson);
     if (!FJsonSerializer::Deserialize(ResponseReader, ResponseObject) || !ResponseObject.IsValid())
     {
-        return MakeToolResult(FString::Printf(TEXT("Malformed response from dispatcher: %s"), *ResponseJson), true);
+        return MakeToolResult(FString::Printf(TEXT("Malformed response from dispatcher: %s"), *ResponseJson), TEXT(""), true);
     }
 
     bool bSuccess = ResponseObject->GetBoolField(TEXT("success"));
     FString Message = ResponseObject->GetStringField(TEXT("message"));
     FString Payload = ResponseObject->GetStringField(TEXT("payload"));
 
-    FString Text = Message;
-    if (!Payload.IsEmpty())
-        Text += TEXT("\n") + Payload;
-
-    return MakeToolResult(Text, !bSuccess);
+    return MakeToolResult(Message, Payload, !bSuccess);
 }

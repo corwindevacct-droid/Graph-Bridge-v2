@@ -1018,5 +1018,11 @@ private:
     static FString AddSkeletonSocket(FString SkeletonPath, FString SocketName, FString BoneName,
         float X, float Y, float Z);
 
+    // CAPTURE_VIEW — renders the scene from a controlled viewpoint and returns
+    // base64-encoded PNG images. When Angles > 1, returns JSON array in payload.
+    // Returns JSON string on success, "ERR:..." on failure.
+    static FString CaptureView(FString Target, FString Focus, float Distance, float Yaw, float Pitch,
+        int32 Res, FString Mode, int32 Angles, FString PinPose);
+
 #endif // WITH_EDITOR
 };

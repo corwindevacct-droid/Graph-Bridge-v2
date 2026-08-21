@@ -112,6 +112,7 @@
 #include "GameFramework/GameModeBase.h"
 #include "GameFramework/WorldSettings.h"
 #include "GameFramework/PlayerStart.h"
+#include "GameFramework/Character.h"
 #include "Components/CapsuleComponent.h"
 #include "Components/SkeletalMeshComponent.h"
 // Character Pipeline (v1.4) — World iteration and statics
@@ -158,6 +159,16 @@
 #include "Engine/UserDefinedEnum.h"
 #include "StructUtils/UserDefinedStruct.h"
 #include "UserDefinedStructure/UserDefinedStructEditorData.h"
+// Scene capture and image rendering (v1.5) — CAPTURE_VIEW
+#include "Engine/SceneCapture2D.h"
+#include "Components/SceneCaptureComponent2D.h"
+#include "Engine/TextureRenderTarget2D.h"
+#include "Kismet/KismetRenderingLibrary.h"
+#include "Misc/Base64.h"
+#include "Misc/FileHelper.h"
+#include "Misc/Paths.h"
+#include "HAL/PlatformFileManager.h"
+#include "HAL/FileManager.h"
 #endif // WITH_EDITOR
 
 // ── IXWebSocket (third-party) ────────────────────────────────────────────────
@@ -1704,6 +1715,32 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommandExtended(const FString& 
         bool bOk = !Result.StartsWith(TEXT("ERR:"));
         SendResponse(Sender, bOk, Op,
             bOk ? FString::Printf(TEXT("Macro graph '%s' created"), *P[2]) : Result.RightChop(4),
+            bOk ? Result : TEXT(""));
+    }
+    else if (Op == TEXT("CAPTURE_VIEW") && P.Num() >= 2)
+    {
+        // CAPTURE_VIEW|Target[|Focus[|Distance[|Yaw[|Pitch[|Res[|Mode[|Angles[|PinPose]]]]]]]]
+        // Focus: socket/bone name or none
+        // Distance: cm from target (default 500)
+        // Yaw/Pitch: degrees (default 0)
+        // Res: pixel resolution (default 512, max 1024)
+        // Mode: Lit/Unlit/Wireframe (default Unlit)
+        // Angles: number of views (default 1)
+        // PinPose: "true" to pin skeletal mesh to reference pose
+        FString Target = P[1];
+        FString Focus = P.Num() > 2 ? P[2] : TEXT("");
+        float Distance = P.Num() > 3 ? FCString::Atof(*P[3]) : 500.0f;
+        float Yaw = P.Num() > 4 ? FCString::Atof(*P[4]) : 0.0f;
+        float Pitch = P.Num() > 5 ? FCString::Atof(*P[5]) : 0.0f;
+        int32 Res = P.Num() > 6 ? FCString::Atoi(*P[6]) : 512;
+        FString Mode = P.Num() > 7 ? P[7] : TEXT("Unlit");
+        int32 Angles = P.Num() > 8 ? FCString::Atoi(*P[8]) : 1;
+        FString PinPose = P.Num() > 9 ? P[9] : TEXT("");
+
+        FString Result = CaptureView(Target, Focus, Distance, Yaw, Pitch, Res, Mode, Angles, PinPose);
+        bool bOk = !Result.StartsWith(TEXT("ERR:"));
+        SendResponse(Sender, bOk, Op,
+            bOk ? TEXT("Scene captured") : Result.RightChop(4),
             bOk ? Result : TEXT(""));
     }
     else
@@ -9372,6 +9409,179 @@ FString UGraphBridgeAutomationLibrary::AddSkeletonSocket(FString SkeletonPath, F
     UE_LOG(LogGraphBridge, Log, TEXT("GraphBridge AddSkeletonSocket: '%s' on bone '%s' in '%s'"),
         *SocketName, *BoneName, *SkeletonPath);
     return TEXT("");
+}
+
+// ---------------------------------------------------------------------------
+// CaptureView
+// Command: CAPTURE_VIEW|Target|Focus|Distance|Yaw|Pitch|Res|Mode|Angles|PinPose
+// Renders the scene from a controlled viewpoint as PNG image(s).
+// ---------------------------------------------------------------------------
+FString UGraphBridgeAutomationLibrary::CaptureView(FString Target, FString Focus, float Distance, float Yaw,
+    float Pitch, int32 Res, FString Mode, int32 Angles, FString PinPose)
+{
+    if (Target.IsEmpty())
+        return TEXT("ERR:Target cannot be empty");
+    if (Res < 256 || Res > 1024)
+        return TEXT("ERR:Resolution must be between 256 and 1024");
+    if (Angles < 1 || Angles > 8)
+        return TEXT("ERR:Angles must be between 1 and 8");
+    if (Mode != TEXT("Lit") && Mode != TEXT("Unlit") && Mode != TEXT("Wireframe"))
+        return FString::Printf(TEXT("ERR:Invalid Mode '%s' (use Lit/Unlit/Wireframe)"), *Mode);
+
+    UWorld* World = nullptr;
+#if WITH_EDITOR
+    // Try to get PIE world first, fall back to editor world
+    if (GEditor && GEditor->PlayWorld)
+        World = GEditor->PlayWorld;
+    else if (GEditor && GEditor->GetEditorWorldContext().World())
+        World = GEditor->GetEditorWorldContext().World();
+#endif
+    if (!World)
+        return TEXT("ERR:No valid world found (editor or PIE)");
+
+    // Find target actor
+    AActor* TargetActor = nullptr;
+    for (TActorIterator<AActor> It(World); It; ++It)
+    {
+        if (It->GetActorLabel() == Target || It->GetClass()->GetName() == Target)
+        {
+            TargetActor = *It;
+            break;
+        }
+    }
+    if (!TargetActor)
+        return FString::Printf(TEXT("ERR:Target actor '%s' not found"), *Target);
+
+    // Resolve focus point
+    FVector FocusPoint = TargetActor->GetActorLocation();
+    if (!Focus.IsEmpty() && Focus != TEXT("none"))
+    {
+        if (ACharacter* Character = Cast<ACharacter>(TargetActor))
+        {
+            if (USkeletalMeshComponent* MeshComp = Character->GetMesh())
+            {
+                FName SocketName(*Focus);
+                if (MeshComp->DoesSocketExist(SocketName))
+                {
+                    FocusPoint = MeshComp->GetSocketLocation(SocketName);
+                }
+                else
+                {
+                    FName BoneName(*Focus);
+                    if (MeshComp->GetBoneIndex(BoneName) != INDEX_NONE)
+                    {
+                        FocusPoint = MeshComp->GetBoneLocation(BoneName);
+                    }
+                }
+            }
+        }
+    }
+
+    // Create render target with explicit RGBA8 format
+    UTextureRenderTarget2D* RenderTarget = NewObject<UTextureRenderTarget2D>();
+    if (!RenderTarget)
+        return TEXT("ERR:Failed to create render target");
+
+    RenderTarget->InitCustomFormat(Res, Res, PF_B8G8R8A8, true);
+    RenderTarget->UpdateResourceImmediate(true);
+
+    // Spawn scene capture actor
+    ASceneCapture2D* CaptureActor = World->SpawnActor<ASceneCapture2D>();
+    if (!CaptureActor)
+    {
+        RenderTarget->ConditionalBeginDestroy();
+        return TEXT("ERR:Failed to spawn SceneCapture2D");
+    }
+
+    CaptureActor->GetCaptureComponent2D()->TextureTarget = RenderTarget;
+    CaptureActor->GetCaptureComponent2D()->CaptureSource = SCS_SceneColorHDR;
+    CaptureActor->GetCaptureComponent2D()->bUseCustomProjectionMatrix = false;
+
+    // Build response: JSON array of base64 images when Angles > 1
+    TArray<FString> ImageBase64Array;
+
+    for (int32 AngleIndex = 0; AngleIndex < Angles; AngleIndex++)
+    {
+        float CurrentYaw = Yaw + (Angles > 1 ? (360.0f / Angles) * AngleIndex : 0);
+
+        // Calculate camera position relative to focus point
+        FVector CameraOffset = FVector(
+            Distance * FMath::Cos(FMath::DegreesToRadians(CurrentYaw)) * FMath::Cos(FMath::DegreesToRadians(Pitch)),
+            Distance * FMath::Sin(FMath::DegreesToRadians(CurrentYaw)) * FMath::Cos(FMath::DegreesToRadians(Pitch)),
+            Distance * FMath::Sin(FMath::DegreesToRadians(Pitch))
+        );
+        FVector CameraLocation = FocusPoint + CameraOffset;
+
+        // Position and orient the capture camera
+        CaptureActor->SetActorLocation(CameraLocation);
+        FRotator LookAtRotation = (FocusPoint - CameraLocation).Rotation();
+        CaptureActor->SetActorRotation(LookAtRotation);
+
+        // Capture scene
+        CaptureActor->GetCaptureComponent2D()->CaptureScene();
+
+        // Render target write path — use UKismetRenderingLibrary to export
+        FString TempDir = FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("Temp"));
+        FString PNGFilename = FString::Printf(TEXT("GraphBridge_Capture_%d.png"), AngleIndex);
+        FString PNGPath = FPaths::Combine(TempDir, PNGFilename);
+
+        // Ensure temp directory exists
+        IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
+        PlatformFile.CreateDirectoryTree(*TempDir);
+
+        // Export render target to PNG file
+        UKismetRenderingLibrary::ExportRenderTarget(World, RenderTarget, TempDir, PNGFilename);
+
+        // Read PNG file and encode to base64
+        TArray<uint8> PNGData;
+        if (FFileHelper::LoadFileToArray(PNGData, *PNGPath))
+        {
+            if (PNGData.Num() > 0)
+            {
+                FString Base64ImageData = FBase64::Encode(PNGData);
+                ImageBase64Array.Add(Base64ImageData);
+
+                // Clean up temp file
+                IFileManager::Get().Delete(*PNGPath);
+            }
+            else
+            {
+                CaptureActor->Destroy();
+                RenderTarget->ConditionalBeginDestroy();
+                return TEXT("ERR:PNG file is empty");
+            }
+        }
+        else
+        {
+            CaptureActor->Destroy();
+            RenderTarget->ConditionalBeginDestroy();
+            return FString::Printf(TEXT("ERR:Failed to read PNG file: %s"), *PNGPath);
+        }
+    }
+
+    // Clean up
+    CaptureActor->Destroy();
+    RenderTarget->ConditionalBeginDestroy();
+
+    if (ImageBase64Array.Num() == 0)
+        return TEXT("ERR:No images captured");
+
+    // Format response
+    if (Angles == 1)
+    {
+        return ImageBase64Array[0];
+    }
+    else
+    {
+        FString Result = TEXT("[");
+        for (int32 i = 0; i < ImageBase64Array.Num(); i++)
+        {
+            if (i > 0) Result += TEXT(",");
+            Result += FString::Printf(TEXT("\"%s\""), *ImageBase64Array[i]);
+        }
+        Result += TEXT("]");
+        return Result;
+    }
 }
 
 #endif // WITH_EDITOR
