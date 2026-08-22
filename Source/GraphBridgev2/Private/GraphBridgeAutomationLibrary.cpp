@@ -159,7 +159,7 @@
 #include "Engine/UserDefinedEnum.h"
 #include "StructUtils/UserDefinedStruct.h"
 #include "UserDefinedStructure/UserDefinedStructEditorData.h"
-// Scene capture and image rendering (v1.5) — CAPTURE_VIEW
+// Scene capture and image rendering (v1.5.1) — CAPTURE_VIEW (fixed PNG output)
 #include "Engine/SceneCapture2D.h"
 #include "Components/SceneCaptureComponent2D.h"
 #include "Engine/TextureRenderTarget2D.h"
@@ -9493,9 +9493,23 @@ FString UGraphBridgeAutomationLibrary::CaptureView(FString Target, FString Focus
         return TEXT("ERR:Failed to spawn SceneCapture2D");
     }
 
-    CaptureActor->GetCaptureComponent2D()->TextureTarget = RenderTarget;
-    CaptureActor->GetCaptureComponent2D()->CaptureSource = SCS_SceneColorHDR;
-    CaptureActor->GetCaptureComponent2D()->bUseCustomProjectionMatrix = false;
+    USceneCaptureComponent2D* CaptureComp = CaptureActor->GetCaptureComponent2D();
+    CaptureComp->TextureTarget = RenderTarget;
+    CaptureComp->CaptureSource = SCS_FinalColorLDR;
+    CaptureComp->bUseCustomProjectionMatrix = false;
+
+    // Apply rendering mode flags via ShowFlags
+    if (Mode == TEXT("Unlit"))
+    {
+        CaptureComp->ShowFlags.SetLighting(false);
+        CaptureComp->ShowFlags.SetGlobalIllumination(false);
+        CaptureComp->ShowFlags.SetDeferredLighting(false);
+    }
+    else if (Mode == TEXT("Wireframe"))
+    {
+        CaptureComp->ShowFlags.SetWireframe(true);
+    }
+    // Mode == "Lit" uses defaults
 
     // Build response: JSON array of base64 images when Angles > 1
     TArray<FString> ImageBase64Array;
@@ -9520,7 +9534,8 @@ FString UGraphBridgeAutomationLibrary::CaptureView(FString Target, FString Focus
         // Capture scene
         CaptureActor->GetCaptureComponent2D()->CaptureScene();
 
-        // Render target write path — use UKismetRenderingLibrary to export
+        // Export render target to PNG file
+        // Note: SCS_FinalColorLDR forces 8-bit PNG output (not EXR which was happening with HDR)
         FString TempDir = FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("Temp"));
         FString PNGFilename = FString::Printf(TEXT("GraphBridge_Capture_%d.png"), AngleIndex);
         FString PNGPath = FPaths::Combine(TempDir, PNGFilename);
@@ -9529,34 +9544,35 @@ FString UGraphBridgeAutomationLibrary::CaptureView(FString Target, FString Focus
         IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
         PlatformFile.CreateDirectoryTree(*TempDir);
 
-        // Export render target to PNG file
+        // Export to PNG file (LDR capture source guarantees PNG, not EXR)
         UKismetRenderingLibrary::ExportRenderTarget(World, RenderTarget, TempDir, PNGFilename);
 
         // Read PNG file and encode to base64
         TArray<uint8> PNGData;
-        if (FFileHelper::LoadFileToArray(PNGData, *PNGPath))
-        {
-            if (PNGData.Num() > 0)
-            {
-                FString Base64ImageData = FBase64::Encode(PNGData);
-                ImageBase64Array.Add(Base64ImageData);
-
-                // Clean up temp file
-                IFileManager::Get().Delete(*PNGPath);
-            }
-            else
-            {
-                CaptureActor->Destroy();
-                RenderTarget->ConditionalBeginDestroy();
-                return TEXT("ERR:PNG file is empty");
-            }
-        }
-        else
+        if (!FFileHelper::LoadFileToArray(PNGData, *PNGPath) || PNGData.Num() == 0)
         {
             CaptureActor->Destroy();
             RenderTarget->ConditionalBeginDestroy();
-            return FString::Printf(TEXT("ERR:Failed to read PNG file: %s"), *PNGPath);
+            return FString::Printf(TEXT("ERR:Failed to read or export PNG file (%s, size=%d)"), *PNGPath, PNGData.Num());
         }
+
+        // Verify it's actually a PNG (magic bytes: 89 50 4E 47 = "‰PNG")
+        if (PNGData.Num() < 4 || PNGData[0] != 0x89 || PNGData[1] != 0x50 || PNGData[2] != 0x4E || PNGData[3] != 0x47)
+        {
+            IFileManager::Get().Delete(*PNGPath);
+            CaptureActor->Destroy();
+            RenderTarget->ConditionalBeginDestroy();
+            return FString::Printf(TEXT("ERR:Exported file is not a valid PNG (got %02X %02X %02X %02X)"),
+                PNGData.Num() > 0 ? PNGData[0] : 0, PNGData.Num() > 1 ? PNGData[1] : 0,
+                PNGData.Num() > 2 ? PNGData[2] : 0, PNGData.Num() > 3 ? PNGData[3] : 0);
+        }
+
+        // Base64 encode
+        FString Base64ImageData = FBase64::Encode(PNGData);
+        ImageBase64Array.Add(Base64ImageData);
+
+        // Clean up temp file
+        IFileManager::Get().Delete(*PNGPath);
     }
 
     // Clean up
@@ -9566,7 +9582,22 @@ FString UGraphBridgeAutomationLibrary::CaptureView(FString Target, FString Focus
     if (ImageBase64Array.Num() == 0)
         return TEXT("ERR:No images captured");
 
-    // Format response
+    // Size guard: MCP transport is capped at ~1MB per message
+    const int64 MaxPayloadBytes = 1024 * 1024; // 1MB limit
+    int64 TotalSize = 0;
+    for (const FString& Base64Str : ImageBase64Array)
+    {
+        TotalSize += Base64Str.Len();
+    }
+
+    if (TotalSize > MaxPayloadBytes)
+    {
+        return FString::Printf(
+            TEXT("ERR:Total image size %lld bytes exceeds 1MB limit. Try lower resolution or fewer angles (Resolution=%d, Angles=%d)"),
+            TotalSize, Res, Angles);
+    }
+
+    // Format response: single base64 for one image, JSON array for multiple
     if (Angles == 1)
     {
         return ImageBase64Array[0];
