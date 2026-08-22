@@ -508,17 +508,20 @@ TSharedPtr<FJsonObject> FGraphBridgeMCPServer::HandleToolsCall(const TSharedPtr<
             ContentBlocks.Add(MakeShared<FJsonValueObject>(TextBlock));
         }
 
-        // Check if payload is image data (PNG magic bytes in base64: "iVBORw0K")
-        // or a JSON array of images
+        // Detect and validate image payloads (PNG magic bytes in base64: "iVBORw0K")
         bool bIsImagePayload = false;
         TArray<FString> ImageBase64Array;
+        int64 TotalImageSize = 0;
+        const int64 MaxPayloadBytes = 1024 * 1024; // 1MB limit for MCP transport
 
         if (!Payload.IsEmpty() && !bIsError)
         {
-            if (Payload.StartsWith(TEXT("[")))
+            FString TrimmedPayload = Payload.TrimStartAndEnd();
+
+            if (TrimmedPayload.StartsWith(TEXT("[")))
             {
-                // Parse JSON array of base64 images
-                TSharedRef<TJsonReader<TCHAR>> ArrayReader = TJsonReaderFactory<TCHAR>::Create(Payload);
+                // Parse JSON array of base64 images (for multi-angle captures)
+                TSharedRef<TJsonReader<TCHAR>> ArrayReader = TJsonReaderFactory<TCHAR>::Create(TrimmedPayload);
                 TSharedPtr<FJsonValue> RootValue;
                 if (FJsonSerializer::Deserialize(ArrayReader, RootValue) && RootValue.IsValid() && RootValue->Type == EJson::Array)
                 {
@@ -526,21 +529,40 @@ TSharedPtr<FJsonObject> FGraphBridgeMCPServer::HandleToolsCall(const TSharedPtr<
                     for (const TSharedPtr<FJsonValue>& Item : Array)
                     {
                         if (Item.IsValid() && Item->Type == EJson::String)
-                            ImageBase64Array.Add(Item->AsString());
+                        {
+                            FString Base64Str = Item->AsString();
+                            if (Base64Str.StartsWith(TEXT("iVBORw0K")))
+                            {
+                                ImageBase64Array.Add(Base64Str);
+                                TotalImageSize += Base64Str.Len();
+                            }
+                        }
                     }
                     bIsImagePayload = ImageBase64Array.Num() > 0;
+
+                    // Size guard: MCP responses capped at ~1MB
+                    if (bIsImagePayload && TotalImageSize > MaxPayloadBytes)
+                    {
+                        bIsImagePayload = false;
+                        ImageBase64Array.Empty();
+                        // Error will be added as text block below
+                    }
                 }
             }
-            else if (Payload.StartsWith(TEXT("iVBORw0K")))
+            else if (TrimmedPayload.StartsWith(TEXT("iVBORw0K")))
             {
-                // Single PNG image (PNG magic header in base64)
-                ImageBase64Array.Add(Payload);
-                bIsImagePayload = true;
+                // Single PNG image (PNG magic header in base64: 89 50 4E 47)
+                TotalImageSize = TrimmedPayload.Len();
+                if (TotalImageSize <= MaxPayloadBytes)
+                {
+                    ImageBase64Array.Add(TrimmedPayload);
+                    bIsImagePayload = true;
+                }
             }
         }
 
-        // Add image blocks if payload contains images
-        if (bIsImagePayload)
+        // Add image blocks if payload contains validated images
+        if (bIsImagePayload && ImageBase64Array.Num() > 0)
         {
             for (const FString& Base64Image : ImageBase64Array)
             {
@@ -553,10 +575,15 @@ TSharedPtr<FJsonObject> FGraphBridgeMCPServer::HandleToolsCall(const TSharedPtr<
         }
         else if (!Payload.IsEmpty())
         {
-            // Non-image payload: add as text
+            // Non-image payload: add as text (includes size-limit errors)
+            FString DisplayPayload = Payload;
+            if (TotalImageSize > MaxPayloadBytes)
+            {
+                DisplayPayload = FString::Printf(TEXT("Image payload too large (%lld bytes). Reduce resolution or angle count."), TotalImageSize);
+            }
             TSharedRef<FJsonObject> TextBlock = MakeShared<FJsonObject>();
             TextBlock->SetStringField(TEXT("type"), TEXT("text"));
-            TextBlock->SetStringField(TEXT("text"), Payload);
+            TextBlock->SetStringField(TEXT("text"), DisplayPayload);
             ContentBlocks.Add(MakeShared<FJsonValueObject>(TextBlock));
         }
 
