@@ -2,7 +2,9 @@
 
 #include "GraphBridgeLLMClient.h"
 #include "GraphBridgeSettings.h"
+#include "GraphBridgeCredentialStore.h"
 #include "GraphBridgev2.h"
+#include "GraphBridgeToolManifest.h"
 #include "HttpModule.h"
 #include "Interfaces/IHttpRequest.h"
 #include "Interfaces/IHttpResponse.h"
@@ -143,438 +145,38 @@ TArray<TSharedPtr<FJsonValue>> FGraphBridgeLLMClient::BuildToolSchemas() const
         Tools.Add(MakeShareable(new FJsonValueObject(Tool)));
     };
 
-    Add(MakeTool(TEXT("OPEN_BLUEPRINT"),
-        TEXT("Open a Blueprint asset for editing."),
-        { {TEXT("asset_path"), TEXT("Content-browser path to the Blueprint, e.g. /Game/BP_MyActor")} }));
+    const TArray<FGraphBridgeToolDef>& Manifest = FGraphBridgeToolManifest::GetManifest();
 
-    Add(MakeTool(TEXT("CLOSE_BLUEPRINT"),
-        TEXT("Close the currently open Blueprint editor."),
-        { {TEXT("asset_path"), TEXT("Content-browser path to the Blueprint")} }));
+    for (const FGraphBridgeToolDef& ToolDef : Manifest)
+    {
+        if (!ToolDef.bPublic) continue;
 
-    // Shared optional param — used by every verb below that can target a
-    // Function or Macro graph instead of the default EventGraph.
-    const TArray<TPair<FString,FString>> GraphNameOpt = {
-        {TEXT("graph_name"), TEXT("Optional: name of a Function or Macro graph to target (from LIST_GRAPHS). Omit for the default EventGraph.")}
-    };
-
-    Add(MakeTool(TEXT("SPAWN_NODE"),
-        TEXT("Spawn a new node in the Blueprint graph."),
+        TArray<TPair<FString, FString>> Params;
+        for (const FGraphBridgeToolParam& Param : ToolDef.Parameters)
         {
-            {TEXT("asset_path"), TEXT("Content-browser path to the Blueprint")},
-            {TEXT("node_class"), TEXT("The node class to spawn, e.g. K2Node_CallFunction")},
-            {TEXT("comment"),    TEXT("Optional comment label for the node")},
-            {TEXT("pos_x"),      TEXT("X position in the graph")},
-            {TEXT("pos_y"),      TEXT("Y position in the graph")}
-        }, GraphNameOpt));
+            Params.Add({Param.Name, Param.Description});
+        }
 
-    Add(MakeTool(TEXT("CONNECT_PINS"),
-        TEXT("Connect an output pin on one node to an input pin on another."),
+        TArray<TPair<FString, FString>> OptParams;
+        for (const FGraphBridgeToolParam& Param : ToolDef.OptionalParameters)
         {
-            {TEXT("asset_path"),     TEXT("Content-browser path to the Blueprint")},
-            {TEXT("source_node_id"), TEXT("GUID of the source node")},
-            {TEXT("source_pin"),     TEXT("Name of the output pin")},
-            {TEXT("target_node_id"), TEXT("GUID of the target node")},
-            {TEXT("target_pin"),     TEXT("Name of the input pin")}
-        }, GraphNameOpt));
+            OptParams.Add({Param.Name, Param.Description});
+        }
 
-    Add(MakeTool(TEXT("DISCONNECT_PINS"),
-        TEXT("Disconnect a pin connection."),
-        {
-            {TEXT("asset_path"),     TEXT("Content-browser path to the Blueprint")},
-            {TEXT("source_node_id"), TEXT("GUID of the source node")},
-            {TEXT("source_pin"),     TEXT("Name of the output pin")},
-            {TEXT("target_node_id"), TEXT("GUID of the target node")},
-            {TEXT("target_pin"),     TEXT("Name of the input pin")}
-        }, GraphNameOpt));
+        TSharedPtr<FJsonObject> Tool = MakeTool(
+            *ToolDef.Command,
+            *ToolDef.Description,
+            Params,
+            OptParams.Num() > 0 ? OptParams : TArray<TPair<FString,FString>>());
 
-    Add(MakeTool(TEXT("DELETE_NODE"),
-        TEXT("Delete a node from the graph by its GUID."),
-        {
-            {TEXT("asset_path"), TEXT("Content-browser path to the Blueprint")},
-            {TEXT("node_id"),    TEXT("GUID of the node to delete")}
-        }, GraphNameOpt));
+        Add(Tool);
+    }
 
-    Add(MakeTool(TEXT("CLEAR_NODES"),
-        TEXT("Delete nodes matching a comment tag in a Blueprint graph."),
-        {
-            {TEXT("asset_path"),    TEXT("Content-browser path to the Blueprint")},
-            {TEXT("comment_match"), TEXT("Comment tag to match for deletion")}
-        }, GraphNameOpt));
+    // DEPRECATED: Original hardcoded tools removed (see git history for reference).
+    // All tools now generated from FGraphBridgeToolManifest.
+    // This ensures 83 public tools are always in sync across router/MCP/panel.
 
-    Add(MakeTool(TEXT("SET_PIN_DEFAULT"),
-        TEXT("Set the default value of a pin on a node."),
-        {
-            {TEXT("asset_path"), TEXT("Content-browser path to the Blueprint")},
-            {TEXT("node_id"),    TEXT("GUID of the node")},
-            {TEXT("pin_name"),   TEXT("Name of the pin")},
-            {TEXT("value"),      TEXT("The default value to set")}
-        }));
-
-    Add(MakeTool(TEXT("GET_NODE_PINS"),
-        TEXT("Get all pins on a node."),
-        {
-            {TEXT("asset_path"), TEXT("Content-browser path to the Blueprint")},
-            {TEXT("node_id"),    TEXT("GUID or title of the node")}
-        }, GraphNameOpt));
-
-    Add(MakeTool(TEXT("LIST_NODES"),
-        TEXT("List all nodes in a Blueprint graph."),
-        { {TEXT("asset_path"), TEXT("Content-browser path to the Blueprint")} }, GraphNameOpt));
-
-    Add(MakeTool(TEXT("LIST_GRAPHS"),
-        TEXT("List every graph on a Blueprint (EventGraph, Function graphs, Macro graphs) with its type. "
-             "Call this before spawning nodes into anything other than the default EventGraph."),
-        { {TEXT("asset_path"), TEXT("Content-browser path to the Blueprint")} }));
-
-    Add(MakeTool(TEXT("CREATE_FUNCTION_GRAPH"),
-        TEXT("Create a new custom function graph in a Blueprint. Compiles to a real callable UFunction "
-             "with its own call frame — cannot contain latent nodes. Returns the new FunctionEntry node's GUID."),
-        {
-            {TEXT("asset_path"),    TEXT("Content-browser path to the Blueprint")},
-            {TEXT("function_name"), TEXT("Name for the new function")}
-        }));
-
-    Add(MakeTool(TEXT("CREATE_MACRO_GRAPH"),
-        TEXT("Create a new macro graph in a Blueprint. Unlike a function, a macro is inlined at each call "
-             "site, can have multiple exec pins, and can contain latent nodes — but cannot be overridden in "
-             "child Blueprints. Returns the new entry tunnel node's GUID."),
-        {
-            {TEXT("asset_path"),  TEXT("Content-browser path to the Blueprint")},
-            {TEXT("macro_name"),  TEXT("Name for the new macro")}
-        }));
-
-    Add(MakeTool(TEXT("COMPILE"),
-        TEXT("Compile a Blueprint."),
-        { {TEXT("asset_path"), TEXT("Content-browser path to the Blueprint")} }));
-
-    Add(MakeTool(TEXT("SAVE_BLUEPRINT"),
-        TEXT("Save a Blueprint."),
-        { {TEXT("asset_path"), TEXT("Content-browser path to the Blueprint")} }));
-
-    Add(MakeTool(TEXT("SPAWN_VARIABLE"),
-        TEXT("Spawn a Get or Set variable node for a Blueprint variable."),
-        {
-            {TEXT("asset_path"),    TEXT("Content-browser path to the Blueprint")},
-            {TEXT("variable_name"), TEXT("Name of the variable")},
-            {TEXT("variable_type"), TEXT("Type string, e.g. bool, int32, FString, object:ACharacter")},
-            {TEXT("category"),      TEXT("Variable category")}
-        }));
-
-    Add(MakeTool(TEXT("ADD_VARIABLE"),
-        TEXT("Add a new variable to a Blueprint."),
-        {
-            {TEXT("asset_path"),    TEXT("Content-browser path to the Blueprint")},
-            {TEXT("variable_name"), TEXT("Name for the new variable")},
-            {TEXT("variable_type"), TEXT("Type, e.g. bool, int32, float, FString, FVector")},
-            {TEXT("category"),      TEXT("Optional category")}
-        }));
-
-    Add(MakeTool(TEXT("LIST_VARIABLES"),
-        TEXT("List all variables in a Blueprint."),
-        { {TEXT("asset_path"), TEXT("Content-browser path to the Blueprint")} }));
-
-    Add(MakeTool(TEXT("SET_VARIABLE_DEFAULT"),
-        TEXT("Set the default value of a Blueprint variable."),
-        {
-            {TEXT("asset_path"),    TEXT("Content-browser path to the Blueprint")},
-            {TEXT("variable_name"), TEXT("Name of the variable")},
-            {TEXT("value"),         TEXT("Default value to set")}
-        }));
-
-    Add(MakeTool(TEXT("LIST_ASSETS"),
-        TEXT("List assets in the content browser, optionally filtered by path or class."),
-        { {TEXT("filter"), TEXT("Path or class name filter, e.g. /Game/Characters or Blueprint")} }));
-
-    Add(MakeTool(TEXT("FIND_NODE_CLASS"),
-        TEXT("Search for a node class by keyword."),
-        { {TEXT("keyword"), TEXT("Search keyword")} }));
-
-    Add(MakeTool(TEXT("SET_FUNCTION_REF"),
-        TEXT("Set the function reference on a function call node."),
-        {
-            {TEXT("asset_path"),    TEXT("Content-browser path to the Blueprint")},
-            {TEXT("node_id"),       TEXT("GUID of the node")},
-            {TEXT("class_name"),    TEXT("Class that owns the function")},
-            {TEXT("function_name"), TEXT("Name of the function")}
-        }));
-
-    Add(MakeTool(TEXT("SET_EVENT_REF"),
-        TEXT("Set the event reference on an event node."),
-        {
-            {TEXT("asset_path"), TEXT("Content-browser path to the Blueprint")},
-            {TEXT("node_id"),    TEXT("GUID of the node")},
-            {TEXT("event_name"), TEXT("Name of the event, e.g. ReceiveBeginPlay")}
-        }));
-
-    Add(MakeTool(TEXT("SET_VARIABLE_REF"),
-        TEXT("Set the variable reference on a variable node."),
-        {
-            {TEXT("asset_path"),    TEXT("Content-browser path to the Blueprint")},
-            {TEXT("node_id"),       TEXT("GUID of the node")},
-            {TEXT("variable_name"), TEXT("Name of the variable")}
-        }));
-
-    Add(MakeTool(TEXT("ADD_COMPONENT"),
-        TEXT("Add a component to a Blueprint."),
-        {
-            {TEXT("asset_path"),      TEXT("Content-browser path to the Blueprint")},
-            {TEXT("component_class"), TEXT("Class of the component, e.g. StaticMeshComponent")},
-            {TEXT("component_name"),  TEXT("Name for the new component")}
-        }));
-
-    Add(MakeTool(TEXT("SET_ANIM_CLASS"),
-        TEXT("Set the animation class on a skeletal mesh component in a Blueprint."),
-        {
-            {TEXT("asset_path"),     TEXT("Content-browser path to the Blueprint")},
-            {TEXT("component_name"), TEXT("Name of the SkeletalMeshComponent")},
-            {TEXT("anim_bp_path"),   TEXT("Content path to the AnimBlueprint")}
-        }));
-
-    Add(MakeTool(TEXT("SET_INPUT_ACTION"),
-        TEXT("Set the input action on an input action node."),
-        {
-            {TEXT("asset_path"),        TEXT("Content-browser path to the Blueprint")},
-            {TEXT("node_id"),           TEXT("GUID of the node")},
-            {TEXT("input_action_path"), TEXT("Content path to the input action asset")}
-        }));
-
-    Add(MakeTool(TEXT("LIST_BLENDSPACES"),
-        TEXT("List all BlendSpace assets in the project."),
-        { {TEXT("filter"), TEXT("Optional path filter")} }));
-
-    Add(MakeTool(TEXT("LIST_ASSET_PROPERTIES"),
-        TEXT("List all editable properties on an asset."),
-        { {TEXT("asset_path"), TEXT("Content path to the asset")} }));
-
-    Add(MakeTool(TEXT("GET_ASSET_PROPERTY"),
-        TEXT("Get the value of a property on an asset."),
-        {
-            {TEXT("asset_path"),    TEXT("Content path to the asset")},
-            {TEXT("property_name"), TEXT("Name of the property")}
-        }));
-
-    Add(MakeTool(TEXT("SET_ASSET_PROPERTY"),
-        TEXT("Set the value of a property on an asset."),
-        {
-            {TEXT("asset_path"),    TEXT("Content path to the asset")},
-            {TEXT("property_name"), TEXT("Name of the property")},
-            {TEXT("value"),         TEXT("Value to set")}
-        }));
-
-    Add(MakeTool(TEXT("SAVE_ASSET"),
-        TEXT("Save an asset to disk."),
-        { {TEXT("asset_path"), TEXT("Content path to the asset")} }));
-
-    Add(MakeTool(TEXT("GET_MONTAGE_INFO"),
-        TEXT("Get info about an Animation Montage."),
-        { {TEXT("asset_path"), TEXT("Content path to the montage")} }));
-
-    Add(MakeTool(TEXT("ADD_MONTAGE_SECTION"),
-        TEXT("Add a section to an Animation Montage."),
-        {
-            {TEXT("asset_path"),   TEXT("Content path to the montage")},
-            {TEXT("section_name"), TEXT("Name for the new section")},
-            {TEXT("start_time"),   TEXT("Start time in seconds")}
-        }));
-
-    Add(MakeTool(TEXT("REMOVE_MONTAGE_SECTION"),
-        TEXT("Remove a section from an Animation Montage."),
-        {
-            {TEXT("asset_path"),  TEXT("Content path to the montage")},
-            {TEXT("section_name"), TEXT("Name of the section to remove")}
-        }));
-
-    Add(MakeTool(TEXT("SET_MONTAGE_SLOT"),
-        TEXT("Set the slot on an Animation Montage track."),
-        {
-            {TEXT("asset_path"),  TEXT("Content path to the montage")},
-            {TEXT("slot_index"),  TEXT("Index of the slot track")},
-            {TEXT("slot_name"),   TEXT("New slot name, e.g. DefaultGroup.UpperBody")}
-        }));
-
-    Add(MakeTool(TEXT("ADD_MONTAGE_NOTIFY"),
-        TEXT("Add a single-frame UAnimNotify to an Animation Montage. ")
-        TEXT("For a begin/end window (e.g. a weapon hitbox active-frames span), ")
-        TEXT("use ADD_MONTAGE_NOTIFY_STATE instead."),
-        {
-            {TEXT("asset_path"),   TEXT("Content path to the montage")},
-            {TEXT("notify_class"), TEXT("Class of the notify (a UAnimNotify subclass)")},
-            {TEXT("trigger_time"), TEXT("Trigger time in seconds")}
-        }));
-
-    Add(MakeTool(TEXT("ADD_MONTAGE_NOTIFY_STATE"),
-        TEXT("Add a UAnimNotifyState (a begin/end window) to an Animation Montage. ")
-        TEXT("Use this for hit-detection windows and any other effect with a duration; ")
-        TEXT("use ADD_MONTAGE_NOTIFY for single-frame events."),
-        {
-            {TEXT("asset_path"),   TEXT("Content path to the montage")},
-            {TEXT("notify_class"), TEXT("Class of the notify state (a UAnimNotifyState subclass)")},
-            {TEXT("start_time"),   TEXT("Window start time in seconds")},
-            {TEXT("duration"),     TEXT("Window length in seconds (must be > 0)")}
-        }));
-
-    Add(MakeTool(TEXT("REMOVE_MONTAGE_NOTIFY"),
-        TEXT("Remove a notify from an Animation Montage by index."),
-        {
-            {TEXT("asset_path"),   TEXT("Content path to the montage")},
-            {TEXT("notify_index"), TEXT("Index of the notify to remove")}
-        }));
-
-    Add(MakeTool(TEXT("LIST_DATATABLE_ROWS"),
-        TEXT("List all rows in a DataTable."),
-        { {TEXT("asset_path"), TEXT("Content path to the DataTable")} }));
-
-    Add(MakeTool(TEXT("ADD_DATATABLE_ROW"),
-        TEXT("Add a row to a DataTable."),
-        {
-            {TEXT("asset_path"), TEXT("Content path to the DataTable")},
-            {TEXT("row_name"),   TEXT("Name for the new row")}
-        }));
-
-    Add(MakeTool(TEXT("DELETE_DATATABLE_ROW"),
-        TEXT("Delete a row from a DataTable."),
-        {
-            {TEXT("asset_path"), TEXT("Content path to the DataTable")},
-            {TEXT("row_name"),   TEXT("Name of the row to delete")}
-        }));
-
-    Add(MakeTool(TEXT("RENAME_DATATABLE_ROW"),
-        TEXT("Rename a row in a DataTable."),
-        {
-            {TEXT("asset_path"), TEXT("Content path to the DataTable")},
-            {TEXT("old_name"),   TEXT("Current row name")},
-            {TEXT("new_name"),   TEXT("New row name")}
-        }));
-
-    Add(MakeTool(TEXT("LIST_SKELETON_SOCKETS"),
-        TEXT("List all sockets on a Skeleton."),
-        { {TEXT("asset_path"), TEXT("Content path to the Skeleton")} }));
-
-    Add(MakeTool(TEXT("ADD_SKELETON_SOCKET"),
-        TEXT("Add a socket to a Skeleton."),
-        {
-            {TEXT("asset_path"),  TEXT("Content path to the Skeleton")},
-            {TEXT("socket_name"), TEXT("Name for the new socket")},
-            {TEXT("bone_name"),   TEXT("Parent bone name")}
-        }));
-
-    Add(MakeTool(TEXT("MOVE_SKELETON_SOCKET"),
-        TEXT("Move a socket on a Skeleton."),
-        {
-            {TEXT("asset_path"),        TEXT("Content path to the Skeleton")},
-            {TEXT("socket_name"),       TEXT("Name of the socket")},
-            {TEXT("loc_x"),             TEXT("Relative location X (cm)")},
-            {TEXT("loc_y"),             TEXT("Relative location Y (cm)")},
-            {TEXT("loc_z"),             TEXT("Relative location Z (cm)")},
-            {TEXT("rot_pitch"),         TEXT("Relative rotation pitch (degrees)")},
-            {TEXT("rot_yaw"),           TEXT("Relative rotation yaw (degrees)")},
-            {TEXT("rot_roll"),          TEXT("Relative rotation roll (degrees)")}
-        }));
-
-    Add(MakeTool(TEXT("DELETE_SKELETON_SOCKET"),
-        TEXT("Delete a socket from a Skeleton."),
-        {
-            {TEXT("asset_path"),  TEXT("Content path to the Skeleton")},
-            {TEXT("socket_name"), TEXT("Name of the socket to delete")}
-        }));
-
-    Add(MakeTool(TEXT("CREATE_IMC"),
-        TEXT("Create a new Input Mapping Context asset."),
-        { {TEXT("asset_path"), TEXT("Content path for the new IMC")} }));
-
-    Add(MakeTool(TEXT("ADD_IMC_MAPPING"),
-        TEXT("Add an input action mapping to an Input Mapping Context."),
-        {
-            {TEXT("imc_path"),    TEXT("Content path to the IMC")},
-            {TEXT("action_path"), TEXT("Content path to the Input Action")},
-            {TEXT("key"),         TEXT("Key name, e.g. W, SpaceBar, Gamepad_LeftX")}
-        }));
-
-    Add(MakeTool(TEXT("REMOVE_IMC_MAPPING"),
-        TEXT("Remove an input action mapping from an Input Mapping Context."),
-        {
-            {TEXT("imc_path"),    TEXT("Content path to the IMC")},
-            {TEXT("action_path"), TEXT("Content path to the Input Action")},
-            {TEXT("key"),         TEXT("Key name to remove")}
-        }));
-
-    Add(MakeTool(TEXT("LIST_IMC_MAPPINGS"),
-        TEXT("List all mappings in an Input Mapping Context."),
-        { {TEXT("imc_path"), TEXT("Content path to the IMC")} }));
-
-    Add(MakeTool(TEXT("ADD_IMC_TO_CHARACTER"),
-        TEXT("Add an Input Mapping Context to a character Blueprint's BeginPlay."),
-        {
-            {TEXT("asset_path"), TEXT("Content path to the character Blueprint")},
-            {TEXT("imc_path"),   TEXT("Content path to the IMC")},
-            {TEXT("priority"),   TEXT("Priority (default 0)")}
-        }));
-
-    Add(MakeTool(TEXT("SET_CHARACTER_MESH"),
-        TEXT("Set the skeletal mesh on a character Blueprint."),
-        {
-            {TEXT("asset_path"),     TEXT("Content path to the character Blueprint")},
-            {TEXT("mesh_path"),      TEXT("Content path to the SkeletalMesh")},
-            {TEXT("component_name"), TEXT("Component name (default CharacterMesh0)")}
-        }));
-
-    Add(MakeTool(TEXT("SET_CHARACTER_CAPSULE"),
-        TEXT("Set the capsule size on a character Blueprint."),
-        {
-            {TEXT("asset_path"),   TEXT("Content path to the character Blueprint")},
-            {TEXT("half_height"),  TEXT("Half height of the capsule in cm")},
-            {TEXT("radius"),       TEXT("Radius of the capsule in cm")}
-        }));
-
-    Add(MakeTool(TEXT("SET_CAMERA_BOOM"),
-        TEXT("Set the camera boom (spring arm) on a character Blueprint."),
-        {
-            {TEXT("asset_path"),        TEXT("Content path to the character Blueprint")},
-            {TEXT("arm_length"),        TEXT("Target arm length in cm")},
-            {TEXT("offset_x"),          TEXT("Socket offset X")},
-            {TEXT("offset_y"),          TEXT("Socket offset Y")},
-            {TEXT("offset_z"),          TEXT("Socket offset Z")}
-        }));
-
-    Add(MakeTool(TEXT("SET_GAMEMODE_PAWN"),
-        TEXT("Set the default pawn class on a GameMode Blueprint."),
-        {
-            {TEXT("gamemode_path"), TEXT("Content path to the GameMode Blueprint")},
-            {TEXT("pawn_path"),     TEXT("Content path to the Pawn Blueprint")}
-        }));
-
-    Add(MakeTool(TEXT("GET_CURRENT_GAMEMODE"),
-        TEXT("Get the current GameMode for the active level."),
-        {}));
-
-    Add(MakeTool(TEXT("GET_PLAYER_START"),
-        TEXT("Get the location of the Player Start actor in the current level."),
-        {}));
-
-    Add(MakeTool(TEXT("SET_LEVEL_GAMEMODE"),
-        TEXT("Set the GameMode override for the current level."),
-        { {TEXT("gamemode_path"), TEXT("Content path to the GameMode Blueprint")} }));
-
-    Add(MakeTool(TEXT("SET_CAST_TARGET"),
-        TEXT("Set the cast target class on a Cast node."),
-        {
-            {TEXT("asset_path"),  TEXT("Content path to the Blueprint")},
-            {TEXT("node_id"),     TEXT("GUID of the Cast node")},
-            {TEXT("class_name"),  TEXT("Target class name")}
-        }));
-
-    Add(MakeTool(TEXT("SET_VARIABLE_TYPE"),
-        TEXT("Change the type of an existing Blueprint variable."),
-        {
-            {TEXT("asset_path"),    TEXT("Content path to the Blueprint")},
-            {TEXT("variable_name"), TEXT("Name of the variable")},
-            {TEXT("new_type"),      TEXT("New type, e.g. bool, int32, float, FString, FVector")}
-        }));
-
-    Add(MakeTool(TEXT("RUN_PYTHON"),
-        TEXT("Execute a Python script string in the Unreal Editor Python environment."),
-        { {TEXT("script"), TEXT("Python code to execute")} }));
-
+    // All tools generated from manifest (see above)
     return Tools;
 }
 
@@ -604,7 +206,8 @@ void FGraphBridgeLLMClient::PostToOpenAI()
     }
 
     const UGraphBridgeSettings* Settings = GetDefault<UGraphBridgeSettings>();
-    if (!Settings || Settings->ApiKey.IsEmpty())
+    const FString ApiKey = FGraphBridgeCredentialStore::GetApiKey();
+    if (!Settings || ApiKey.IsEmpty())
     {
         OnError.ExecuteIfBound(TEXT("No API key set. Please add your OpenAI API key in Project Settings → Plugins → GraphBridge AI."));
         return;
@@ -640,7 +243,7 @@ void FGraphBridgeLLMClient::PostToOpenAI()
     Request->SetURL(LLMUrl);
     Request->SetVerb(TEXT("POST"));
     Request->SetHeader(TEXT("Content-Type"),  TEXT("application/json"));
-    Request->SetHeader(TEXT("Authorization"), TEXT("Bearer ") + Settings->ApiKey);
+    Request->SetHeader(TEXT("Authorization"), TEXT("Bearer ") + ApiKey);
     Request->SetContentAsString(PayloadString);
     Request->OnProcessRequestComplete().BindRaw(this, &FGraphBridgeLLMClient::OnHttpResponse);
     ActiveHttpRequest = Request;
@@ -765,7 +368,8 @@ void FGraphBridgeLLMClient::PostToAnthropic()
     }
 
     const UGraphBridgeSettings* Settings = GetDefault<UGraphBridgeSettings>();
-    if (!Settings || Settings->ApiKey.IsEmpty())
+    const FString ApiKey = FGraphBridgeCredentialStore::GetApiKey();
+    if (!Settings || ApiKey.IsEmpty())
     {
         OnError.ExecuteIfBound(TEXT("No API key. Add your Anthropic API key in Editor Preferences → Plugins → GraphBridge AI."));
         return;
@@ -810,7 +414,7 @@ void FGraphBridgeLLMClient::PostToAnthropic()
     Request->SetURL(Endpoint);
     Request->SetVerb(TEXT("POST"));
     Request->SetHeader(TEXT("Content-Type"),      TEXT("application/json"));
-    Request->SetHeader(TEXT("x-api-key"),         Settings->ApiKey);
+    Request->SetHeader(TEXT("x-api-key"),         ApiKey);
     Request->SetHeader(TEXT("anthropic-version"), TEXT("2023-06-01"));
     Request->SetContentAsString(PayloadString);
     Request->OnProcessRequestComplete().BindRaw(this, &FGraphBridgeLLMClient::OnAnthropicHttpResponse);
@@ -940,81 +544,42 @@ FString FGraphBridgeLLMClient::DispatchToolCall(const FString& ToolName, const T
         return Val;
     };
 
-    FString Command;
-
-    if      (ToolName == TEXT("OPEN_BLUEPRINT"))        Command = FString::Printf(TEXT("OPEN_BLUEPRINT|%s"),              *GetArg(TEXT("asset_path")));
-    else if (ToolName == TEXT("CLOSE_BLUEPRINT"))       Command = FString::Printf(TEXT("CLOSE_BLUEPRINT|%s"),             *GetArg(TEXT("asset_path")));
-    else if (ToolName == TEXT("SPAWN_NODE"))            Command = FString::Printf(TEXT("SPAWN_NODE|%s|%s|%s|%s|%s|%s"),   *GetArg(TEXT("asset_path")), *GetArg(TEXT("node_class")), *GetArg(TEXT("comment")), *GetArg(TEXT("pos_x")), *GetArg(TEXT("pos_y")), *GetArg(TEXT("graph_name")));
-    else if (ToolName == TEXT("CONNECT_PINS"))          Command = FString::Printf(TEXT("CONNECT_PINS|%s|%s|%s|%s|%s|%s"), *GetArg(TEXT("asset_path")), *GetArg(TEXT("source_node_id")), *GetArg(TEXT("source_pin")), *GetArg(TEXT("target_node_id")), *GetArg(TEXT("target_pin")), *GetArg(TEXT("graph_name")));
-    else if (ToolName == TEXT("DISCONNECT_PINS"))       Command = FString::Printf(TEXT("DISCONNECT_PINS|%s|%s|%s|%s|%s|%s"), *GetArg(TEXT("asset_path")), *GetArg(TEXT("source_node_id")), *GetArg(TEXT("source_pin")), *GetArg(TEXT("target_node_id")), *GetArg(TEXT("target_pin")), *GetArg(TEXT("graph_name")));
-    else if (ToolName == TEXT("DELETE_NODE"))           Command = FString::Printf(TEXT("DELETE_NODE|%s|%s|%s"),           *GetArg(TEXT("asset_path")), *GetArg(TEXT("node_id")), *GetArg(TEXT("graph_name")));
-    else if (ToolName == TEXT("CLEAR_NODES"))           Command = FString::Printf(TEXT("CLEAR_NODES|%s|%s|%s"),           *GetArg(TEXT("asset_path")), *GetArg(TEXT("comment_match")), *GetArg(TEXT("graph_name")));
-    else if (ToolName == TEXT("SET_PIN_DEFAULT"))       Command = FString::Printf(TEXT("SET_PIN_DEFAULT|%s|%s|%s|%s"),    *GetArg(TEXT("asset_path")), *GetArg(TEXT("node_id")), *GetArg(TEXT("pin_name")), *GetArg(TEXT("value")));
-    else if (ToolName == TEXT("GET_NODE_PINS"))         Command = FString::Printf(TEXT("GET_NODE_PINS|%s|%s|%s"),         *GetArg(TEXT("asset_path")), *GetArg(TEXT("node_id")), *GetArg(TEXT("graph_name")));
-    else if (ToolName == TEXT("LIST_NODES"))            Command = FString::Printf(TEXT("LIST_NODES|%s|%s"),               *GetArg(TEXT("asset_path")), *GetArg(TEXT("graph_name")));
-    else if (ToolName == TEXT("LIST_GRAPHS"))           Command = FString::Printf(TEXT("LIST_GRAPHS|%s"),                 *GetArg(TEXT("asset_path")));
-    else if (ToolName == TEXT("CREATE_FUNCTION_GRAPH")) Command = FString::Printf(TEXT("CREATE_FUNCTION_GRAPH|%s|%s"),    *GetArg(TEXT("asset_path")), *GetArg(TEXT("function_name")));
-    else if (ToolName == TEXT("CREATE_MACRO_GRAPH"))    Command = FString::Printf(TEXT("CREATE_MACRO_GRAPH|%s|%s"),       *GetArg(TEXT("asset_path")), *GetArg(TEXT("macro_name")));
-    else if (ToolName == TEXT("COMPILE"))               Command = FString::Printf(TEXT("COMPILE|%s"),                      *GetArg(TEXT("asset_path")));
-    else if (ToolName == TEXT("SAVE_BLUEPRINT"))        Command = FString::Printf(TEXT("SAVE_BLUEPRINT|%s"),               *GetArg(TEXT("asset_path")));
-    else if (ToolName == TEXT("SPAWN_VARIABLE"))        Command = FString::Printf(TEXT("SPAWN_VARIABLE|%s|%s|%s|%s"),     *GetArg(TEXT("asset_path")), *GetArg(TEXT("variable_name")), *GetArg(TEXT("variable_type")), *GetArg(TEXT("category")));
-    else if (ToolName == TEXT("ADD_VARIABLE"))          Command = FString::Printf(TEXT("ADD_VARIABLE|%s|%s|%s|%s"),       *GetArg(TEXT("asset_path")), *GetArg(TEXT("variable_name")), *GetArg(TEXT("variable_type")), *GetArg(TEXT("category")));
-    else if (ToolName == TEXT("LIST_VARIABLES"))        Command = FString::Printf(TEXT("LIST_VARIABLES|%s"),               *GetArg(TEXT("asset_path")));
-    else if (ToolName == TEXT("SET_VARIABLE_DEFAULT"))  Command = FString::Printf(TEXT("SET_VARIABLE_DEFAULT|%s|%s|%s"),   *GetArg(TEXT("asset_path")), *GetArg(TEXT("variable_name")), *GetArg(TEXT("value")));
-    else if (ToolName == TEXT("LIST_ASSETS"))           Command = FString::Printf(TEXT("LIST_ASSETS|%s"),                  *GetArg(TEXT("filter")));
-    else if (ToolName == TEXT("FIND_NODE_CLASS"))       Command = FString::Printf(TEXT("FIND_NODE_CLASS|%s"),              *GetArg(TEXT("keyword")));
-    else if (ToolName == TEXT("SET_FUNCTION_REF"))      Command = FString::Printf(TEXT("SET_FUNCTION_REF|%s|%s|%s|%s"),   *GetArg(TEXT("asset_path")), *GetArg(TEXT("node_id")), *GetArg(TEXT("class_name")), *GetArg(TEXT("function_name")));
-    else if (ToolName == TEXT("SET_EVENT_REF"))         Command = FString::Printf(TEXT("SET_EVENT_REF|%s|%s|%s"),          *GetArg(TEXT("asset_path")), *GetArg(TEXT("node_id")), *GetArg(TEXT("event_name")));
-    else if (ToolName == TEXT("SET_VARIABLE_REF"))      Command = FString::Printf(TEXT("SET_VARIABLE_REF|%s|%s|%s"),       *GetArg(TEXT("asset_path")), *GetArg(TEXT("node_id")), *GetArg(TEXT("variable_name")));
-    else if (ToolName == TEXT("ADD_COMPONENT"))         Command = FString::Printf(TEXT("ADD_COMPONENT|%s|%s|%s"),           *GetArg(TEXT("asset_path")), *GetArg(TEXT("component_class")), *GetArg(TEXT("component_name")));
-    else if (ToolName == TEXT("SET_ANIM_CLASS"))        Command = FString::Printf(TEXT("SET_ANIM_CLASS|%s|%s|%s"),          *GetArg(TEXT("asset_path")), *GetArg(TEXT("component_name")), *GetArg(TEXT("anim_bp_path")));
-    else if (ToolName == TEXT("SET_INPUT_ACTION"))      Command = FString::Printf(TEXT("SET_INPUT_ACTION|%s|%s|%s"),        *GetArg(TEXT("asset_path")), *GetArg(TEXT("node_id")), *GetArg(TEXT("input_action_path")));
-    else if (ToolName == TEXT("LIST_BLENDSPACES"))      Command = FString::Printf(TEXT("LIST_BLENDSPACES|%s"),              *GetArg(TEXT("filter")));
-    else if (ToolName == TEXT("LIST_ASSET_PROPERTIES")) Command = FString::Printf(TEXT("LIST_ASSET_PROPERTIES|%s"),         *GetArg(TEXT("asset_path")));
-    else if (ToolName == TEXT("GET_ASSET_PROPERTY"))    Command = FString::Printf(TEXT("GET_ASSET_PROPERTY|%s|%s"),         *GetArg(TEXT("asset_path")), *GetArg(TEXT("property_name")));
-    else if (ToolName == TEXT("SET_ASSET_PROPERTY"))    Command = FString::Printf(TEXT("SET_ASSET_PROPERTY|%s|%s|%s"),      *GetArg(TEXT("asset_path")), *GetArg(TEXT("property_name")), *GetArg(TEXT("value")));
-    else if (ToolName == TEXT("SAVE_ASSET"))            Command = FString::Printf(TEXT("SAVE_ASSET|%s"),                    *GetArg(TEXT("asset_path")));
-    else if (ToolName == TEXT("GET_MONTAGE_INFO"))      Command = FString::Printf(TEXT("GET_MONTAGE_INFO|%s"),              *GetArg(TEXT("asset_path")));
-    else if (ToolName == TEXT("ADD_MONTAGE_SECTION"))   Command = FString::Printf(TEXT("ADD_MONTAGE_SECTION|%s|%s|%s"),    *GetArg(TEXT("asset_path")), *GetArg(TEXT("section_name")), *GetArg(TEXT("start_time")));
-    else if (ToolName == TEXT("REMOVE_MONTAGE_SECTION"))Command = FString::Printf(TEXT("REMOVE_MONTAGE_SECTION|%s|%s"),    *GetArg(TEXT("asset_path")), *GetArg(TEXT("section_name")));
-    else if (ToolName == TEXT("SET_MONTAGE_SLOT"))      Command = FString::Printf(TEXT("SET_MONTAGE_SLOT|%s|%s|%s"),       *GetArg(TEXT("asset_path")), *GetArg(TEXT("slot_index")), *GetArg(TEXT("slot_name")));
-    else if (ToolName == TEXT("ADD_MONTAGE_NOTIFY"))    Command = FString::Printf(TEXT("ADD_MONTAGE_NOTIFY|%s|%s|%s"),     *GetArg(TEXT("asset_path")), *GetArg(TEXT("notify_class")), *GetArg(TEXT("trigger_time")));
-    else if (ToolName == TEXT("ADD_MONTAGE_NOTIFY_STATE")) Command = FString::Printf(TEXT("ADD_MONTAGE_NOTIFY_STATE|%s|%s|%s|%s"), *GetArg(TEXT("asset_path")), *GetArg(TEXT("notify_class")), *GetArg(TEXT("start_time")), *GetArg(TEXT("duration")));
-    else if (ToolName == TEXT("REMOVE_MONTAGE_NOTIFY")) Command = FString::Printf(TEXT("REMOVE_MONTAGE_NOTIFY|%s|%s"),     *GetArg(TEXT("asset_path")), *GetArg(TEXT("notify_index")));
-    else if (ToolName == TEXT("LIST_DATATABLE_ROWS"))   Command = FString::Printf(TEXT("LIST_DATATABLE_ROWS|%s"),           *GetArg(TEXT("asset_path")));
-    else if (ToolName == TEXT("ADD_DATATABLE_ROW"))     Command = FString::Printf(TEXT("ADD_DATATABLE_ROW|%s|%s"),          *GetArg(TEXT("asset_path")), *GetArg(TEXT("row_name")));
-    else if (ToolName == TEXT("DELETE_DATATABLE_ROW"))  Command = FString::Printf(TEXT("DELETE_DATATABLE_ROW|%s|%s"),       *GetArg(TEXT("asset_path")), *GetArg(TEXT("row_name")));
-    else if (ToolName == TEXT("RENAME_DATATABLE_ROW"))  Command = FString::Printf(TEXT("RENAME_DATATABLE_ROW|%s|%s|%s"),   *GetArg(TEXT("asset_path")), *GetArg(TEXT("old_name")), *GetArg(TEXT("new_name")));
-    else if (ToolName == TEXT("LIST_SKELETON_SOCKETS")) Command = FString::Printf(TEXT("LIST_SKELETON_SOCKETS|%s"),         *GetArg(TEXT("asset_path")));
-    else if (ToolName == TEXT("ADD_SKELETON_SOCKET"))   Command = FString::Printf(TEXT("ADD_SKELETON_SOCKET|%s|%s|%s"),    *GetArg(TEXT("asset_path")), *GetArg(TEXT("socket_name")), *GetArg(TEXT("bone_name")));
-    else if (ToolName == TEXT("MOVE_SKELETON_SOCKET"))  Command = FString::Printf(TEXT("MOVE_SKELETON_SOCKET|%s|%s|%s|%s|%s|%s|%s|%s"), *GetArg(TEXT("asset_path")), *GetArg(TEXT("socket_name")), *GetArg(TEXT("loc_x")), *GetArg(TEXT("loc_y")), *GetArg(TEXT("loc_z")), *GetArg(TEXT("rot_pitch")), *GetArg(TEXT("rot_yaw")), *GetArg(TEXT("rot_roll")));
-    else if (ToolName == TEXT("DELETE_SKELETON_SOCKET"))Command = FString::Printf(TEXT("DELETE_SKELETON_SOCKET|%s|%s"),     *GetArg(TEXT("asset_path")), *GetArg(TEXT("socket_name")));
-    else if (ToolName == TEXT("CREATE_IMC"))            Command = FString::Printf(TEXT("CREATE_IMC|%s"),                    *GetArg(TEXT("asset_path")));
-    else if (ToolName == TEXT("ADD_IMC_MAPPING"))       Command = FString::Printf(TEXT("ADD_IMC_MAPPING|%s|%s|%s"),         *GetArg(TEXT("imc_path")), *GetArg(TEXT("action_path")), *GetArg(TEXT("key")));
-    else if (ToolName == TEXT("REMOVE_IMC_MAPPING"))    Command = FString::Printf(TEXT("REMOVE_IMC_MAPPING|%s|%s|%s"),      *GetArg(TEXT("imc_path")), *GetArg(TEXT("action_path")), *GetArg(TEXT("key")));
-    else if (ToolName == TEXT("LIST_IMC_MAPPINGS"))     Command = FString::Printf(TEXT("LIST_IMC_MAPPINGS|%s"),              *GetArg(TEXT("imc_path")));
-    else if (ToolName == TEXT("ADD_IMC_TO_CHARACTER"))  Command = FString::Printf(TEXT("ADD_IMC_TO_CHARACTER|%s|%s|%s"),    *GetArg(TEXT("asset_path")), *GetArg(TEXT("imc_path")), *GetArg(TEXT("priority")));
-    else if (ToolName == TEXT("SET_CHARACTER_MESH"))    Command = FString::Printf(TEXT("SET_CHARACTER_MESH|%s|%s|%s"),       *GetArg(TEXT("asset_path")), *GetArg(TEXT("mesh_path")), *GetArg(TEXT("component_name")));
-    else if (ToolName == TEXT("SET_CHARACTER_CAPSULE")) Command = FString::Printf(TEXT("SET_CHARACTER_CAPSULE|%s|%s|%s"),   *GetArg(TEXT("asset_path")), *GetArg(TEXT("half_height")), *GetArg(TEXT("radius")));
-    else if (ToolName == TEXT("SET_CAMERA_BOOM"))       Command = FString::Printf(TEXT("SET_CAMERA_BOOM|%s|%s|%s|%s|%s"),   *GetArg(TEXT("asset_path")), *GetArg(TEXT("arm_length")), *GetArg(TEXT("offset_x")), *GetArg(TEXT("offset_y")), *GetArg(TEXT("offset_z")));
-    else if (ToolName == TEXT("SET_GAMEMODE_PAWN"))     Command = FString::Printf(TEXT("SET_GAMEMODE_PAWN|%s|%s"),           *GetArg(TEXT("gamemode_path")), *GetArg(TEXT("pawn_path")));
-    else if (ToolName == TEXT("GET_CURRENT_GAMEMODE"))  Command = TEXT("GET_CURRENT_GAMEMODE");
-    else if (ToolName == TEXT("GET_PLAYER_START"))      Command = TEXT("GET_PLAYER_START");
-    else if (ToolName == TEXT("SET_LEVEL_GAMEMODE"))    Command = FString::Printf(TEXT("SET_LEVEL_GAMEMODE|%s"),             *GetArg(TEXT("gamemode_path")));
-    else if (ToolName == TEXT("SET_CAST_TARGET"))       Command = FString::Printf(TEXT("SET_CAST_TARGET|%s|%s|%s"),          *GetArg(TEXT("asset_path")), *GetArg(TEXT("node_id")), *GetArg(TEXT("class_name")));
-    else if (ToolName == TEXT("SET_VARIABLE_TYPE"))     Command = FString::Printf(TEXT("SET_VARIABLE_TYPE|%s|%s|%s"),        *GetArg(TEXT("asset_path")), *GetArg(TEXT("variable_name")), *GetArg(TEXT("new_type")));
-    else if (ToolName == TEXT("RUN_PYTHON"))            Command = FString::Printf(TEXT("RUN_PYTHON|%s"),                     *GetArg(TEXT("script")));
-    else
+    // Build command from manifest (zero hardcoded tool names)
+    const FGraphBridgeToolDef* ToolDef = FGraphBridgeToolManifest::FindTool(ToolName);
+    if (!ToolDef)
     {
         UE_LOG(LogGraphBridge, Warning, TEXT("LLMClient: unknown tool '%s'"), *ToolName);
         return FString::Printf(TEXT("ERR: Unknown tool '%s'"), *ToolName);
     }
 
+    // Build pipe-delimited command string from parameters
+    // Format: COMMAND_NAME|param1|param2|param3|...
+    FString Command = ToolDef->Command;
+
+    // Add required parameters in order
+    for (const FGraphBridgeToolParam& Param : ToolDef->Parameters)
+    {
+        Command += FString::Printf(TEXT("|%s"), *GetArg(Param.Name));
+    }
+
+    // Add optional parameters only if provided
+    for (const FGraphBridgeToolParam& Param : ToolDef->OptionalParameters)
+    {
+        FString ArgVal = GetArg(Param.Name);
+        if (!ArgVal.IsEmpty())
+        {
+            Command += FString::Printf(TEXT("|%s"), *ArgVal);
+        }
+    }
+
     FGraphBridgev2Module& Module = FModuleManager::GetModuleChecked<FGraphBridgev2Module>(TEXT("GraphBridgev2"));
     FString Result = Module.HandleGraphCommand(Command);
 
-    UE_LOG(LogGraphBridge, Log, TEXT("LLMClient: %s → %s"), *ToolName,
-        Result.IsEmpty() ? TEXT("(empty)") : *Result);
+    // Verbose + truncated: a tool call result can be a RUN_PYTHON command's
+    // full captured stdout -- same disclosure class as the command string
+    // itself (see GraphBridgeTruncateForLog's comment in GraphBridgev2.h).
+    UE_LOG(LogGraphBridge, Verbose, TEXT("LLMClient: %s → %s"), *ToolName,
+        Result.IsEmpty() ? TEXT("(empty)") : *GraphBridgeTruncateForLog(Result));
 
     return Result.IsEmpty() ? TEXT("OK") : Result;
 }
