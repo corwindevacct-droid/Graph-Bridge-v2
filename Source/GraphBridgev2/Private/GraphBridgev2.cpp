@@ -5,6 +5,7 @@
 #include "GraphBridgeSettings.h"
 #include "GraphBridgeCredentialStore.h"
 #include "GraphBridgeMCPServer.h"
+#include "GraphBridgeToolManifest.h"
 #include "Modules/ModuleManager.h"
 
 #if WITH_EDITOR
@@ -27,6 +28,11 @@ void FGraphBridgev2Module::StartupModule()
     // No-op once that ini value has been cleared. Must run before anything
     // else reads the key.
     FGraphBridgeCredentialStore::MigrateFromIniIfNeeded();
+
+#if WITH_EDITOR
+    // Validate that manifest parameter counts match router guards at startup
+    UGraphBridgeAutomationLibrary::ValidateManifestArityAgainstRouters();
+#endif
 
     UGraphBridgeAutomationLibrary::StartGraphBridgeServer(
         UGraphBridgeSettings::Get()->ServerPort);
@@ -64,6 +70,16 @@ void FGraphBridgev2Module::ShutdownModule()
 {
     FGlobalTabmanager::Get()->UnregisterNomadTabSpawner(FName(TEXT("GraphBridgePanel")));
     LLMClient.Reset();
+
+    // Covers the editor-exit path, not just an explicit Stop Server click --
+    // also deletes Saved/GraphBridge/session_token.txt (see
+    // StopGraphBridgeServer) so a stale token can't outlive the server that
+    // minted it.
+    if (UGraphBridgeAutomationLibrary::IsServerRunning())
+    {
+        UGraphBridgeAutomationLibrary::StopGraphBridgeServer();
+        UE_LOG(LogGraphBridge, Log, TEXT("GraphBridge: WebSocket server stopped (module shutdown)"));
+    }
 
     if (MCPServer)
     {

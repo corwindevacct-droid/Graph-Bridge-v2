@@ -152,6 +152,14 @@ public:
     static void ExecuteAtomicCommandExtended(const FGraphBridgeCommandContext& Context, const FString& Op,
                                              const TArray<FString>& P);
 
+#if WITH_EDITOR
+    // ValidateManifestArityAgainstRouters — schema validation that runs at startup.
+    // Asserts that for every manifest tool, Parameters.Num() exactly matches
+    // the number of arguments the router's P.Num() >= N guard requires.
+    // Prevents manifest/handler divergence from causing unrecoverable agent errors.
+    static void ValidateManifestArityAgainstRouters();
+#endif
+
     // -----------------------------------------------------------------------
     // Static state — definitions live in the .cpp
     // -----------------------------------------------------------------------

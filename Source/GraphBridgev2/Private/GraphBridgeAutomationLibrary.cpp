@@ -3,6 +3,7 @@
 #include "GraphBridgeAutomationLibrary.h"
 #include "GraphBridgev2.h"
 #include "GraphBridgeMCPServer.h"
+#include "GraphBridgeToolManifest.h"
 #include "GraphBridgeSettings.h"
 #include "Misc/Paths.h"
 #include "Misc/FileHelper.h"
@@ -1518,13 +1519,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommandExtended(const FGraphBri
         // process. Gated here at the dispatch boundary, not only by hiding
         // the control in the panel, so every entry point (WebSocket, MCP,
         // Panel, RPC) is covered.
-        // TODO(next commit): read from UGraphBridgeSettings::bAllowRunPython
-        // once the Project Settings toggle lands alongside the credential
-        // store commit; this raw ini read is the same off-by-default gate,
-        // just without a UI checkbox yet.
-        bool bAllowRunPython = false;
-        GConfig->GetBool(TEXT("GraphBridge"), TEXT("AllowRunPython"), bAllowRunPython, GEditorIni);
-        if (!bAllowRunPython)
+        if (!UGraphBridgeSettings::Get()->bAllowRunPython)
         {
             SendResponse(Context, false, Op,
                 TEXT("ERR: RUN_PYTHON is disabled. Enable it in Project Settings -> Plugins -> ")
@@ -2135,9 +2130,22 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommandExtended(const FGraphBri
     }
     else
     {
-        UE_LOG(LogGraphBridge, Warning, TEXT("GraphBridge: Unknown command: %s"), *Op);
-        SendResponse(Context, false, Op,
-            FString::Printf(TEXT("Unknown command or wrong arg count: %s"), *Op), TEXT(""));
+        const FGraphBridgeToolDef* Def = FGraphBridgeToolManifest::FindTool(Op);
+        const bool bCommandRecognized = (Def != nullptr);
+        const int32 ExpectedArgCount = Def ? Def->Parameters.Num() : 0;
+
+        if (bCommandRecognized)
+        {
+            UE_LOG(LogGraphBridge, Warning, TEXT("GraphBridge: Wrong arg count for %s (expected %d, got %d)"), *Op, ExpectedArgCount, P.Num() - 1);
+            SendResponse(Context, false, Op,
+                FString::Printf(TEXT("Wrong arg count: %s expects %d arguments, got %d"), *Op, ExpectedArgCount, P.Num() - 1), TEXT(""));
+        }
+        else
+        {
+            UE_LOG(LogGraphBridge, Warning, TEXT("GraphBridge: Unknown command: %s"), *Op);
+            SendResponse(Context, false, Op,
+                FString::Printf(TEXT("Unknown command: %s"), *Op), TEXT(""));
+        }
     }
 
 #else
@@ -10048,6 +10056,56 @@ FString UGraphBridgeAutomationLibrary::CaptureView(FString Target, FString Focus
         Result += TEXT("]");
         return Result;
     }
+}
+
+// ---------------------------------------------------------------------------
+// ValidateManifestArityAgainstRouters — schema validation test
+// Asserts that for every manifest tool, Parameters.Num() exactly matches
+// the number of arguments the router's P.Num() >= N guard requires.
+// This prevents the class of errors where manifest parameter counts diverge
+// from handler expectations, causing agents to receive unrecoverable
+// "wrong argument count" errors that contradict the schema they read.
+// ---------------------------------------------------------------------------
+void UGraphBridgeAutomationLibrary::ValidateManifestArityAgainstRouters()
+{
+	const TArray<FGraphBridgeToolDef>& Manifest = FGraphBridgeToolManifest::GetManifest();
+
+	// Map of command name to expected argument count from router guards (P.Num() >= N means N-1 required args after verb)
+	const TMap<FString, int32> RouterGuards = {
+		{TEXT("ADD_CUSTOM_EVENT_PARAM"), 3}, // bp_path, event_name, param_name
+		{TEXT("ADD_LOCAL_VARIABLE"), 5}, // bp_path, func_name, var_name, var_type, category
+		{TEXT("ADD_MATERIAL_NODE"), 3}, // material_path, node_type, x
+		{TEXT("ADD_RETARGET_CHAIN"), 5}, // retargeter_path, chain_name, source, target, target_skeleton
+		{TEXT("ADD_SKELETON_SOCKET"), 6}, // asset_path, socket_name, bone_name, loc_x, loc_y, loc_z
+		{TEXT("CREATE_EVENT_DISPATCHER"), 2}, // bp_path, dispatcher_name
+		{TEXT("CREATE_NIAGARA_SYSTEM"), 1}, // asset_path
+		{TEXT("LIST_NIAGARA_MODULES"), 2}, // emitter_path, stage
+		{TEXT("REMOVE_FUNCTION_PARAM"), 4}, // bp_path, function_name, param_name, param_index
+		{TEXT("SET_NIAGARA_MODULE_INPUT"), 5}, // emitter_path, module_name, input_name, value, stage
+		{TEXT("SPAWN_NODE_ANCHORED"), 5}, // bp_path, anchor_node_guid, node_class, comment, x
+	};
+
+	int32 MismatchCount = 0;
+	for (const FGraphBridgeToolDef& Tool : Manifest)
+	{
+		if (const int32* ExpectedArgCount = RouterGuards.Find(Tool.Command))
+		{
+			if (Tool.Parameters.Num() != *ExpectedArgCount)
+			{
+				UE_LOG(LogGraphBridge, Error,
+					TEXT("Arity mismatch: %s manifest has %d parameters, router requires %d arguments"),
+					*Tool.Command, Tool.Parameters.Num(), *ExpectedArgCount);
+				MismatchCount++;
+			}
+		}
+	}
+
+	if (MismatchCount > 0)
+	{
+		UE_LOG(LogGraphBridge, Fatal,
+			TEXT("FATAL: %d manifest/router arity mismatches detected. Fix manifest parameter counts to match router guards."),
+			MismatchCount);
+	}
 }
 
 #endif // WITH_EDITOR
