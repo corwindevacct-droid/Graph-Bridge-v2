@@ -3,13 +3,27 @@ GRAPHBRIDGE AI - PYTHON TOOLS
 
 SETUP
 1. pip install websockets anthropic openai
-2. Edit graphbridge_config.py and set your API keys
-   OR set environment variables:
+2. Set your API keys as environment variables (used by graphbridge_agent.py):
      Windows:   set ANTHROPIC_API_KEY=<your-key-here>
      Mac/Linux: export ANTHROPIC_API_KEY=<your-key-here>
 3. Open your Unreal project with GraphBridge AI enabled
 4. Click Start Server in the GraphBridge AI panel (Window menu)
 5. Confirm the green dot shows Running on port 8080
+
+SECURITY
+The bridge requires a per-session auth token on every connection, minted
+fresh each time the server starts. graphbridge_bridge.py (and everything
+built on it below) picks this up automatically from
+Saved/GraphBridge/session_token.txt via graphbridge_config.py -- no action
+needed for the tools below. If you're driving the bridge some other way
+(raw curl, a new script), read that file yourself or copy the token shown
+in the GraphBridge AI panel.
+
+RUN_PYTHON (arbitrary Python execution inside the editor process) is now
+OFF by default -- enable it in Project Settings -> Plugins -> GraphBridge AI
+if you rely on it. See README.md's Security section for the full threat
+model: the bridge only binds to loopback, but any other process running as
+your OS user can still reach it -- localhost is not a trust boundary.
 
 TOOLS
   graphbridge_tools.py    - Find assets, inspect pins, list nodes
@@ -66,6 +80,14 @@ SETUP
 3. Open your Unreal project with GraphBridge AI enabled.
 4. Click Start Server in the GraphBridge AI panel (Window menu).
 5. Confirm the green dot shows Running on port 8080.
+
+NOTE: as of the security hardening release, every connection must present
+the per-session token from Saved/GraphBridge/session_token.txt (or shown in
+the panel) as a "token" query parameter on the WebSocket URI, e.g.
+ws://127.0.0.1:8080/?token=<token>. This CLI is not present in this checkout
+as of this writing -- if you build/restore it, add that query parameter to
+its connection URI (or the "BRIDGE_URI" value in graphbridge_config.json)
+before expecting a successful connection.
 
 TOOLS
   graphbridge find <term> [term2 ...]      - Find assets (Blueprint + AnimBlueprint)

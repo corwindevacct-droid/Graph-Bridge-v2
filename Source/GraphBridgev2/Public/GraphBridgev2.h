@@ -8,6 +8,21 @@
 
 DECLARE_LOG_CATEGORY_EXTERN(LogGraphBridge, Log, All);
 
+// Bounds how much of a command string / command result gets written to the
+// log. Full command bodies (RUN_PYTHON source, its captured stdout, and any
+// other free-form payload) are the same disclosure class as the API key
+// that used to sit in project config: Output Logs get pasted into bug
+// reports and Discord threads verbatim. Use this at every log site in the
+// dispatch chain that would otherwise print a full command/result string --
+// it still gives support something to go on (the operation verb plus a
+// bounded prefix), it just doesn't hand out the whole payload for free.
+FORCEINLINE FString GraphBridgeTruncateForLog(const FString& In, int32 MaxLen = 200)
+{
+    return In.Len() > MaxLen
+        ? In.Left(MaxLen) + FString::Printf(TEXT("...(+%d more chars)"), In.Len() - MaxLen)
+        : In;
+}
+
 #if WITH_EDITOR
 class SDockTab;
 class FSpawnTabArgs;

@@ -14,12 +14,36 @@ import asyncio
 import json
 import websockets
 
+try:
+    import graphbridge_config as _config
+except ImportError:
+    _config = None
+
+
+def _with_token(uri: str, token: str) -> str:
+    """
+    Appends the session token as a query parameter (?token=... or
+    &token=... if the URI already has a query string), unless the URI
+    already carries a token param -- lets a caller override by passing a
+    URI with its own explicit token.
+    """
+    if not token or "token=" in uri:
+        return uri
+    separator = "&" if "?" in uri else "?"
+    return f"{uri}{separator}token={token}"
+
 
 class UnrealBridge:
-    def __init__(self, uri: str = "ws://127.0.0.1:8080", timeout: float = 10.0):
+    def __init__(self, uri: str = "ws://127.0.0.1:8080", timeout: float = 10.0,
+                 token: str | None = None):
         self.uri = uri
         self.websocket = None
         self.timeout = timeout
+        # Auto-discovered from Saved/GraphBridge/session_token.txt via
+        # graphbridge_config unless explicitly overridden. Required by the
+        # server on every connection -- see the plugin's README.md Security
+        # section.
+        self.token = token if token is not None else (_config.SESSION_TOKEN if _config else "")
 
     # ------------------------------------------------------------------
     # Connection management
@@ -31,9 +55,10 @@ class UnrealBridge:
         Retries up to `retries` times with `delay` seconds between attempts.
         Returns True on success, False if all attempts fail.
         """
+        connect_uri = _with_token(self.uri, self.token)
         for attempt in range(1, retries + 1):
             try:
-                self.websocket = await websockets.connect(self.uri)
+                self.websocket = await websockets.connect(connect_uri)
                 print(f"[Bridge] Connected to {self.uri}")
                 return True
             except Exception as e:
@@ -41,6 +66,9 @@ class UnrealBridge:
                 if attempt < retries:
                     await asyncio.sleep(delay)
         print("[Bridge] Could not connect. Is the Unreal editor open with the plugin loaded?")
+        if not self.token:
+            print("[Bridge] No session token found (looked in Saved/GraphBridge/session_token.txt) "
+                  "-- start the GraphBridge server in the editor first, then retry.")
         return False
 
     async def close(self):

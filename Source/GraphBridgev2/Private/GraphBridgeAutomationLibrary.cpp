@@ -3,6 +3,12 @@
 #include "GraphBridgeAutomationLibrary.h"
 #include "GraphBridgev2.h"
 #include "GraphBridgeMCPServer.h"
+#include "GraphBridgeSettings.h"
+#include "Misc/Paths.h"
+#include "Misc/FileHelper.h"
+#include "Misc/ScopeLock.h"
+#include "HAL/PlatformFileManager.h"
+#include "HAL/CriticalSection.h"
 
 // All UE5 headers MUST come before any third-party Windows headers.
 // IXWebSocket pulls in raw Windows atomics (winsock2.h etc.) which clash
@@ -187,6 +193,7 @@ THIRD_PARTY_INCLUDES_START
 #undef check
 #include "ixwebsocket/IXWebSocket.h"
 #include "ixwebsocket/IXWebSocketServer.h"
+#include "ixwebsocket/IXConnectionState.h"
 #pragma pop_macro("check")
 THIRD_PARTY_INCLUDES_END
 #include "Windows/HideWindowsPlatformAtomics.h"
@@ -200,9 +207,184 @@ THIRD_PARTY_INCLUDES_END
 std::unique_ptr<ix::WebSocketServer> UGraphBridgeAutomationLibrary::Server;
 std::unique_ptr<FGraphBridgeMCPServer> UGraphBridgeAutomationLibrary::MCPServer;
 FOnSendMessage UGraphBridgeAutomationLibrary::SendMessageDelegate;
+FString UGraphBridgeAutomationLibrary::SessionToken;
 
-// Non-null only during a DispatchCommandSync call — captures the JSON result
-// string instead of sending it over the WebSocket wire. Game thread only.
+// ---------------------------------------------------------------------------
+// Connection security helpers (loopback-bind + Origin + token checks)
+// ---------------------------------------------------------------------------
+// Threat model: localhost is not a trust boundary here. Origin validation
+// only stops a browser tab (WebSocket connections aren't subject to CORS),
+// it does not stop another local process running as the same user -- that's
+// what the per-session token is for. See README.md's Security section.
+namespace
+{
+    FString GetSessionTokenFilePath()
+    {
+        return FPaths::ProjectSavedDir() / TEXT("GraphBridge") / TEXT("session_token.txt");
+    }
+
+    // Mirrors the token to Saved/GraphBridge/session_token.txt so the bundled
+    // Python client (graphbridge_config.py) can pick it up without any
+    // manual copy/paste. Saved/ is gitignored by every standard UE project
+    // template, so this never lands in source control. Called before
+    // Server->listen() -- the file must exist before the port can accept any
+    // connection, or a client racing the startup window could read a
+    // missing or stale previous-session file.
+    void WriteSessionTokenToDisk(const FString& Token)
+    {
+        const FString Dir = FPaths::ProjectSavedDir() / TEXT("GraphBridge");
+        const FString FilePath = GetSessionTokenFilePath();
+        IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
+        if (!PlatformFile.DirectoryExists(*Dir))
+        {
+            PlatformFile.CreateDirectoryTree(*Dir);
+        }
+        if (!FFileHelper::SaveStringToFile(Token, *FilePath))
+        {
+            UE_LOG(LogGraphBridge, Warning,
+                TEXT("GraphBridge: failed to write session token to %s -- the bundled Python "
+                     "client will not be able to auto-discover it."), *FilePath);
+        }
+    }
+
+    // Removes the token file on server stop / module shutdown. A stale
+    // token surviving the server that minted it would let the next session
+    // start up believing a still-present file is current, producing a
+    // confusing "wrong token" failure for a client instead of a clear
+    // "no server running" one.
+    void DeleteSessionTokenFromDisk()
+    {
+        const FString FilePath = GetSessionTokenFilePath();
+        IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
+        if (PlatformFile.FileExists(*FilePath))
+        {
+            PlatformFile.DeleteFile(*FilePath);
+        }
+    }
+
+    // Byte-by-byte comparison that always walks the full length of both
+    // strings rather than short-circuiting on the first mismatch, so an
+    // incorrect token doesn't leak how many leading characters were right
+    // via response timing.
+    bool ConstantTimeEquals(const FString& A, const FString& B)
+    {
+        const int32 LenA = A.Len();
+        const int32 LenB = B.Len();
+        int32 Diff = LenA ^ LenB;
+        const int32 MaxLen = FMath::Max(LenA, LenB);
+        for (int32 i = 0; i < MaxLen; ++i)
+        {
+            const TCHAR CharA = i < LenA ? A[i] : 0;
+            const TCHAR CharB = i < LenB ? B[i] : 0;
+            Diff |= (CharA ^ CharB);
+        }
+        return Diff == 0;
+    }
+
+    // Pulls a single query parameter's value out of a raw HTTP request-target
+    // (e.g. "/?token=abc123"). No URL-decoding -- the token is always a
+    // plain hex GUID string, so none is needed.
+    FString ExtractUriQueryParam(const FString& Uri, const FString& Key)
+    {
+        FString Path, Query;
+        if (!Uri.Split(TEXT("?"), &Path, &Query))
+        {
+            return FString();
+        }
+        TArray<FString> Pairs;
+        Query.ParseIntoArray(Pairs, TEXT("&"));
+        for (const FString& Pair : Pairs)
+        {
+            FString PKey, PValue;
+            if (Pair.Split(TEXT("="), &PKey, &PValue) && PKey == Key)
+            {
+                return PValue;
+            }
+        }
+        return FString();
+    }
+
+    // Origin is only ever sent by browser-context WebSocket clients (a
+    // non-browser client, e.g. our Python bridge, sends no Origin header at
+    // all -- that's normal and must pass). A PRESENT Origin that isn't
+    // loopback means some web page's script opened this connection, which
+    // CORS does not prevent for WebSockets -- reject it.
+    bool IsLoopbackOrigin(const FString& Origin)
+    {
+        FString Remainder = Origin;
+        Remainder.RemoveFromStart(TEXT("https://"));
+        Remainder.RemoveFromStart(TEXT("http://"));
+
+        FString HostPort = Remainder;
+        int32 SlashIdx;
+        if (Remainder.FindChar(TEXT('/'), SlashIdx))
+        {
+            HostPort = Remainder.Left(SlashIdx);
+        }
+
+        FString Host = HostPort;
+        if (HostPort.StartsWith(TEXT("[")))
+        {
+            // Bracketed IPv6 literal, e.g. [::1]:8080
+            int32 CloseBracket;
+            if (HostPort.FindChar(TEXT(']'), CloseBracket))
+            {
+                Host = HostPort.Mid(1, CloseBracket - 1);
+            }
+        }
+        else
+        {
+            int32 ColonIdx;
+            if (HostPort.FindChar(TEXT(':'), ColonIdx))
+            {
+                Host = HostPort.Left(ColonIdx);
+            }
+        }
+
+        return Host == TEXT("127.0.0.1") || Host == TEXT("localhost") || Host == TEXT("::1");
+    }
+
+    // Per-connection authentication state. Subclasses ix::ConnectionState so
+    // IXWebSocket allocates one instance per connection (via
+    // setConnectionStateFactory, registered before listen()) and hands it to
+    // setOnConnectionCallback, which installs the per-socket message handler
+    // that reads/writes bAuthenticated -- see StartGraphBridgeServer below.
+    //
+    // This replaces an earlier TSet<ix::WebSocket*> + FCriticalSection
+    // design. That design was unsound, not just unproven: keying
+    // authenticated-ness on a connection's raw ix::WebSocket* address
+    // assumes addresses are never reused across unrelated connections, but
+    // IXWebSocket allocates that WebSocket as a make_shared local in
+    // WebSocketServer::handleUpgrade (Source/ThirdParty/ixwebsocket/
+    // IXWebSocketServer.cpp), destroyed when that connection's dedicated
+    // worker thread returns -- the address is free for the allocator to
+    // hand to the very next connection. A stale TSet entry surviving past
+    // its connection's cleanup (any code path that destroys the socket
+    // without this callback observing Close/Error first) would let a
+    // brand-new, never-authenticated connection inherit "authenticated" for
+    // free purely by landing at a recycled address. A per-connection object,
+    // one per handleUpgrade call, owned via shared_ptr for exactly that
+    // connection's lifetime, has no such identity ambiguity -- there is
+    // nothing to key by address at all.
+    //
+    // CONFIRMED LIVE (adversarial test, see Tests/graphbridge_handshake_security_test.py
+    // and Tests/graphbridge_concurrency_test.py) that the Message-branch
+    // check in the per-socket handler is load-bearing, not defense-in-depth:
+    // a client that sends a command frame in the same TCP burst as a
+    // handshake carrying a bad token/Origin can still reach the message
+    // handler before WebSocket::close() (called from the Open branch) takes
+    // effect -- IXWebSocket's socket read buffering does not honor
+    // Open/Message callback ordering. Do not remove the flag check on the
+    // assumption that the Open-branch rejection alone closes the race.
+    class FGraphBridgeConnectionState : public ix::ConnectionState
+    {
+    public:
+        std::atomic<bool> bAuthenticated{false};
+    };
+} // namespace
+
+// DEPRECATED: Replaced by FGraphBridgeCommandContext.ResultBuffer.
+// Kept as nullptr for debug assertions only.
 static FString* GSyncResultCapture = nullptr;
 
 // ---------------------------------------------------------------------------
@@ -255,25 +437,177 @@ void UGraphBridgeAutomationLibrary::StartGraphBridgeServer(int32 Port)
         Port = ConfigPort;
     }
 
-    Server = std::make_unique<ix::WebSocketServer>(Port);
+    // Mint a fresh per-session token every time the server starts (not a
+    // fixed or port-derived value) and mirror it to Saved/ for the Python
+    // client. Generated from FGuid::NewGuid(), which on Windows is backed by
+    // CoCreateGuid (a CSPRNG) -- adequate entropy for a local, short-lived
+    // session credential.
+    SessionToken = FGuid::NewGuid().ToString(EGuidFormats::Digits);
+    WriteSessionTokenToDisk(SessionToken);
 
-    Server->setOnClientMessageCallback(
-        [](std::shared_ptr<ix::ConnectionState> ConnectionState,
-           ix::WebSocket& WebSocket,
-           const ix::WebSocketMessagePtr& Msg)
+    // Bind loopback explicitly rather than relying on IXWebSocketServer's
+    // default host parameter -- confirmed the vendored copy in
+    // Source/ThirdParty/ixwebsocket already defaults to "127.0.0.1", but that
+    // default is an implementation detail of the library, not a guarantee.
+    Server = std::make_unique<ix::WebSocketServer>(Port, std::string("127.0.0.1"));
+
+    // One FGraphBridgeConnectionState per connection, handed to
+    // setOnConnectionCallback below. Must be registered before listen().
+    Server->setConnectionStateFactory(
+        []() -> std::shared_ptr<ix::ConnectionState>
         {
-            if (Msg->type == ix::WebSocketMessageType::Message)
-            {
-                FString Received = FString(UTF8_TO_TCHAR(Msg->str.c_str()));
+            return std::make_shared<FGraphBridgeConnectionState>();
+        });
 
-                // IXWebSocket delivers on its own thread — marshal to GameThread
-                // before touching any UObjects.
-                ix::WebSocket* SenderPtr = &WebSocket;
-                AsyncTask(ENamedThreads::GameThread, [Received, SenderPtr]()
-                {
-                    ExecuteAtomicCommand(Received, SenderPtr);
-                });
+    // setOnConnectionCallback (not setOnClientMessageCallback) fires exactly
+    // once per connection, synchronously, on that connection's own dedicated
+    // worker thread, from inside WebSocketServer::handleUpgrade -- BEFORE
+    // the WebSocket handshake itself runs. We must call setOnMessageCallback
+    // on WebSocket before returning, or IXWebSocket logs a developer error
+    // and terminates the connection (see handleUpgrade in
+    // IXWebSocketServer.cpp). This one call site is where the per-connection
+    // FGraphBridgeConnectionState gets captured into this connection's own
+    // message closure -- no global collection, no address-based lookup.
+    Server->setOnConnectionCallback(
+        [](std::weak_ptr<ix::WebSocket> WeakWebSocket,
+           std::shared_ptr<ix::ConnectionState> ConnState)
+        {
+            std::shared_ptr<ix::WebSocket> InitialLock = WeakWebSocket.lock();
+            if (!InitialLock)
+            {
+                return;
             }
+
+            // ConnState always came from the factory above, so this
+            // downcast is safe.
+            FGraphBridgeConnectionState* TypedState =
+                static_cast<FGraphBridgeConnectionState*>(ConnState.get());
+
+            // Capture ConnState (the shared_ptr, not a raw pointer to it) by
+            // value so this connection's state object stays alive for as
+            // long as this message closure does -- i.e. for the connection's
+            // whole lifetime. WeakWebSocket is captured too, for the
+            // game-thread AsyncTask hop below.
+            InitialLock->setOnMessageCallback(
+                [WeakWebSocket, ConnState, TypedState](const ix::WebSocketMessagePtr& Msg)
+                {
+                    // NOTE: the Open callback fires synchronously before
+                    // IXWebSocket starts its frame-read loop for this
+                    // socket, but that does NOT mean a command frame sent in
+                    // the same TCP burst as a rejected handshake can't reach
+                    // the Message branch below -- confirmed LIVE via an
+                    // adversarial test (Tests/graphbridge_handshake_security_test.py,
+                    // Tests/graphbridge_concurrency_test.py) that it can: the
+                    // socket's read buffering does not honor the Open/Message
+                    // callback ordering. That's what TypedState->bAuthenticated
+                    // actually enforces; treat the checks in this Open branch
+                    // as "decide whether to authenticate", not as sufficient
+                    // on their own.
+                    if (Msg->type == ix::WebSocketMessageType::Open)
+                    {
+                        const auto OriginIt = Msg->openInfo.headers.find("Origin");
+                        const FString Origin = OriginIt != Msg->openInfo.headers.end()
+                            ? FString(UTF8_TO_TCHAR(OriginIt->second.c_str()))
+                            : FString();
+
+                        // Absent Origin is normal for non-browser clients (our
+                        // Python bridge, curl, a future CLI/sidecar) and must
+                        // pass. A PRESENT non-loopback Origin means a browser
+                        // tab opened this connection -- WebSockets aren't
+                        // subject to CORS, so this is the only thing stopping
+                        // a malicious web page.
+                        if (!Origin.IsEmpty() && !IsLoopbackOrigin(Origin))
+                        {
+                            UE_LOG(LogGraphBridge, Warning,
+                                TEXT("GraphBridge: rejected connection -- non-loopback Origin '%s'"), *Origin);
+                            if (std::shared_ptr<ix::WebSocket> Locked = WeakWebSocket.lock())
+                            {
+                                Locked->close(1008, "Origin not allowed");
+                            }
+                            return;
+                        }
+
+                        const FString Uri = FString(UTF8_TO_TCHAR(Msg->openInfo.uri.c_str()));
+                        const FString PresentedToken = ExtractUriQueryParam(Uri, TEXT("token"));
+                        if (!ConstantTimeEquals(PresentedToken, UGraphBridgeAutomationLibrary::SessionToken))
+                        {
+                            UE_LOG(LogGraphBridge, Warning,
+                                TEXT("GraphBridge: rejected connection -- missing or invalid session token"));
+                            if (std::shared_ptr<ix::WebSocket> Locked = WeakWebSocket.lock())
+                            {
+                                Locked->close(1008, "Invalid or missing token");
+                            }
+                            return;
+                        }
+
+                        TypedState->bAuthenticated.store(true);
+                        return;
+                    }
+
+                    if (Msg->type == ix::WebSocketMessageType::Close || Msg->type == ix::WebSocketMessageType::Error)
+                    {
+                        // No bookkeeping needed -- TypedState/ConnState are
+                        // owned by shared_ptrs scoped to this connection
+                        // (this closure, and IXWebSocket's own
+                        // ConnectionThreads list); both are torn down
+                        // automatically when the connection ends. There is
+                        // no global collection to prune any more.
+                        return;
+                    }
+
+                    if (Msg->type == ix::WebSocketMessageType::Message)
+                    {
+                        if (!TypedState->bAuthenticated.load())
+                        {
+                            // Should be unreachable -- the Open branch above
+                            // should already have closed anything that gets
+                            // here. If this ever logs, the handshake-race
+                            // regression is back.
+                            UE_LOG(LogGraphBridge, Warning,
+                                TEXT("GraphBridge: dropped a command frame from an unauthenticated connection"));
+                            if (std::shared_ptr<ix::WebSocket> Locked = WeakWebSocket.lock())
+                            {
+                                Locked->close(1008, "Not authenticated");
+                            }
+                            return;
+                        }
+
+                        FString Received = FString(UTF8_TO_TCHAR(Msg->str.c_str()));
+
+                        // IXWebSocket delivers on its own thread — marshal to
+                        // GameThread before touching any UObjects. Capture a
+                        // weak_ptr, not a raw ix::WebSocket* (as this code
+                        // used to): if the client disconnects before this
+                        // task runs, handleUpgrade's local
+                        // shared_ptr<WebSocket> goes out of scope and the
+                        // object is destroyed -- a raw pointer captured here
+                        // would dangle by the time the game thread runs this.
+                        std::weak_ptr<ix::WebSocket> WeakSender = WeakWebSocket;
+                        AsyncTask(ENamedThreads::GameThread, [Received, WeakSender]()
+                        {
+                            // Lock and discard if the connection is gone --
+                            // the only safe way to use a weak_ptr captured
+                            // across the thread hop above.
+                            std::shared_ptr<ix::WebSocket> LockedSender = WeakSender.lock();
+                            if (!LockedSender)
+                            {
+                                return;
+                            }
+
+                            FGraphBridgeCommandContext Context;
+                            Context.CommandString = Received;
+                            Context.Source = FGraphBridgeCommandContext::ESource::WebSocket;
+                            // Safe: LockedSender is a local shared_ptr that
+                            // keeps the object alive for the rest of this
+                            // synchronous call (through ExecuteAtomicCommand
+                            // and any SendResponse it triggers) -- the raw
+                            // pointer never escapes this call stack.
+                            Context.WebSocket = LockedSender.get();
+                            Context.ResultBuffer = nullptr;
+                            ExecuteAtomicCommand(Context);
+                        });
+                    }
+                });
         });
 
     auto Result = Server->listen();
@@ -298,12 +632,25 @@ void UGraphBridgeAutomationLibrary::StopGraphBridgeServer()
     if (!Server) return;
     Server->stop();
     Server.reset();
+
+    // Remove the token this server minted -- a stale token file surviving
+    // past the server that wrote it would let the next session start up
+    // with a wrong-looking-but-present file instead of a clean "no server
+    // running" signal for a client that connects too early.
+    DeleteSessionTokenFromDisk();
+    SessionToken.Empty();
+
     UE_LOG(LogGraphBridge, Log, TEXT("GraphBridge: WebSocket server stopped"));
 }
 
 bool UGraphBridgeAutomationLibrary::IsServerRunning()
 {
     return Server != nullptr;
+}
+
+FString UGraphBridgeAutomationLibrary::GetSessionToken()
+{
+    return SessionToken;
 }
 
 // ---------------------------------------------------------------------------
@@ -351,36 +698,35 @@ bool UGraphBridgeAutomationLibrary::IsMCPServerRunning()
 // Response helper
 // ---------------------------------------------------------------------------
 
-void UGraphBridgeAutomationLibrary::SendResponse(ix::WebSocket* Sender, bool bSuccess,
-    FString Command, FString Message, FString Payload)
+void UGraphBridgeAutomationLibrary::SendResponse(const FGraphBridgeCommandContext& Context, bool bSuccess,
+    const FString& Command, const FString& Message, const FString& Payload)
 {
-    auto Escape = [](FString& S)
+    auto Escape = [](FString S) -> FString
     {
         S.ReplaceInline(TEXT("\\"), TEXT("\\\\"));
         S.ReplaceInline(TEXT("\""), TEXT("\\\""));
         S.ReplaceInline(TEXT("\n"), TEXT("\\n"));
         S.ReplaceInline(TEXT("\r"), TEXT("\\r"));
         S.ReplaceInline(TEXT("\t"), TEXT("\\t"));
+        return S;
     };
-    Escape(Command);
-    Escape(Message);
-    Escape(Payload);
 
     FString Json = FString::Printf(
         TEXT("{\"success\":%s,\"command\":\"%s\",\"message\":\"%s\",\"payload\":\"%s\"}"),
         bSuccess ? TEXT("true") : TEXT("false"),
-        *Command, *Message, *Payload);
+        *Escape(Command), *Escape(Message), *Escape(Payload));
 
-    // Sync capture path — used by DispatchCommandSync / the LLM agentic loop
-    if (GSyncResultCapture)
+    // Write to result buffer if this is a sync (MCP/panel) call
+    if (Context.ResultBuffer)
     {
-        *GSyncResultCapture = Json;
+        *Context.ResultBuffer = Json;
         return;
     }
 
-    if (!Sender) return;
+    // Otherwise send over WebSocket
+    if (!Context.WebSocket) return;
     std::string JsonStr(TCHAR_TO_UTF8(*Json));
-    Sender->send(JsonStr);
+    Context.WebSocket->send(JsonStr);
 }
 
 // ---------------------------------------------------------------------------
@@ -389,29 +735,47 @@ void UGraphBridgeAutomationLibrary::SendResponse(ix::WebSocket* Sender, bool bSu
 
 FString UGraphBridgeAutomationLibrary::DispatchCommandSync(const FString& Command)
 {
-    // GSyncResultCapture is a non-reentrant global — this function must only
-    // ever be called on the game thread, never concurrently.
     check(IsInGameThread());
+
+    FGraphBridgeCommandContext Context;
+    Context.CommandString = Command;
+    Context.Source = FGraphBridgeCommandContext::ESource::RPC;
+
     FString Result;
-    GSyncResultCapture = &Result;
-    ExecuteAtomicCommand(Command, nullptr);
-    GSyncResultCapture = nullptr;
+    Context.ResultBuffer = &Result;
+    Context.WebSocket = nullptr;
+
+    ExecuteAtomicCommand(Context);
     return Result;
 }
 
 // ---------------------------------------------------------------------------
-// Command router
+// Command router (reentrancy-safe via FGraphBridgeCommandContext)
 // ---------------------------------------------------------------------------
 
-void UGraphBridgeAutomationLibrary::ExecuteAtomicCommand(FString Command, ix::WebSocket* Sender)
+void UGraphBridgeAutomationLibrary::ExecuteAtomicCommand(const FGraphBridgeCommandContext& Context)
 {
-    UE_LOG(LogGraphBridge, Log, TEXT("GraphBridge received: %s"), *Command);
+    // Verbose, not Log: a command string can be a RUN_PYTHON source body or
+    // contain arbitrary string literals -- the same disclosure class as the
+    // API key that used to live in project config, since Output Logs get
+    // pasted into bug reports and Discord threads verbatim. Log the
+    // operation verb plus a bounded prefix of the arguments, never the
+    // whole thing at a level anyone leaves enabled by default.
+    {
+        FString LogOp, LogArgs;
+        if (!Context.CommandString.Split(TEXT("|"), &LogOp, &LogArgs))
+        {
+            LogOp = Context.CommandString;
+        }
+        UE_LOG(LogGraphBridge, Verbose, TEXT("GraphBridge [%s] received: %s %s"),
+            *Context.CommandId, *LogOp, *GraphBridgeTruncateForLog(LogArgs));
+    }
 
     TArray<FString> P;
-    Command.ParseIntoArray(P, TEXT("|"));
+    Context.CommandString.ParseIntoArray(P, TEXT("|"));
     if (P.Num() == 0)
     {
-        SendResponse(Sender, false, TEXT(""), TEXT("Empty command"), TEXT(""));
+        SendResponse(Context, false, TEXT(""), TEXT("Empty command"), TEXT(""));
         return;
     }
 
@@ -426,7 +790,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommand(FString Command, ix::We
         FString Result = SpawnNode(P[1], P[2], P[3],
             FCString::Atoi(*P[4]), FCString::Atoi(*P[5]), GraphName);
         bool bOk = !Result.IsEmpty() && !Result.StartsWith(TEXT("ERR:"));
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? FString::Printf(TEXT("Node spawned: %s"), *Result)
                 : (Result.IsEmpty() ? TEXT("Spawn failed") : Result.RightChop(4)),
             bOk ? Result : TEXT(""));
@@ -440,7 +804,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommand(FString Command, ix::We
         FString Result = SpawnEventNode(P[1], P[2], P[3],
             FCString::Atoi(*P[4]), FCString::Atoi(*P[5]));
         bool bOk = !Result.IsEmpty() && !Result.StartsWith(TEXT("ERR:"));
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? FString::Printf(TEXT("Event node spawned: %s"), *Result)
                 : (Result.IsEmpty() ? TEXT("Spawn failed") : Result.RightChop(4)),
             bOk ? Result : TEXT(""));
@@ -451,14 +815,14 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommand(FString Command, ix::We
         FString GraphName = P.Num() >= 7 ? P[6] : TEXT("");
         FString Err = ConnectPins(P[1], P[2], P[3], P[4], P[5], GraphName);
         bool bOk = Err.IsEmpty();
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? TEXT("Pins connected") : Err, TEXT(""));
     }
     else if (Op == TEXT("DISCONNECT_PINS") && P.Num() >= 6)
     {
         FString GraphName = P.Num() >= 7 ? P[6] : TEXT("");
         bool bOk = DisconnectPins(P[1], P[2], P[3], P[4], P[5], GraphName);
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? TEXT("Pins disconnected") : TEXT("Disconnect failed"), TEXT(""));
     }
     else if (Op == TEXT("DELETE_NODE") && P.Num() >= 3)
@@ -467,7 +831,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommand(FString Command, ix::We
         FString GraphName = P.Num() >= 4 ? P[3] : TEXT("");
         FString Err = DeleteNode(P[1], P[2], GraphName);
         bool bOk = Err.IsEmpty();
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? TEXT("Node deleted") : Err, TEXT(""));
     }
     else if (Op == TEXT("CLEAR_NODES") && P.Num() >= 3)
@@ -476,14 +840,14 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommand(FString Command, ix::We
         FString GraphName = P.Num() >= 4 ? P[3] : TEXT("");
         FString Err = ClearNodes(P[1], P[2], GraphName);
         bool bOk = Err.IsEmpty();
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? TEXT("Nodes cleared") : Err, TEXT(""));
     }
     else if (Op == TEXT("SET_PIN_DEFAULT") && P.Num() >= 5)
     {
         FString Err = SetPinDefault(P[1], P[2], P[3], P[4]);
         bool bOk = Err.IsEmpty();
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? TEXT("Default set") : Err, TEXT(""));
     }
     else if (Op == TEXT("ADD_ARRAY_PIN") && P.Num() >= 3)
@@ -498,7 +862,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommand(FString Command, ix::We
         // literal array via MakeArray's own pins is the robust path.
         FString Err = AddArrayPin(P[1], P[2]);
         bool bOk = Err.IsEmpty();
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? TEXT("Array pin added") : Err, TEXT(""));
     }
     else if (Op == TEXT("GET_NODE_PINS") && P.Num() >= 3)
@@ -507,7 +871,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommand(FString Command, ix::We
         FString GraphName = P.Num() >= 4 ? P[3] : TEXT("");
         FString Pins = GetNodePins(P[1], P[2], GraphName);
         bool bOk = !Pins.IsEmpty();
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? TEXT("Pins found") : TEXT("Node not found"), Pins);
     }
     else if (Op == TEXT("GET_PIN_CONNECTIONS") && P.Num() >= 4)
@@ -517,7 +881,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommand(FString Command, ix::We
         // pin is linked to. Empty payload (still success) = no connections.
         FString Result = GetPinConnections(P[1], P[2], P[3]);
         bool bOk = !Result.StartsWith(TEXT("ERR:"));
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? (Result.IsEmpty() ? TEXT("No connections") : TEXT("Connections found")) : Result.RightChop(4),
             bOk ? Result : TEXT(""));
     }
@@ -527,7 +891,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommand(FString Command, ix::We
         // Empty payload (still success) = pin has no default value set.
         FString Result = GetPinDefault(P[1], P[2], P[3]);
         bool bOk = !Result.StartsWith(TEXT("ERR:"));
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? (Result.IsEmpty() ? TEXT("No default set") : TEXT("Default retrieved")) : Result.RightChop(4),
             bOk ? Result : TEXT(""));
     }
@@ -536,20 +900,20 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommand(FString Command, ix::We
         // SET_ANIM_CLASS|BPPath|ComponentName|AnimBPPath
         FString Err = SetAnimClass(P[1], P[2], P[3]);
         bool bOk = Err.IsEmpty();
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? TEXT("AnimClass set and blueprint recompiled") : Err.RightChop(4), TEXT(""));
     }
 
     else if (Op == TEXT("COMPILE") && P.Num() >= 2)
     {
         bool bOk = CompileBlueprint(P[1]);
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? TEXT("Compiled") : TEXT("Compile failed"), TEXT(""));
     }
     else if (Op == TEXT("SAVE_BLUEPRINT") && P.Num() >= 2)
     {
         bool bOk = SaveBlueprint(P[1]);
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? TEXT("Saved") : TEXT("Save failed"), TEXT(""));
     }
     else if (Op == TEXT("SPAWN_VARIABLE") && P.Num() >= 4)
@@ -557,7 +921,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommand(FString Command, ix::We
         FString Category = P.Num() >= 5 ? P[4] : TEXT("Default");
         FString Guid = SpawnVariable(P[1], P[2], P[3], Category);
         bool bOk = !Guid.IsEmpty();
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? FString::Printf(TEXT("Variable '%s' created"), *P[2]) : TEXT("Variable spawn failed"),
             Guid);
     }
@@ -570,7 +934,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommand(FString Command, ix::We
         FString ParentName = P.Num() > 4 ? P[4] : TEXT("");
         FString Err = AddComponent(P[1], P[2], CompName, ParentName);
         bool bOk = Err.IsEmpty();
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? FString::Printf(TEXT("Component added: %s"), *CompName) : Err,
             bOk ? CompName : TEXT(""));
     }
@@ -578,7 +942,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommand(FString Command, ix::We
     else if (Op == TEXT("SET_VARIABLE_DEFAULT") && P.Num() >= 4)
     {
         bool bOk = SetVariableDefault(P[1], P[2], P[3]);
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? TEXT("Default set — remember to COMPILE") : TEXT("Set default failed"), TEXT(""));
     }
     else if (Op == TEXT("LIST_NODES") && P.Num() >= 2)
@@ -588,7 +952,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommand(FString Command, ix::We
         FString GraphName = P.Num() >= 3 ? P[2] : TEXT("");
         FString Results = ListNodes(P[1], GraphName);
         bool bOk = !Results.IsEmpty();
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? TEXT("Nodes listed") : TEXT("No nodes or BP not found"), Results);
     }
 
@@ -596,7 +960,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommand(FString Command, ix::We
     {
         FString Results = FindNodeClass(P[1]);
         bool bOk = !Results.IsEmpty();
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? TEXT("Matches found") : TEXT("No matches"), Results);
     }
     else if (Op == TEXT("LIST_ASSETS"))
@@ -605,13 +969,13 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommand(FString Command, ix::We
         FString Filter = P.Num() >= 2 ? P[1] : TEXT("");
         FString Results = ListAssets(Filter);
         bool bOk = !Results.IsEmpty();
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? TEXT("Assets found") : TEXT("No assets"), Results);
     }
     else if (Op == TEXT("SET_INPUT_ACTION") && P.Num() >= 4)
     {
         bool bOk = SetInputAction(P[1], P[2], P[3]);
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? TEXT("Input action set") : TEXT("Set input action failed"), TEXT(""));
     }
 
@@ -620,7 +984,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommand(FString Command, ix::We
         // SET_FUNCTION_REF|BPPath|NodeId|ClassName|FunctionName
         FString Err = SetFunctionRef(P[1], P[2], P[3], P[4]);
         bool bOk = Err.IsEmpty();
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? TEXT("Function reference set") : Err, TEXT(""));
     }
 
@@ -631,7 +995,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommand(FString Command, ix::We
         // e.g. SET_EVENT_REF|/Game/BP_X.BP_X|<guid>|ReceiveBeginPlay
         FString Err = SetEventRef(P[1], P[2], P[3]);
         bool bOk = Err.IsEmpty();
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? TEXT("Event reference set") : Err, TEXT(""));
     }
 
@@ -650,7 +1014,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommand(FString Command, ix::We
         // instead — this command is what makes that name callable.
         FString Err = SetCustomEventName(P[1], P[2], P[3]);
         bool bOk = Err.IsEmpty();
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? TEXT("Custom event named") : Err, TEXT(""));
     }
 
@@ -660,7 +1024,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommand(FString Command, ix::We
         // Returns the available variable list in the message on failure
         FString VarRefErr;
         bool bOk = SetVariableRef(P[1], P[2], P[3], VarRefErr);
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? TEXT("Variable reference set") : VarRefErr, TEXT(""));
     }
 
@@ -679,7 +1043,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommand(FString Command, ix::We
         // component reference (e.g. a Get CameraBoom node's output).
         FString Err = SetExternalVariableRef(P[1], P[2], P[3], P[4]);
         bool bOk = Err.IsEmpty();
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? TEXT("External variable reference set") : Err, TEXT(""));
     }
 
@@ -698,7 +1062,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommand(FString Command, ix::We
                 bOk = true;
             }
         }
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? TEXT("Blueprint editor closed") : TEXT("Close failed"), TEXT(""));
     }
 
@@ -716,7 +1080,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommand(FString Command, ix::We
                 bOk = true;
             }
         }
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? TEXT("Blueprint editor opened") : TEXT("Open failed"), TEXT(""));
     }
     else if (Op == TEXT("LIST_BLENDSPACES"))
@@ -726,7 +1090,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommand(FString Command, ix::We
         FString BSFilter = P.Num() >= 2 ? P[1] : TEXT("");
         FString Results  = ListBlendSpaces(BSFilter);
         bool bOk = !Results.IsEmpty();
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? TEXT("BlendSpaces found") : TEXT("No BlendSpaces found"), Results);
     }
     else if (Op == TEXT("LIST_ASSET_PROPERTIES") && P.Num() >= 2)
@@ -735,7 +1099,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommand(FString Command, ix::We
         // Returns all editable UPROPERTY names, types and current values.
         FString Result = ListAssetProperties(P[1]);
         bool bOk = !Result.IsEmpty() && !Result.StartsWith(TEXT("ERR:"));
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? TEXT("Properties listed") : (Result.IsEmpty() ? TEXT("Asset not found") : Result.RightChop(4)),
             bOk ? Result : TEXT(""));
     }
@@ -744,7 +1108,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommand(FString Command, ix::We
         // GET_ASSET_PROPERTY|AssetPath|PropertyName
         FString Result = GetAssetProperty(P[1], P[2]);
         bool bOk = !Result.StartsWith(TEXT("ERR:"));
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? TEXT("Property retrieved") : Result.RightChop(4),
             bOk ? Result : TEXT(""));
     }
@@ -757,7 +1121,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommand(FString Command, ix::We
             Value += TEXT("|") + P[i];
         FString Err = SetAssetProperty(P[1], P[2], Value);
         bool bOk = Err.IsEmpty();
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? TEXT("Property set") : Err, TEXT(""));
     }
     // ------------------------------------------------------------------
@@ -769,7 +1133,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommand(FString Command, ix::We
         // Returns JSON with sections, slots and notifies.
         FString Result = GetMontageInfo(P[1]);
         bool bOk = !Result.StartsWith(TEXT("ERR:"));
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? TEXT("Montage info retrieved") : Result.RightChop(4),
             bOk ? Result : TEXT(""));
     }
@@ -778,7 +1142,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommand(FString Command, ix::We
         // ADD_MONTAGE_SECTION|AssetPath|SectionName|StartTimeSeconds
         FString Err = AddMontageSection(P[1], P[2], FCString::Atof(*P[3]));
         bool bOk = Err.IsEmpty();
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? TEXT("Section added") : Err, TEXT(""));
     }
     else if (Op == TEXT("REMOVE_MONTAGE_SECTION") && P.Num() >= 3)
@@ -786,7 +1150,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommand(FString Command, ix::We
         // REMOVE_MONTAGE_SECTION|AssetPath|SectionName
         FString Err = RemoveMontageSection(P[1], P[2]);
         bool bOk = Err.IsEmpty();
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? TEXT("Section removed") : Err, TEXT(""));
     }
     else if (Op == TEXT("SET_MONTAGE_SLOT") && P.Num() >= 4)
@@ -795,7 +1159,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommand(FString Command, ix::We
         // SlotName format:  GroupName.SlotName  e.g. DefaultGroup.UpperBody
         FString Err = SetMontageSlot(P[1], FCString::Atoi(*P[2]), P[3]);
         bool bOk = Err.IsEmpty();
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? TEXT("Slot renamed") : Err, TEXT(""));
     }
     else if (Op == TEXT("ADD_MONTAGE_NOTIFY") && P.Num() >= 4)
@@ -804,7 +1168,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommand(FString Command, ix::We
         // NotifyClass: short name e.g. "AnimNotify_PlaySound", or full path
         FString Err = AddMontageNotify(P[1], P[2], FCString::Atof(*P[3]));
         bool bOk = Err.IsEmpty();
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? TEXT("Notify added") : Err, TEXT(""));
     }
     else if (Op == TEXT("ADD_MONTAGE_NOTIFY_STATE") && P.Num() >= 5)
@@ -815,7 +1179,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommand(FString Command, ix::We
         FString Err = AddMontageNotifyState(
             P[1], P[2], FCString::Atof(*P[3]), FCString::Atof(*P[4]));
         bool bOk = Err.IsEmpty();
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? TEXT("Notify state added") : Err, TEXT(""));
     }
     else if (Op == TEXT("REMOVE_MONTAGE_NOTIFY") && P.Num() >= 3)
@@ -823,7 +1187,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommand(FString Command, ix::We
         // REMOVE_MONTAGE_NOTIFY|AssetPath|NotifyIndex (works for both kinds)
         FString Err = RemoveMontageNotify(P[1], FCString::Atoi(*P[2]));
         bool bOk = Err.IsEmpty();
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? TEXT("Notify removed") : Err, TEXT(""));
     }
     // ------------------------------------------------------------------
@@ -835,7 +1199,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommand(FString Command, ix::We
         // Direction is "in" (entry node) or "out" (result node).
         FString Err = AddFunctionParam(P[1], P[2], P[3], P[4]);
         bool bOk = Err.IsEmpty();
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? TEXT("Function parameter(s) added") : Err.RightChop(4), TEXT(""));
     }
     else if (Op == TEXT("REMOVE_FUNCTION_PARAM") && P.Num() >= 5)
@@ -843,7 +1207,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommand(FString Command, ix::We
         // REMOVE_FUNCTION_PARAM|BPPath|FunctionGraphName|Direction|ParamName
         FString Err = RemoveFunctionParam(P[1], P[2], P[3], P[4]);
         bool bOk = Err.IsEmpty();
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? TEXT("Function parameter removed") : Err.RightChop(4), TEXT(""));
     }
     else if (Op == TEXT("ADD_CUSTOM_EVENT_PARAM") && P.Num() >= 4)
@@ -852,7 +1216,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommand(FString Command, ix::We
         // The event must already be named via SET_CUSTOM_EVENT_NAME.
         FString Err = AddCustomEventParam(P[1], P[2], P[3]);
         bool bOk = Err.IsEmpty();
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? TEXT("Custom event parameter(s) added") : Err.RightChop(4), TEXT(""));
     }
     else if (Op == TEXT("REMOVE_CUSTOM_EVENT_PARAM") && P.Num() >= 4)
@@ -860,7 +1224,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommand(FString Command, ix::We
         // REMOVE_CUSTOM_EVENT_PARAM|BPPath|EventNodeId|ParamName
         FString Err = RemoveCustomEventParam(P[1], P[2], P[3]);
         bool bOk = Err.IsEmpty();
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? TEXT("Custom event parameter removed") : Err.RightChop(4), TEXT(""));
     }
     // ------------------------------------------------------------------
@@ -871,7 +1235,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommand(FString Command, ix::We
         // LIST_DATATABLE_ROWS|AssetPath
         FString Result = ListDataTableRows(P[1]);
         bool bOk = !Result.StartsWith(TEXT("ERR:"));
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? TEXT("Rows listed") : Result.RightChop(4),
             bOk ? Result : TEXT(""));
     }
@@ -882,7 +1246,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommand(FString Command, ix::We
         // to fill individual fields via generic reflection.
         FString Err = AddDataTableRow(P[1], P[2]);
         bool bOk = Err.IsEmpty();
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? TEXT("Row added") : Err, TEXT(""));
     }
     else if (Op == TEXT("DELETE_DATATABLE_ROW") && P.Num() >= 3)
@@ -890,7 +1254,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommand(FString Command, ix::We
         // DELETE_DATATABLE_ROW|AssetPath|RowName
         FString Err = DeleteDataTableRow(P[1], P[2]);
         bool bOk = Err.IsEmpty();
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? TEXT("Row deleted") : Err, TEXT(""));
     }
     else if (Op == TEXT("RENAME_DATATABLE_ROW") && P.Num() >= 4)
@@ -898,7 +1262,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommand(FString Command, ix::We
         // RENAME_DATATABLE_ROW|AssetPath|OldRowName|NewRowName
         FString Err = RenameDataTableRow(P[1], P[2], P[3]);
         bool bOk = Err.IsEmpty();
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? TEXT("Row renamed") : Err, TEXT(""));
     }
     // ------------------------------------------------------------------
@@ -909,7 +1273,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommand(FString Command, ix::We
         // LIST_SKELETON_SOCKETS|SkeletonAssetPath
         FString Result = ListSkeletonSockets(P[1]);
         bool bOk = !Result.StartsWith(TEXT("ERR:"));
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? TEXT("Sockets listed") : Result.RightChop(4),
             bOk ? Result : TEXT(""));
     }
@@ -921,7 +1285,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommand(FString Command, ix::We
         FRotator Rot(FCString::Atof(*P[6]), FCString::Atof(*P[7]), FCString::Atof(*P[8]));
         FString Err = MoveSkeletonSocket(P[1], P[2], Loc, Rot);
         bool bOk = Err.IsEmpty();
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? TEXT("Socket moved") : Err, TEXT(""));
     }
     else if (Op == TEXT("DELETE_SKELETON_SOCKET") && P.Num() >= 3)
@@ -929,7 +1293,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommand(FString Command, ix::We
         // DELETE_SKELETON_SOCKET|SkeletonAssetPath|SocketName
         FString Err = DeleteSkeletonSocket(P[1], P[2]);
         bool bOk = Err.IsEmpty();
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? TEXT("Socket deleted") : Err, TEXT(""));
     }
     // ------------------------------------------------------------------
@@ -942,7 +1306,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommand(FString Command, ix::We
         // Example: CREATE_IMC|/Game/Input/IMC_Default
         FString Err = CreateIMC(P[1]);
         bool bOk = Err.IsEmpty();
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? FString::Printf(TEXT("IMC created at '%s'"), *P[1]) : Err, TEXT(""));
     }
     else if (Op == TEXT("ADD_IMC_MAPPING") && P.Num() >= 4)
@@ -953,7 +1317,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommand(FString Command, ix::We
         FString Mods = P.Num() >= 5 ? P[4] : TEXT("");
         FString Err = AddIMCMapping(P[1], P[2], P[3], Mods);
         bool bOk = Err.IsEmpty();
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? FString::Printf(TEXT("Mapping added: %s -> %s"), *P[3], *P[2]) : Err, TEXT(""));
     }
     else if (Op == TEXT("REMOVE_IMC_MAPPING") && P.Num() >= 4)
@@ -961,7 +1325,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommand(FString Command, ix::We
         // REMOVE_IMC_MAPPING|IMCPath|ActionPath|KeyName
         FString Err = RemoveIMCMapping(P[1], P[2], P[3]);
         bool bOk = Err.IsEmpty();
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? FString::Printf(TEXT("Mapping removed: %s -> %s"), *P[3], *P[2]) : Err, TEXT(""));
     }
     else if (Op == TEXT("LIST_IMC_MAPPINGS") && P.Num() >= 2)
@@ -970,7 +1334,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommand(FString Command, ix::We
         // Returns JSON array of all key-to-action mappings in the IMC.
         FString Result = ListIMCMappings(P[1]);
         bool bOk = !Result.StartsWith(TEXT("ERR:"));
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? TEXT("Mappings listed") : Result.RightChop(4),
             bOk ? Result : TEXT(""));
     }
@@ -979,7 +1343,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommand(FString Command, ix::We
         // SAVE_ASSET|AssetPath
         // Saves any UObject asset to disk. Works on IMC, DataTable, Skeleton, etc.
         bool bOk = SaveAsset(P[1]);
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? TEXT("Asset saved") : TEXT("Save failed — asset may not exist or path is wrong"), TEXT(""));
     }
     else if (Op == TEXT("SET_CHARACTER_MESH") && P.Num() >= 3)
@@ -989,7 +1353,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommand(FString Command, ix::We
         FString CompName = P.Num() >= 4 ? P[3] : TEXT("");
         FString Err = SetCharacterMesh(P[1], P[2], CompName);
         bool bOk = Err.IsEmpty();
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? TEXT("Skeletal mesh set and Blueprint recompiled") : Err, TEXT(""));
     }
     else if (Op == TEXT("SET_CHARACTER_CAPSULE") && P.Num() >= 4)
@@ -1000,7 +1364,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommand(FString Command, ix::We
         FString Err = SetCharacterCapsule(
             P[1], FCString::Atof(*P[2]), FCString::Atof(*P[3]), CompName);
         bool bOk = Err.IsEmpty();
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? TEXT("Capsule dimensions set and Blueprint recompiled") : Err, TEXT(""));
     }
     else if (Op == TEXT("SET_CAMERA_BOOM") && P.Num() >= 6)
@@ -1011,7 +1375,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommand(FString Command, ix::We
         FString CompName = P.Num() >= 7 ? P[6] : TEXT("");
         FString Err = SetCameraBoom(P[1], FCString::Atof(*P[2]), Offset, CompName);
         bool bOk = Err.IsEmpty();
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? TEXT("Camera boom configured and Blueprint recompiled") : Err, TEXT(""));
     }
     else if (Op == TEXT("ADD_IMC_TO_CHARACTER") && P.Num() >= 3)
@@ -1023,7 +1387,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommand(FString Command, ix::We
         int32 Priority = P.Num() >= 4 ? FCString::Atoi(*P[3]) : 0;
         FString Result = AddIMCToCharacter(P[1], P[2], Priority);
         bool bOk = !Result.StartsWith(TEXT("ERR:"));
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? FString::Printf(
                 TEXT("IMC wired in BeginPlay — AddMappingContext GUID: %s"), *Result)
                 : Result.RightChop(4),
@@ -1035,7 +1399,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommand(FString Command, ix::We
         // Sets DefaultPawnClass on the GameMode Blueprint's CDO and recompiles.
         FString Err = SetGameModePawn(P[1], P[2]);
         bool bOk = Err.IsEmpty();
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? TEXT("DefaultPawnClass set — Blueprint recompiled") : Err, TEXT(""));
     }
     else if (Op == TEXT("GET_CURRENT_GAMEMODE"))
@@ -1044,7 +1408,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommand(FString Command, ix::We
         // Returns JSON: {"world":"<LevelName>","gameMode":"<ClassPath>"}
         FString Result = GetCurrentGameMode();
         bool bOk = !Result.StartsWith(TEXT("ERR:"));
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? TEXT("GameMode retrieved") : Result.RightChop(4),
             bOk ? Result : TEXT(""));
     }
@@ -1054,7 +1418,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommand(FString Command, ix::We
         // Returns JSON array of PlayerStart actors in the current editor level.
         FString Result = GetPlayerStart();
         bool bOk = !Result.StartsWith(TEXT("ERR:"));
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? TEXT("Player starts listed") : Result.RightChop(4),
             bOk ? Result : TEXT(""));
     }
@@ -1065,7 +1429,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommand(FString Command, ix::We
         // Save the level afterward to persist (File > Save Current Level).
         FString Err = SetLevelGameMode(P[1]);
         bool bOk = Err.IsEmpty();
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? TEXT("Level GameMode set — save the level to persist the change") : Err, TEXT(""));
     }
     else if (Op == TEXT("SET_CAST_TARGET") && P.Num() >= 4)
@@ -1076,7 +1440,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommand(FString Command, ix::We
         // e.g. "/Game/Characters/BP_Hero.BP_Hero_C"
         FString Err = SetCastTarget(P[1], P[2], P[3]);
         bool bOk = Err.IsEmpty();
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? FString::Printf(TEXT("Cast target set to '%s' — pins rebuilt"), *P[3]) : Err,
             TEXT(""));
     }
@@ -1088,7 +1452,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommand(FString Command, ix::We
         // ReturnValue is typed as the requested subsystem class.
         FString Err = SetSubsystemClass(P[1], P[2], P[3]);
         bool bOk = Err.IsEmpty();
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? FString::Printf(TEXT("Subsystem class set to '%s' — pins rebuilt"), *P[3]) : Err,
             TEXT(""));
     }
@@ -1100,7 +1464,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommand(FString Command, ix::We
         FString Category = P.Num() > 4 ? P[4] : TEXT("");
         FString Result = AddVariable(P[1], P[2], P[3], Category);
         bool bOk = !Result.IsEmpty() && !Result.StartsWith(TEXT("ERR:"));
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? FString::Printf(TEXT("Variable '%s' created"), *Result)
                 : (Result.IsEmpty() ? TEXT("Add variable failed") : Result.RightChop(4)),
             bOk ? Result : TEXT(""));
@@ -1110,19 +1474,19 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommand(FString Command, ix::We
         // See ExecuteAtomicCommandExtended's declaration comment: this chain
         // hit MSVC's C1061 nesting-depth limit, split here purely to shorten
         // it -- no logic moved, just relocated.
-        ExecuteAtomicCommandExtended(Command, Op, P, Sender);
+        ExecuteAtomicCommandExtended(Context, Op, P);
     }
 
 #else
-    SendResponse(Sender, false, Op, TEXT("GraphBridge commands require an editor build"), TEXT(""));
+    SendResponse(Context, false, Op, TEXT("GraphBridge commands require an editor build"), TEXT(""));
 #endif
 }
 
 // ---------------------------------------------------------------------------
 // Command router, part 2 — see ExecuteAtomicCommandExtended's header comment.
 // ---------------------------------------------------------------------------
-void UGraphBridgeAutomationLibrary::ExecuteAtomicCommandExtended(const FString& Command, const FString& Op,
-    const TArray<FString>& P, ix::WebSocket* Sender)
+void UGraphBridgeAutomationLibrary::ExecuteAtomicCommandExtended(const FGraphBridgeCommandContext& Context, const FString& Op,
+    const TArray<FString>& P)
 {
 #if WITH_EDITOR
     if (Op == TEXT("SET_VARIABLE_TYPE") && P.Num() >= 4)
@@ -1131,7 +1495,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommandExtended(const FString& 
         // Retypes an existing Blueprint member variable.
         FString Err = SetVariableType(P[1], P[2], P[3]);
         bool bOk = Err.IsEmpty();
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? FString::Printf(TEXT("Variable '%s' retyped to '%s'"), *P[2], *P[3]) : Err,
             TEXT(""));
     }
@@ -1141,22 +1505,45 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommandExtended(const FString& 
         // Returns pipe-delimited: VarName~PinCategory~PinSubCategory
         FString Result = ListVariables(P[1]);
         bool bOk = !Result.StartsWith(TEXT("ERR:"));
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? TEXT("Variables listed") : Result.RightChop(4),
             bOk ? Result : TEXT(""));
     }
     else if (Op == TEXT("RUN_PYTHON") && P.Num() >= 2)
     {
         // RUN_PYTHON|PythonCode
-        // Joins remaining pipe segments back (code may contain pipes)
-        FString Code = P[1];
-        for (int32 i = 2; i < P.Num(); i++)
-            Code += TEXT("|") + P[i];
-        FString Result = RunPython(Code);
-        bool bOk = !Result.StartsWith(TEXT("ERR:"));
-        SendResponse(Sender, bOk, Op,
-            bOk ? TEXT("Python executed") : Result,
-            bOk ? Result : TEXT(""));
+        // Off by default: any bridge client (any process running as this
+        // user, not just our own scripts -- see README.md's Security
+        // section) can otherwise execute arbitrary Python in the editor
+        // process. Gated here at the dispatch boundary, not only by hiding
+        // the control in the panel, so every entry point (WebSocket, MCP,
+        // Panel, RPC) is covered.
+        // TODO(next commit): read from UGraphBridgeSettings::bAllowRunPython
+        // once the Project Settings toggle lands alongside the credential
+        // store commit; this raw ini read is the same off-by-default gate,
+        // just without a UI checkbox yet.
+        bool bAllowRunPython = false;
+        GConfig->GetBool(TEXT("GraphBridge"), TEXT("AllowRunPython"), bAllowRunPython, GEditorIni);
+        if (!bAllowRunPython)
+        {
+            SendResponse(Context, false, Op,
+                TEXT("ERR: RUN_PYTHON is disabled. Enable it in Project Settings -> Plugins -> ")
+                TEXT("GraphBridge AI (off by default -- it lets any bridge client run arbitrary ")
+                TEXT("Python in the editor process)."),
+                TEXT(""));
+        }
+        else
+        {
+            // Joins remaining pipe segments back (code may contain pipes)
+            FString Code = P[1];
+            for (int32 i = 2; i < P.Num(); i++)
+                Code += TEXT("|") + P[i];
+            FString Result = RunPython(Code);
+            bool bOk = !Result.StartsWith(TEXT("ERR:"));
+            SendResponse(Context,bOk, Op,
+                bOk ? Result : Result.RightChop(4),
+                bOk ? Result : TEXT(""));
+        }
     }
     else if (Op == TEXT("GET_COMPILE_ERRORS") && P.Num() >= 2)
     {
@@ -1165,7 +1552,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommandExtended(const FString& 
         // "CLEAN". Distinct from COMPILE — this is the diagnostic version.
         FString Result = GetCompileErrors(P[1]);
         bool bOk = !Result.StartsWith(TEXT("ERR:"));
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? (Result == TEXT("CLEAN") ? TEXT("Compiled clean") : TEXT("Compile issues found"))
                 : Result.RightChop(4),
             bOk ? Result : TEXT(""));
@@ -1177,7 +1564,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommandExtended(const FString& 
         // "Actor", "Pawn", "ActorComponent", "GameModeBase", "PlayerController"
         FString Result = CreateBlueprint(P[1], P[2]);
         bool bOk = !Result.StartsWith(TEXT("ERR:"));
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? FString::Printf(TEXT("Blueprint created at '%s'"), *Result) : Result.RightChop(4),
             bOk ? Result : TEXT(""));
     }
@@ -1189,7 +1576,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommandExtended(const FString& 
         // CREATE_FUNCTION|BPPath|FunctionName
         FString Result = CreateFunction(P[1], P[2]);
         bool bOk = !Result.StartsWith(TEXT("ERR:"));
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? FString::Printf(TEXT("Function '%s' created"), *Result) : Result.RightChop(4),
             bOk ? Result : TEXT(""));
     }
@@ -1199,7 +1586,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommandExtended(const FString& 
         FString Result = SpawnNodeInGraph(P[1], P[2], P[3], P[4],
             FCString::Atoi(*P[5]), FCString::Atoi(*P[6]));
         bool bOk = !Result.IsEmpty() && !Result.StartsWith(TEXT("ERR:"));
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? FString::Printf(TEXT("Node spawned: %s"), *Result)
                 : (Result.IsEmpty() ? TEXT("Spawn failed") : Result.RightChop(4)),
             bOk ? Result : TEXT(""));
@@ -1209,7 +1596,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommandExtended(const FString& 
         // SET_NODE_POSITION|BPPath|NodeGUID|X|Y
         FString Err = SetNodePosition(P[1], P[2], FCString::Atoi(*P[3]), FCString::Atoi(*P[4]));
         bool bOk = Err.IsEmpty();
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? TEXT("Node position set") : Err.RightChop(4), TEXT(""));
     }
     else if (Op == TEXT("CREATE_INPUT_ACTION") && P.Num() >= 3)
@@ -1217,7 +1604,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommandExtended(const FString& 
         // CREATE_INPUT_ACTION|AssetPath|ValueType
         FString Result = CreateInputAction(P[1], P[2]);
         bool bOk = !Result.StartsWith(TEXT("ERR:"));
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? FString::Printf(TEXT("InputAction created at '%s'"), *Result) : Result.RightChop(4),
             bOk ? Result : TEXT(""));
     }
@@ -1227,7 +1614,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommandExtended(const FString& 
         FString Result = SpawnActorInLevel(P[1],
             FCString::Atof(*P[2]), FCString::Atof(*P[3]), FCString::Atof(*P[4]), FCString::Atof(*P[5]));
         bool bOk = !Result.StartsWith(TEXT("ERR:"));
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? FString::Printf(TEXT("Actor spawned: '%s'"), *Result) : Result.RightChop(4),
             bOk ? Result : TEXT(""));
     }
@@ -1237,7 +1624,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommandExtended(const FString& 
         FString Filter = P.Num() >= 2 ? P[1] : TEXT("");
         FString Results = ListLevelActors(Filter);
         bool bOk = !Results.StartsWith(TEXT("ERR:"));
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? TEXT("Actors listed") : Results.RightChop(4),
             bOk ? Results : TEXT(""));
     }
@@ -1252,7 +1639,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommandExtended(const FString& 
             P.Num() >= 11 ? FCString::Atof(*P[10]) : 1.0f);
         FString Err = SetActorTransform(P[1], Loc, Rot, Scale);
         bool bOk = Err.IsEmpty();
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? TEXT("Actor transform set") : Err.RightChop(4), TEXT(""));
     }
     else if (Op == TEXT("DELETE_LEVEL_ACTOR") && P.Num() >= 2)
@@ -1260,7 +1647,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommandExtended(const FString& 
         // DELETE_LEVEL_ACTOR|ActorLabel
         FString Err = DeleteLevelActor(P[1]);
         bool bOk = Err.IsEmpty();
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? TEXT("Actor deleted") : Err.RightChop(4), TEXT(""));
     }
     // ------------------------------------------------------------------
@@ -1271,7 +1658,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommandExtended(const FString& 
         // CREATE_WIDGET_BLUEPRINT|AssetPath
         FString Result = CreateWidgetBlueprint(P[1]);
         bool bOk = !Result.StartsWith(TEXT("ERR:"));
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? FString::Printf(TEXT("Widget Blueprint created at '%s'"), *Result) : Result.RightChop(4),
             bOk ? Result : TEXT(""));
     }
@@ -1281,7 +1668,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommandExtended(const FString& 
         FString Result = AddWidgetElement(P[1], P[2], P[3],
             FCString::Atoi(*P[4]), FCString::Atoi(*P[5]), FCString::Atoi(*P[6]), FCString::Atoi(*P[7]));
         bool bOk = !Result.StartsWith(TEXT("ERR:"));
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? FString::Printf(TEXT("Widget element '%s' added"), *Result) : Result.RightChop(4),
             bOk ? Result : TEXT(""));
     }
@@ -1294,7 +1681,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommandExtended(const FString& 
             Text += TEXT("|") + P[i];
         FString Err = SetWidgetText(P[1], P[2], Text);
         bool bOk = Err.IsEmpty();
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? TEXT("Widget text set") : Err.RightChop(4), TEXT(""));
     }
     else if (Op == TEXT("CREATE_MATERIAL") && P.Num() >= 3)
@@ -1302,7 +1689,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommandExtended(const FString& 
         // CREATE_MATERIAL|AssetPath|BlendMode
         FString Result = CreateMaterial(P[1], P[2]);
         bool bOk = !Result.StartsWith(TEXT("ERR:"));
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? FString::Printf(TEXT("Material created at '%s'"), *Result) : Result.RightChop(4),
             bOk ? Result : TEXT(""));
     }
@@ -1311,7 +1698,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommandExtended(const FString& 
         // ADD_MATERIAL_NODE|MaterialPath|NodeType|X|Y
         FString Result = AddMaterialNode(P[1], P[2], FCString::Atoi(*P[3]), FCString::Atoi(*P[4]));
         bool bOk = !Result.StartsWith(TEXT("ERR:"));
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? FString::Printf(TEXT("Material node added at index %s"), *Result) : Result.RightChop(4),
             bOk ? Result : TEXT(""));
     }
@@ -1320,7 +1707,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommandExtended(const FString& 
         // CONNECT_MATERIAL_PINS|MaterialPath|NodeIndexA|OutputPin|NodeIndexB|InputPin
         FString Err = ConnectMaterialPins(P[1], FCString::Atoi(*P[2]), P[3], FCString::Atoi(*P[4]), P[5]);
         bool bOk = Err.IsEmpty();
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? TEXT("Material pins connected") : Err.RightChop(4), TEXT(""));
     }
     else if (Op == TEXT("SET_MATERIAL_RESULT") && P.Num() >= 5)
@@ -1328,7 +1715,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommandExtended(const FString& 
         // SET_MATERIAL_RESULT|MaterialPath|Channel|NodeIndex|OutputPin
         FString Err = SetMaterialResult(P[1], P[2], FCString::Atoi(*P[3]), P[4]);
         bool bOk = Err.IsEmpty();
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? TEXT("Material result connected") : Err.RightChop(4), TEXT(""));
     }
     else if (Op == TEXT("COMPILE_MATERIAL") && P.Num() >= 2)
@@ -1336,7 +1723,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommandExtended(const FString& 
         // COMPILE_MATERIAL|MaterialPath
         FString Result = CompileMaterial(P[1]);
         bool bOk = !Result.StartsWith(TEXT("ERR:"));
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? (Result == TEXT("CLEAN") ? TEXT("Compiled clean") : TEXT("Compile errors found"))
                 : Result.RightChop(4),
             bOk ? Result : TEXT(""));
@@ -1358,7 +1745,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommandExtended(const FString& 
                 bOk = true;
             }
         }
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? TEXT("Material editor closed") : TEXT("Close failed"), TEXT(""));
     }
     else if (Op == TEXT("CREATE_ENUM") && P.Num() >= 3)
@@ -1366,7 +1753,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommandExtended(const FString& 
         // CREATE_ENUM|AssetPath|Name1,Name2,Name3,...
         FString Result = CreateEnum(P[1], P[2]);
         bool bOk = !Result.StartsWith(TEXT("ERR:"));
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? FString::Printf(TEXT("Enum created at '%s'"), *Result) : Result.RightChop(4),
             bOk ? Result : TEXT(""));
     }
@@ -1375,7 +1762,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommandExtended(const FString& 
         // CREATE_STRUCT|AssetPath
         FString Result = CreateStruct(P[1]);
         bool bOk = !Result.StartsWith(TEXT("ERR:"));
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? FString::Printf(TEXT("Struct created at '%s'"), *Result) : Result.RightChop(4),
             bOk ? Result : TEXT(""));
     }
@@ -1384,7 +1771,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommandExtended(const FString& 
         // ADD_STRUCT_MEMBER|StructAssetPath|MemberName|MemberType
         FString Err = AddStructMember(P[1], P[2], P[3]);
         bool bOk = Err.IsEmpty();
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? TEXT("Struct member added") : Err.RightChop(4), TEXT(""));
     }
     else if (Op == TEXT("CREATE_FUNCTION_LIBRARY") && P.Num() >= 2)
@@ -1392,7 +1779,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommandExtended(const FString& 
         // CREATE_FUNCTION_LIBRARY|AssetPath
         FString Result = CreateFunctionLibrary(P[1]);
         bool bOk = !Result.StartsWith(TEXT("ERR:"));
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? FString::Printf(TEXT("Function Library created at '%s'"), *Result) : Result.RightChop(4),
             bOk ? Result : TEXT(""));
     }
@@ -1401,7 +1788,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommandExtended(const FString& 
         // ADD_LOCAL_VARIABLE|BPPath|FunctionGraphName|VarName|VarType|DefaultValue
         FString Err = AddLocalVariable(P[1], P[2], P[3], P[4], P[5]);
         bool bOk = Err.IsEmpty();
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? TEXT("Local variable added") : Err.RightChop(4), TEXT(""));
     }
     else if (Op == TEXT("SET_VARIABLE_METADATA") && P.Num() >= 5)
@@ -1409,7 +1796,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommandExtended(const FString& 
         // SET_VARIABLE_METADATA|BPPath|VarName|MetaKey|MetaValue
         FString Err = SetVariableMetadata(P[1], P[2], P[3], P[4]);
         bool bOk = Err.IsEmpty();
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? TEXT("Variable metadata set") : Err.RightChop(4), TEXT(""));
     }
     else if (Op == TEXT("CREATE_EVENT_DISPATCHER") && P.Num() >= 3)
@@ -1418,7 +1805,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommandExtended(const FString& 
         FString Params = P.Num() >= 4 ? P[3] : TEXT("");
         FString Err = CreateEventDispatcher(P[1], P[2], Params);
         bool bOk = Err.IsEmpty();
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? TEXT("Event dispatcher created") : Err.RightChop(4), TEXT(""));
     }
     else if (Op == TEXT("CREATE_STATE_MACHINE") && P.Num() >= 6)
@@ -1426,7 +1813,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommandExtended(const FString& 
         // CREATE_STATE_MACHINE|BPPath|GraphName|StateMachineName|X|Y
         FString Result = CreateStateMachine(P[1], P[2], P[3], FCString::Atoi(*P[4]), FCString::Atoi(*P[5]));
         bool bOk = !Result.StartsWith(TEXT("ERR:"));
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? FString::Printf(TEXT("State machine node spawned: %s"), *Result) : Result.RightChop(4),
             bOk ? Result : TEXT(""));
     }
@@ -1435,7 +1822,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommandExtended(const FString& 
         // ADD_ANIM_STATE|BPPath|StateMachineNodeGUID|StateName|X|Y
         FString Result = AddAnimState(P[1], P[2], P[3], FCString::Atoi(*P[4]), FCString::Atoi(*P[5]));
         bool bOk = !Result.StartsWith(TEXT("ERR:"));
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? FString::Printf(TEXT("State node spawned: %s"), *Result) : Result.RightChop(4),
             bOk ? Result : TEXT(""));
     }
@@ -1444,7 +1831,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommandExtended(const FString& 
         // ADD_ANIM_TRANSITION|BPPath|StateMachineNodeGUID|FromStateGUID|ToStateGUID
         FString Result = AddAnimTransition(P[1], P[2], P[3], P[4]);
         bool bOk = !Result.StartsWith(TEXT("ERR:"));
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? FString::Printf(TEXT("Transition node spawned: %s"), *Result) : Result.RightChop(4),
             bOk ? Result : TEXT(""));
     }
@@ -1453,7 +1840,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommandExtended(const FString& 
         // LIST_ANIM_STATES|BPPath|StateMachineNodeGUID
         FString Result = ListAnimStates(P[1], P[2]);
         bool bOk = !Result.StartsWith(TEXT("ERR:"));
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? TEXT("States listed") : Result.RightChop(4),
             bOk ? Result : TEXT(""));
     }
@@ -1462,7 +1849,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommandExtended(const FString& 
         // GET_ANIM_STATE_TRANSITIONS|BPPath|StateNodeGUID
         FString Result = GetAnimStateTransitions(P[1], P[2]);
         bool bOk = !Result.StartsWith(TEXT("ERR:"));
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? TEXT("Transitions listed") : Result.RightChop(4),
             bOk ? Result : TEXT(""));
     }
@@ -1470,14 +1857,17 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommandExtended(const FString& 
     {
         // GET_ANIM_NODE_PINS|BPPath|NodeGUID
         FString Result = GetAnimNodePins(P[1], P[2]);
-        SendResponse(Sender, true, Op, TEXT("Pins found"), Result);
+        bool bOk = !Result.IsEmpty();
+        SendResponse(Context, bOk, Op,
+            bOk ? TEXT("Pins found") : TEXT("Node not found"),
+            bOk ? Result : TEXT(""));
     }
     else if (Op == TEXT("CONNECT_ANIM_PINS") && P.Num() >= 6)
     {
         // CONNECT_ANIM_PINS|BPPath|NodeGUIDA|PinNameA|NodeGUIDB|PinNameB
         FString Result = ConnectAnimPins(P[1], P[2], P[3], P[4], P[5]);
         bool bOk = Result.IsEmpty();
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? TEXT("Anim pins connected") : Result.RightChop(4),
             TEXT(""));
     }
@@ -1486,7 +1876,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommandExtended(const FString& 
         // LIST_ANIM_GRAPH_NODES|BPPath|GraphName
         FString Result = ListAnimGraphNodes(P[1], P[2]);
         bool bOk = !Result.StartsWith(TEXT("ERR:"));
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? TEXT("Anim graph nodes listed") : Result.RightChop(4),
             bOk ? Result : TEXT(""));
     }
@@ -1495,7 +1885,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommandExtended(const FString& 
         // LIST_STATE_GRAPH_NODES|BPPath|StateOrTransitionGUID
         FString Result = ListStateGraphNodes(P[1], P[2]);
         bool bOk = !Result.StartsWith(TEXT("ERR:"));
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? TEXT("State graph nodes listed") : Result.RightChop(4),
             bOk ? Result : TEXT(""));
     }
@@ -1504,7 +1894,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommandExtended(const FString& 
         // SPAWN_NODE_ANCHORED|BPPath|AnchorNodeGUID|NodeClass|Comment|X|Y
         FString Result = SpawnNodeAnchored(P[1], P[2], P[3], P[4], FCString::Atoi(*P[5]), P.Num() >= 7 ? FCString::Atoi(*P[6]) : 0);
         bool bOk = !Result.StartsWith(TEXT("ERR:"));
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? FString::Printf(TEXT("Node spawned: %s"), *Result) : Result.RightChop(4),
             bOk ? Result : TEXT(""));
     }
@@ -1513,7 +1903,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommandExtended(const FString& 
         // CREATE_BLEND_SPACE_PLAYER_ANCHORED|BPPath|AnchorNodeGUID|BlendSpaceAssetPath|X|Y
         FString Result = CreateBlendSpacePlayerAnchored(P[1], P[2], P[3], FCString::Atoi(*P[4]), FCString::Atoi(*P[5]));
         bool bOk = !Result.StartsWith(TEXT("ERR:"));
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? FString::Printf(TEXT("BlendSpacePlayer spawned: %s"), *Result) : Result.RightChop(4),
             bOk ? Result : TEXT(""));
     }
@@ -1522,7 +1912,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommandExtended(const FString& 
         // SET_TRANSITION_CONDITION|BPPath|TransitionNodeGUID|VarName|bNegate(0/1)
         FString Result = SetTransitionCondition(P[1], P[2], P[3], FCString::Atoi(*P[4]) != 0);
         bool bOk = Result.IsEmpty();
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? TEXT("Transition condition set") : Result.RightChop(4),
             TEXT(""));
     }
@@ -1531,7 +1921,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommandExtended(const FString& 
         // ADD_ANIM_SLOT_NODE|BPPath|GraphName|SlotName|X|Y
         FString Result = AddAnimSlotNode(P[1], P[2], P[3], FCString::Atoi(*P[4]), FCString::Atoi(*P[5]));
         bool bOk = !Result.StartsWith(TEXT("ERR:"));
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? FString::Printf(TEXT("Slot node spawned: %s"), *Result) : Result.RightChop(4),
             bOk ? Result : TEXT(""));
     }
@@ -1540,7 +1930,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommandExtended(const FString& 
         // CREATE_NIAGARA_SYSTEM|AssetPath
         FString Result = CreateNiagaraSystem(P[1]);
         bool bOk = !Result.StartsWith(TEXT("ERR:"));
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? FString::Printf(TEXT("Niagara System created at '%s'"), *Result) : Result.RightChop(4),
             bOk ? Result : TEXT(""));
     }
@@ -1549,7 +1939,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommandExtended(const FString& 
         // CREATE_NIAGARA_EMITTER|AssetPath
         FString Result = CreateNiagaraEmitter(P[1]);
         bool bOk = !Result.StartsWith(TEXT("ERR:"));
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? FString::Printf(TEXT("Niagara Emitter created at '%s'"), *Result) : Result.RightChop(4),
             bOk ? Result : TEXT(""));
     }
@@ -1558,7 +1948,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommandExtended(const FString& 
         // LIST_NIAGARA_MODULES|SystemAssetPath|EmitterName
         FString Result = ListNiagaraModules(P[1], P[2]);
         bool bOk = !Result.StartsWith(TEXT("ERR:"));
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? TEXT("Modules listed") : Result.RightChop(4),
             bOk ? Result : TEXT(""));
     }
@@ -1567,7 +1957,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommandExtended(const FString& 
         // SET_NIAGARA_MODULE_INPUT|SystemAssetPath|EmitterName|ModuleName|InputName|Value
         FString Err = SetNiagaraModuleInput(P[1], P[2], P[3], P[4], P[5]);
         bool bOk = Err.IsEmpty();
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? TEXT("Module input set") : Err.RightChop(4), TEXT(""));
     }
     else if (Op == TEXT("CREATE_PHYSICS_ASSET") && P.Num() >= 4)
@@ -1576,7 +1966,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommandExtended(const FString& 
         bool bSetToMesh = P[3].ToBool();
         FString Result = CreatePhysicsAsset(P[1], P[2], bSetToMesh);
         bool bOk = !Result.StartsWith(TEXT("ERR:"));
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? FString::Printf(TEXT("Physics Asset created at '%s'"), *Result) : Result.RightChop(4),
             bOk ? Result : TEXT(""));
     }
@@ -1585,7 +1975,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommandExtended(const FString& 
         // CREATE_IK_RIG|AssetPath|SkeletalMeshPath
         FString Result = CreateIKRig(P[1], P[2]);
         bool bOk = !Result.StartsWith(TEXT("ERR:"));
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? FString::Printf(TEXT("IK Rig created at '%s'"), *Result) : Result.RightChop(4),
             bOk ? Result : TEXT(""));
     }
@@ -1594,7 +1984,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommandExtended(const FString& 
         // IK_RIG_AUTO_SETUP|IKRigAssetPath
         FString Err = IKRigAutoSetup(P[1]);
         bool bOk = Err.IsEmpty();
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? TEXT("IK Rig auto setup applied") : Err.RightChop(4), TEXT(""));
     }
     else if (Op == TEXT("ADD_IK_GOAL") && P.Num() >= 4)
@@ -1602,7 +1992,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommandExtended(const FString& 
         // ADD_IK_GOAL|IKRigAssetPath|GoalName|BoneName
         FString Err = AddIKGoal(P[1], P[2], P[3]);
         bool bOk = Err.IsEmpty();
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? TEXT("IK Goal added") : Err.RightChop(4), TEXT(""));
     }
     else if (Op == TEXT("ADD_RETARGET_CHAIN") && P.Num() >= 6)
@@ -1610,7 +2000,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommandExtended(const FString& 
         // ADD_RETARGET_CHAIN|IKRigAssetPath|ChainName|StartBone|EndBone|GoalName
         FString Err = AddRetargetChain(P[1], P[2], P[3], P[4], P[5]);
         bool bOk = Err.IsEmpty();
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? TEXT("Retarget chain added") : Err.RightChop(4), TEXT(""));
     }
     else if (Op == TEXT("CREATE_IK_RETARGETER") && P.Num() >= 4)
@@ -1618,7 +2008,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommandExtended(const FString& 
         // CREATE_IK_RETARGETER|AssetPath|SourceIKRigPath|TargetIKRigPath
         FString Result = CreateIKRetargeter(P[1], P[2], P[3]);
         bool bOk = !Result.StartsWith(TEXT("ERR:"));
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? FString::Printf(TEXT("IK Retargeter created at '%s'"), *Result) : Result.RightChop(4),
             bOk ? Result : TEXT(""));
     }
@@ -1628,7 +2018,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommandExtended(const FString& 
         FString AnimSeq = P.Num() >= 4 ? P[3] : TEXT("");
         FString Result = CreateAnimMontage(P[1], P[2], AnimSeq);
         bool bOk = !Result.StartsWith(TEXT("ERR:"));
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? FString::Printf(TEXT("Anim Montage created at '%s'"), *Result) : Result.RightChop(4),
             bOk ? Result : TEXT(""));
     }
@@ -1637,7 +2027,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommandExtended(const FString& 
         // GET_ANIM_PIN_CONNECTIONS|BPPath|NodeGUID|PinName
         FString Result = GetAnimPinConnections(P[1], P[2], P[3]);
         bool bOk = !Result.StartsWith(TEXT("ERR:"));
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? TEXT("Pin connections listed") : Result.RightChop(4),
             bOk ? Result : TEXT(""));
     }
@@ -1646,7 +2036,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommandExtended(const FString& 
         // EDIT_BLEND_SPACE_SAMPLE|BlendSpaceAssetPath|AnimSequencePath|NewX|NewY
         FString Result = EditBlendSpaceSample(P[1], P[2], FCString::Atof(*P[3]), FCString::Atof(*P[4]));
         bool bOk = Result.IsEmpty();
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? TEXT("Sample repositioned") : Result.RightChop(4),
             TEXT(""));
     }
@@ -1655,7 +2045,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommandExtended(const FString& 
         // SET_BLEND_SPACE_PLAYER_ASSET|BPPath|NodeGUID|BlendSpaceAssetPath
         FString Result = SetBlendSpacePlayerAsset(P[1], P[2], P[3]);
         bool bOk = Result.IsEmpty();
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? TEXT("BlendSpacePlayer asset set") : Result.RightChop(4),
             TEXT(""));
     }
@@ -1664,7 +2054,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommandExtended(const FString& 
         // ADD_BLEND_SPACE_SAMPLE|BlendSpaceAssetPath|AnimSequencePath|X|Y
         FString Result = AddBlendSpaceSample(P[1], P[2], FCString::Atof(*P[3]), FCString::Atof(*P[4]));
         bool bOk = !Result.StartsWith(TEXT("ERR:"));
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? FString::Printf(TEXT("Sample added at index %s"), *Result) : Result.RightChop(4),
             bOk ? Result : TEXT(""));
     }
@@ -1673,7 +2063,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommandExtended(const FString& 
         // CREATE_BLEND_SPACE|AssetPath|SkeletonPath
         FString Result = CreateBlendSpace(P[1], P[2]);
         bool bOk = !Result.StartsWith(TEXT("ERR:"));
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? FString::Printf(TEXT("BlendSpace created at '%s'"), *Result) : Result.RightChop(4),
             bOk ? Result : TEXT(""));
     }
@@ -1683,7 +2073,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommandExtended(const FString& 
         FString Err = AddSkeletonSocket(P[1], P[2], P[3],
             FCString::Atof(*P[4]), FCString::Atof(*P[5]), FCString::Atof(*P[6]));
         bool bOk = Err.IsEmpty();
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? TEXT("Skeleton socket added") : Err.RightChop(4), TEXT(""));
     }
     // ------------------------------------------------------------------
@@ -1695,7 +2085,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommandExtended(const FString& 
         // Returns pipe-delimited "GraphName~GraphType" entries.
         FString Result = ListGraphs(P[1]);
         bool bOk = !Result.StartsWith(TEXT("ERR:"));
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? TEXT("Graphs listed") : Result.RightChop(4),
             bOk ? Result : TEXT(""));
     }
@@ -1704,7 +2094,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommandExtended(const FString& 
         // CREATE_FUNCTION_GRAPH|BPPath|FunctionName
         FString Result = CreateFunctionGraph(P[1], P[2]);
         bool bOk = !Result.StartsWith(TEXT("ERR:"));
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? FString::Printf(TEXT("Function graph '%s' created"), *P[2]) : Result.RightChop(4),
             bOk ? Result : TEXT(""));
     }
@@ -1713,7 +2103,7 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommandExtended(const FString& 
         // CREATE_MACRO_GRAPH|BPPath|MacroName
         FString Result = CreateMacroGraph(P[1], P[2]);
         bool bOk = !Result.StartsWith(TEXT("ERR:"));
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? FString::Printf(TEXT("Macro graph '%s' created"), *P[2]) : Result.RightChop(4),
             bOk ? Result : TEXT(""));
     }
@@ -1739,19 +2129,19 @@ void UGraphBridgeAutomationLibrary::ExecuteAtomicCommandExtended(const FString& 
 
         FString Result = CaptureView(Target, Focus, Distance, Yaw, Pitch, Res, Mode, Angles, PinPose);
         bool bOk = !Result.StartsWith(TEXT("ERR:"));
-        SendResponse(Sender, bOk, Op,
+        SendResponse(Context,bOk, Op,
             bOk ? TEXT("Scene captured") : Result.RightChop(4),
             bOk ? Result : TEXT(""));
     }
     else
     {
-        UE_LOG(LogGraphBridge, Warning, TEXT("GraphBridge: Unknown or malformed command: %s"), *Command);
-        SendResponse(Sender, false, Op,
-            FString::Printf(TEXT("Unknown command or wrong arg count: %s"), *Command), TEXT(""));
+        UE_LOG(LogGraphBridge, Warning, TEXT("GraphBridge: Unknown command: %s"), *Op);
+        SendResponse(Context, false, Op,
+            FString::Printf(TEXT("Unknown command or wrong arg count: %s"), *Op), TEXT(""));
     }
 
 #else
-    SendResponse(Sender, false, Op, TEXT("GraphBridge commands require an editor build"), TEXT(""));
+    SendResponse(Context, false, Op, TEXT("GraphBridge commands require an editor build"), TEXT(""));
 #endif
 }
 
@@ -6083,15 +6473,37 @@ FString UGraphBridgeAutomationLibrary::SetLevelGameMode(FString GameModeBPPath)
 // Pipes in the code are supported — the dispatcher rejoins split segments.
 // ---------------------------------------------------------------------------
 
-// Helper output device to capture UE log output during Python execution
+// Hybrid output device: captures engine-side logs (LogUObjectGlobals, LogEditorScripting, etc.)
 class FGraphBridgePythonOutputDevice : public FOutputDevice
 {
 public:
     FString Output;
+    FString ErrorOutput;  // Only Error/Warning level logs
+
     virtual void Serialize(const TCHAR* V, ELogVerbosity::Type Verbosity, const FName& Category) override
     {
-        if (Category == FName("LogPython") || Category == FName("Python"))
+        // Capture Error/Warning level from important categories
+        bool bCaptureCategory =
+            Category == FName("LogPython") ||
+            Category == FName("Python") ||
+            Category == FName("LogEditorScripting") ||
+            Category == FName("LogSpawn") ||
+            Category == FName("LogWorldPartition") ||
+            Category == FName("LogUObjectGlobals");
+
+        bool bIsError = Verbosity == ELogVerbosity::Error || Verbosity == ELogVerbosity::Warning;
+
+        if (bIsError)
+        {
+            // Error/Warning from any category
+            ErrorOutput += FString(V) + TEXT("\n");
             Output += FString(V) + TEXT("\n");
+        }
+        else if (bCaptureCategory)
+        {
+            // Info/Log level from important categories (for informational purposes)
+            Output += FString(V) + TEXT("\n");
+        }
     }
     virtual bool CanBeUsedOnAnyThread() const override { return false; }
 };
@@ -6102,15 +6514,32 @@ FString UGraphBridgeAutomationLibrary::RunPython(FString Code)
     if (!PythonPlugin || !PythonPlugin->IsPythonAvailable())
         return TEXT("ERR:Python plugin not available");
 
-    FGraphBridgePythonOutputDevice Capture;
-    GLog->AddOutputDevice(&Capture);
+    FPythonCommandEx Command;
+    Command.Command = Code;
+    Command.ExecutionMode = EPythonCommandExecutionMode::ExecuteFile;
+    Command.FileExecutionScope = EPythonFileExecutionScope::Private;
 
-    PythonPlugin->ExecPythonCommand(*Code);
+    PythonPlugin->ExecPythonCommandEx(Command);
 
-    GLog->RemoveOutputDevice(&Capture);
-    Capture.Output.TrimEndInline();
+    // Error signal: CommandResult == "None" means success; otherwise it's an exception
+    bool bIsError = Command.CommandResult != TEXT("None");
 
-    return Capture.Output.IsEmpty() ? TEXT("(no output)") : Capture.Output;
+    if (bIsError)
+    {
+        return FString::Printf(TEXT("ERR:%s"), *Command.CommandResult);
+    }
+
+    // Success: return Python's output from LogOutput
+    FString Output;
+    for (const FPythonLogOutputEntry& LogEntry : Command.LogOutput)
+    {
+        Output += LogEntry.Output;
+        if (!LogEntry.Output.EndsWith(TEXT("\n")))
+            Output += TEXT("\n");
+    }
+    Output.TrimEndInline();
+
+    return Output.IsEmpty() ? TEXT("(no output)") : Output;
 }
 
 // ---------------------------------------------------------------------------
@@ -9482,7 +9911,13 @@ FString UGraphBridgeAutomationLibrary::CaptureView(FString Target, FString Focus
     if (!RenderTarget)
         return TEXT("ERR:Failed to create render target");
 
-    RenderTarget->InitCustomFormat(Res, Res, PF_B8G8R8A8, true);
+    // ExportRenderTarget picks HDR/EXR vs PNG from RenderTargetFormat, NOT from the
+    // filename and NOT from InitCustomFormat's OverrideFormat. RTF_RGBA8 +
+    // SCS_FinalColorLDR is the documented combination that yields a real PNG.
+    RenderTarget->RenderTargetFormat = RTF_RGBA8;
+    RenderTarget->ClearColor = FLinearColor::Black;
+    RenderTarget->bGPUSharedFlag = true;
+    RenderTarget->InitAutoFormat(Res, Res);
     RenderTarget->UpdateResourceImmediate(true);
 
     // Spawn scene capture actor

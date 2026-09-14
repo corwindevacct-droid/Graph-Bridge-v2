@@ -17,13 +17,17 @@ Usage:
 import asyncio
 import websockets
 
+from graphbridge_bridge import _with_token
+import graphbridge_config as _config
+
 UE_URI = "ws://127.0.0.1:8080"
 
 
 async def session():
+    connect_uri = _with_token(UE_URI, _config.SESSION_TOKEN)
     print(f"Connecting to GraphBridge at {UE_URI} ...")
     try:
-        async with websockets.connect(UE_URI) as ws:
+        async with websockets.connect(connect_uri) as ws:
             print("Connected. Type a command and press Enter. Type 'quit' to exit.\n")
             # Use get_running_loop() — get_event_loop() is deprecated in Python 3.10+
             loop = asyncio.get_running_loop()

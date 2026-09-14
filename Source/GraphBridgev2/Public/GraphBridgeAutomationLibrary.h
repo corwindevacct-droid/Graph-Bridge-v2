@@ -4,6 +4,7 @@
 
 #include "CoreMinimal.h"
 #include "Kismet/BlueprintFunctionLibrary.h"
+#include "Misc/Guid.h"
 #include <memory>
 
 // Forward-declare ix types so we don't pull in IXWebSocket headers here.
@@ -40,6 +41,45 @@ class UEditorActorSubsystem;
 // connected client without going through the full command pipeline.
 DECLARE_DYNAMIC_DELEGATE_OneParam(FOnSendMessage, FString, Message);
 
+// Command context: carries result buffer and metadata for a single command.
+// Replaces the non-reentrant GSyncResultCapture global. Each command gets its
+// own context, allowing safe concurrent dispatch on the game thread.
+struct FGraphBridgeCommandContext
+{
+	// Unique ID for this command (for logging/debugging)
+	FString CommandId;
+
+	// Where to write the JSON response. If null, response goes over WebSocket wire.
+	FString* ResultBuffer;
+
+	// WebSocket to send response on (if ResultBuffer is null). Owned by server.
+	ix::WebSocket* WebSocket;
+
+	// Source of this command for logging/metrics
+	enum class ESource : uint8
+	{
+		WebSocket,
+		MCP,
+		Panel,
+		RPC,
+	} Source;
+
+	// The full pipe-delimited command for tracing
+	FString CommandString;
+
+	// When this command was issued (for metrics)
+	double IssuedTime;
+
+	FGraphBridgeCommandContext()
+		: CommandId(FGuid::NewGuid().ToString(EGuidFormats::DigitsWithHyphens))
+		, ResultBuffer(nullptr)
+		, WebSocket(nullptr)
+		, Source(ESource::WebSocket)
+		, IssuedTime(FPlatformTime::Seconds())
+	{
+	}
+};
+
 UCLASS()
 class GRAPHBRIDGEV2_API UGraphBridgeAutomationLibrary : public UBlueprintFunctionLibrary
 {
@@ -58,6 +98,11 @@ public:
 
     UFUNCTION(BlueprintCallable, Category = "GraphBridge")
     static bool IsServerRunning();
+
+    // Returns the current per-session auth token required of WebSocket
+    // clients (minted fresh each time the server starts). Not a UFUNCTION --
+    // for internal editor UI display only (see SGraphBridgePanel).
+    static FString GetSessionToken();
 
     UFUNCTION(BlueprintCallable, Category = "GraphBridge")
     static void SetSendMessageDelegate(FOnSendMessage InDelegate);
@@ -84,7 +129,28 @@ public:
      * Called by FGraphBridgev2Module::HandleGraphCommand for the LLM agentic loop.
      * Must be called on the game thread.
      */
+    UFUNCTION(BlueprintCallable, Category = "GraphBridge")
     static FString DispatchCommandSync(const FString& Command);
+
+    // -----------------------------------------------------------------------
+    // Internal command dispatch — takes context carrying result buffer or WebSocket.
+    // Reentrancy-safe: each command has its own context with independent result buffer.
+    // -----------------------------------------------------------------------
+    static void ExecuteAtomicCommand(const FGraphBridgeCommandContext& Context);
+
+    // Helper to send a response; writes to Context's ResultBuffer if set, else WebSocket.
+    static void SendResponse(const FGraphBridgeCommandContext& Context, bool bSuccess,
+        const FString& Command, const FString& Message, const FString& Payload);
+
+    // ExecuteAtomicCommand's else-if dispatch chain hit MSVC's C1061 "blocks
+    // nested too deeply" limit once it grew past ~116 branches (a single
+    // else-if chain nests one compound-statement level per branch). Split at
+    // roughly the midpoint (right after ADD_VARIABLE) into this second
+    // function purely to keep each chain's nesting depth under the compiler
+    // limit -- no command's logic changed, Op/P/Sender are just forwarded
+    // from ExecuteAtomicCommand's final else. Not exposed to Blueprint.
+    static void ExecuteAtomicCommandExtended(const FGraphBridgeCommandContext& Context, const FString& Op,
+                                             const TArray<FString>& P);
 
     // -----------------------------------------------------------------------
     // Static state — definitions live in the .cpp
@@ -96,30 +162,15 @@ private:
     // Server owns the IXWebSocket server instance
     static std::unique_ptr<ix::WebSocketServer> Server;
 
+    // Per-session token required on every WebSocket connection (checked in
+    // StartGraphBridgeServer's Open-message handler, before any command can
+    // reach ExecuteAtomicCommand). Regenerated each time the server starts;
+    // mirrored to Saved/GraphBridge/session_token.txt so the Python client
+    // can pick it up without manual copy/paste.
+    static FString SessionToken;
+
     // MCPServer owns the MCP (HTTP) server instance — independent of Server above.
     static std::unique_ptr<FGraphBridgeMCPServer> MCPServer;
-
-    // -----------------------------------------------------------------------
-    // Internal command dispatch — takes the raw pipe-delimited string and the
-    // socket to reply on. NOT exposed to Blueprint.
-    // -----------------------------------------------------------------------
-    static void ExecuteAtomicCommand(FString Command, ix::WebSocket* Sender);
-
-    // ExecuteAtomicCommand's else-if dispatch chain hit MSVC's C1061 "blocks
-    // nested too deeply" limit once it grew past ~116 branches (a single
-    // else-if chain nests one compound-statement level per branch). Split at
-    // roughly the midpoint (right after ADD_VARIABLE) into this second
-    // function purely to keep each chain's nesting depth under the compiler
-    // limit -- no command's logic changed, Op/P/Sender are just forwarded
-    // from ExecuteAtomicCommand's final else. Not exposed to Blueprint.
-    static void ExecuteAtomicCommandExtended(const FString& Command, const FString& Op,
-                                             const TArray<FString>& P, ix::WebSocket* Sender);
-
-    // -----------------------------------------------------------------------
-    // Response helper — builds the JSON envelope and sends it back
-    // -----------------------------------------------------------------------
-    static void SendResponse(ix::WebSocket* Sender, bool bSuccess,
-                             FString Command, FString Message, FString Payload);
 
     // -----------------------------------------------------------------------
     // Editor-only graph operations

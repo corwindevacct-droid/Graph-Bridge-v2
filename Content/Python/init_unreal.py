@@ -17,6 +17,12 @@ try:
     unreal.log(f"[GraphBridge AI] Bridge URI: {_cfg.BRIDGE_URI}")
     if not _cfg.ANTHROPIC_API_KEY:
         unreal.log_warning("[GraphBridge AI] ANTHROPIC_API_KEY not set.")
+    if not _cfg.SESSION_TOKEN:
+        unreal.log_warning(
+            "[GraphBridge AI] No session token found yet (Saved/GraphBridge/session_token.txt) - "
+            "this is normal before the server has been started at least once this editor session. "
+            "graphbridge_bridge.py will fail to connect until the server has started and re-reads it."
+        )
 except ImportError:
     unreal.log_warning("[GraphBridge AI] graphbridge_config.py not found - using defaults.")
 
