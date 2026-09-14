@@ -1,209 +1,147 @@
-# GraphBridge AI
+﻿# GraphBridgev2
 
-AI-powered Blueprint graph assistant for Unreal Engine 5. Chat with Claude or GPT directly inside the editor to inspect, summarize, and manipulate your Blueprint graphs using natural language.
+**The most complete Blueprint automation plugin for Unreal Engine 5.8+ with AI-native tooling.**
 
----
+GraphBridgev2 is a production-ready automation framework providing 129 fully-typed tools for Blueprint wiring, character setup, animation pipeline acceleration, and AI-assisted editor workflows. This is the **final v2 release** — feature-complete, stable, and maintained as-is. Future innovation will be delivered in v3 (a new plugin).
+
+## Features
+
+- **129 Production-Ready Tools**: Complete coverage of Blueprint operations, animation, character, materials, widgets, and level management
+- **Fully Typed Parameters (Tier 1+2)**: 44 critical tools with enums, bounded floats/ints, defaults, and docstrings
+- **Python Toolset**: Auto-generated from C++ manifest; runs against WebSocket (:8080) or MCP (:8090)
+- **MCP 0.1+ Compatible**: Dual-server architecture—runs alongside Epic's native MCP without conflicts
+- **Deep Verticalization**: Animation montages, IK rigs, skeleton sockets, state machines, character setup
+- **Comprehensive Test Harness**: Drift tests, coexistence verification, golden-file validation
+- **Local-Only Bridge**: loopback-only bind and Origin rejection on both WebSocket and MCP, plus a WebSocket-specific handshake-race token — see [Security](#security) below for what this does and doesn't protect against
+
+## Competitive Positioning
+
+**Better than Epic's native Bridge:**
+- Richer parameter typing (not just strings)—bounds, enums, semantic validation
+- Deep animation/IK/character support
+- Proven at scale; fully tested
+
+**Stable & Maintained:**
+- v2.0.0 is feature-complete and locked
+- Bug fixes and updates in v2; new features in v3
+- No breaking changes
 
 ## Installation
 
-1. Download `GraphBridgev2_v1.0.10_UE5.7.zip`
-2. Extract into `YourProject/Plugins/GraphBridgev2/`
-3. Open your project in UE 5.7 â€” when prompted, enable the plugin and restart the editor
-4. Go to **Window â†’ GraphBridge AI** to open the panel
+### Fab Marketplace (Recommended)
+Open UE 5.8+, Marketplace → Search GraphBridgev2 → Install
 
----
+### Manual Clone
+\\\ash
+cd YourProject/Plugins
+git clone https://github.com/YourOrg/GraphBridgev2.git
+\\\
 
-## First Use
+## Compatibility
 
-1. Click **Start Server** â€” confirm the green dot shows "Running on port 8080"
-2. Enter your Anthropic API key (`sk-ant-...`) in the API Key field
-3. Click **Save Settings**
-4. Open any Blueprint in the editor
-5. Click a preset task button or type a question and press **Run Task**
-6. Claude will read your graph and respond in the chat panel
+- Unreal Engine 5.8.0+
+- Python 3.9+
+- MCP 0.1+
 
----
+## Security
 
-## Requirements
+GraphBridge runs two servers inside the editor process that accept commands
+and execute them against your live editor — a WebSocket server (`:8080`)
+and an MCP server over HTTP (`:8090`). That is inherently powerful, and this
+section is here so you know exactly what protects each of them and what
+doesn't. The two surfaces are protected differently, on purpose — see below.
 
-- Unreal Engine 5.7 or later
-- Anthropic API key ([console.anthropic.com](https://console.anthropic.com)) — only needed for the in-editor chat panel, not for the WebSocket/MCP bridges themselves
-- Python 3.x (for the companion WebSocket bridge server)
-- Windows 64-bit
+**Threat model: localhost is not a trust boundary.** Any other process
+running as the same OS user as the editor — not just your own scripts — can
+open a socket to either server, **and can read any file that process can
+read, including the WebSocket session token described below.** Origin checks
+stop a browser tab (WebSocket connections aren't subject to CORS, so a
+malicious web page could otherwise open one; a same-origin-policy-respecting
+fetch() to the MCP port is blocked the same way), but neither Origin checks
+nor the token do anything against another local program running as you —
+that program can read the token file itself. Treat live access to either
+bridge as equivalent to arbitrary code execution in the editor process and
+scope your machine's trust accordingly. This is the same posture Epic takes
+for its own native Unreal MCP server in 5.8 — we are not claiming to be more
+"secure" than that, only to be honest about it.
 
----
+What's actually in place:
+- **Loopback-only bind, both servers.** Both bind explicitly to `127.0.0.1`
+  — neither is ever reachable from another machine on your network.
+- **Origin rejection, both servers, different strictness.** The WebSocket
+  server closes a connection whose `Origin` header is present and not a
+  loopback origin. The MCP server is stricter: it rejects *any* request that
+  carries an `Origin` header at all, present because real MCP clients
+  (Claude Code, Cursor, curl, SDKs) never send one — a browser's fetch()
+  always does, on every request, so this fully blocks browser-originated
+  MCP calls, not just non-loopback ones. Non-browser clients (the bundled
+  Python tools, curl, a future CLI) send no `Origin` header at all on either
+  server, which is normal and always passes.
+- **Per-session token — WebSocket only, not MCP.** The WebSocket server
+  mints a random token every time it starts and requires it on every
+  connection (compared in constant time). This exists specifically to close
+  a race in the WebSocket handshake: a client that sends a command frame in
+  the same TCP burst as its (ultimately-rejected) upgrade request could
+  otherwise reach dispatch before the rejection closed the connection. **Do
+  not read more into it than that** — per the threat model above, another
+  local process as the same OS user can simply read
+  `<Project>/Saved/GraphBridge/session_token.txt`, so the token is not a
+  secret that stops same-user access; it stops the handshake race and,
+  incidentally, a browser tab that guesses or brute-forces it. The MCP
+  server has no equivalent token: its request/response model has no
+  handshake-then-frames race for a token to close, so loopback-only bind
+  plus the stricter Origin rejection above is its actual and complete bar.
+  If you're scripting against WebSocket, you'll find the token two places:
+  the GraphBridge AI panel (Window menu), and
+  `<Project>/Saved/GraphBridge/session_token.txt` — `Saved/` is gitignored
+  by every standard UE project template, so it never lands in source
+  control. The bundled Python client (`graphbridge_bridge.py` and every
+  `graphbridge_*.py` script built on it) reads this file automatically; you
+  only need it yourself for manual/curl-style debugging.
+- **`RUN_PYTHON` is off by default.** This command executes arbitrary Python
+  inside the editor process — enabling it (Project Settings → Plugins →
+  GraphBridge AI) is equivalent to granting arbitrary code execution to
+  anything that can reach the bridge. It's enforced at the command-dispatch
+  boundary, not just hidden from the panel, so it's off for every entry
+  point (WebSocket, MCP, the in-editor chat panel) until you explicitly turn
+  it on. Turning it on logs a warning in the Output Log every time.
+- **API keys live in OS credential storage**, not project config — Windows
+  Credential Manager, falling back to the `GRAPHBRIDGE_API_KEY` environment
+  variable if no platform store is available. **On macOS as of v2.0.1, the
+  Keychain path is not yet enabled** — it ships compiled out
+  (`GRAPHBRIDGE_ENABLE_MAC_KEYCHAIN=0` in `GraphBridgev2.Build.cs`) because
+  it hasn't been built or tested on a real Mac toolchain, so Mac always uses
+  the `GRAPHBRIDGE_API_KEY` environment variable for now; Keychain support
+  is planned for a follow-up release once verified. If you upgraded from an
+  older version that stored the key in
+  `DefaultEditorPerProjectUserSettings.ini`, the plugin migrates it
+  automatically on first load and shows a one-time warning — **if that
+  project's `Config/` folder was ever committed to version control, rotate
+  that key**, since it may still be present in your git history even after
+  the ini value is cleared.
 
-## Architecture
+What this does **not** protect against: another program on your machine
+running as you (this is the localhost-is-not-a-trust-boundary point above),
+a compromised editor process, or a Python dependency (`websockets`,
+`anthropic`, `openai`) with a supply-chain issue. If you need stronger
+isolation, don't run the bridge on a machine you don't otherwise trust.
 
-```
-Slate Chat Panel -> C++ GraphBridgeLLMClient -> Anthropic API (claude-sonnet-4-6)
-                            |
-            C++ WebSocket Server (IXWebSocket, port 8080)
-                            |
-       MCP Server (JSON-RPC 2.0 over HTTP, port 8090) <- any MCP-compatible client
-                            |
-         Unreal Editor (Blueprint graph read/write via GraphBridgeAutomationLibrary)
-```
+## Documentation
 
-Both the WebSocket bridge and the MCP server start automatically with the editor
-(configurable in **Project Settings -> Plugins -> GraphBridge AI**) and route through
-the exact same command dispatcher — there is exactly one command implementation to
-maintain regardless of which transport a client connects over.
+- **INSTALLATION.md** — Setup steps
+- **USAGE.md** — WebSocket and MCP endpoints
+- **API.md** — All 129 tools documented
+- **TROUBLESHOOTING.md** — Common issues
+- **ROADMAP.md** — v2 complete; v3 vision
 
-The Python scripts (graphbridge_bridge.py, graphbridge_tools.py, graphbridge_server.py) are development/debug utilities only - they are NOT part of the runtime path.
+## Examples
 
----
-
-## MCP Transport
-
-GraphBridge also speaks the standard [Model Context Protocol](https://modelcontextprotocol.io) (spec version `2025-06-18`), as a second transport alongside the WebSocket bridge above. Any MCP-compatible client — Claude Code, Cursor, Windsurf, VS Code — can connect directly with no custom client needed, unlike the WebSocket bridge which requires the Python or C++ tooling in this repo.
-
-- **Endpoint:** `http://127.0.0.1:8090/mcp` (HTTP POST, JSON-RPC 2.0).
-- **Starts automatically** with the editor, alongside the WebSocket bridge — no manual step needed. Configurable in **Project Settings -> Plugins -> GraphBridge AI**:
-  - **Enable MCP Server** (default on)
-  - **MCP Server Port** (default `8090`)
-
-  For manual control without restarting the editor (e.g. toggling it off temporarily), the Blueprint-callable `Start MCP Server` / `Stop MCP Server` / `Is MCP Server Running` nodes (or their `UGraphBridgeAutomationLibrary` C++/Python equivalents) are still available independently of the automatic path.
-- **Methods supported:** `initialize`, `tools/list`, `tools/call`, `ping`. Every one of GraphBridge's 81 bridge commands (`LIST_NODES`, `SPAWN_NODE`, `CONNECT_PINS`, `CREATE_FUNCTION`, `SPAWN_ACTOR_IN_LEVEL`, `CREATE_WIDGET_BLUEPRINT`, `ADD_MATERIAL_NODE`, etc.) is exposed as an MCP tool with an auto-generated JSON Schema.
-- **Undo:** MCP calls route through the exact same command dispatcher the WebSocket bridge uses (`DispatchCommandSync`), so every mutating tool call gets the same `FScopedTransaction` undo/redo support — Ctrl+Z in the editor undoes an MCP-triggered change exactly like a WebSocket- or Slate-panel-triggered one.
-- **Transport notes:** implements the Streamable HTTP transport without Server-Sent Events (every request gets a single JSON response, which the spec allows) and without session IDs (both optional for a single-client local tool server). Binds to `localhost` only and rejects any request carrying an `Origin` header, as a DNS-rebinding mitigation.
-
-Example client config (Claude Code, Cursor, etc. — check your client's docs for the exact file):
-```json
-{
-  "mcpServers": {
-    "graphbridge": {
-      "url": "http://127.0.0.1:8090/mcp"
-    }
-  }
-}
-```
-
----
-
-## Python Tools
-
-### Setup
-
-1. Install Python dependencies:
-   ```
-   pip install websockets anthropic openai
-   ```
-2. Configure your API key — edit `Content/Python/graphbridge_config.py` and set
-   your key, or use environment variables:
-   ```
-   # Windows
-   set ANTHROPIC_API_KEY=<your-key-here>
-   # Mac/Linux
-   export ANTHROPIC_API_KEY=<your-key-here>
-   ```
-3. Open your Unreal project with GraphBridge AI enabled.
-4. Click **Start Server** in the GraphBridge AI panel (**Window > GraphBridge AI**).
-5. Confirm the green dot shows "Running on port 8080".
-
-### graphbridge_tools.py — Find assets, inspect pins, list nodes
-
-```
-python graphbridge_tools.py find BP_MyCharacter
-python graphbridge_tools.py nodes /Game/BP_MyCharacter.BP_MyCharacter
-python graphbridge_tools.py pins /Game/BP_MyCharacter.BP_MyCharacter BeginPlay
-```
-
-### graphbridge_scan.py — Scan entire project, save manifest
-
-```
-python graphbridge_scan.py
-python graphbridge_scan.py BP_MyCharacter
-```
-
-### graphbridge_variables.py — Bulk create Blueprint variables
-
-Edit the `STAT_VARIABLES` list in the file, then run:
-
-```
-python graphbridge_variables.py
-```
-
-### graphbridge_animation.py — Create montages, blend spaces, assign AnimBPs
-
-```
-python graphbridge_animation.py list --type AnimMontage
-python graphbridge_animation.py montage --skeleton /Game/SK_Hero --name AM_Attack
-```
-
-### graphbridge_agent.py — Claude agentic loop (natural language)
-
-```
-python graphbridge_agent.py "Add a float variable Speed to /Game/BP_MyChar.BP_MyChar"
-python graphbridge_agent.py "Wire BeginPlay to register the IMC on /Game/BP_MyChar.BP_MyChar"
-python graphbridge_agent.py --openai "List all nodes in /Game/BP_MyChar.BP_MyChar"
-```
-
-### graphbridge_server.py — Raw command debug shell
-
-```
-python graphbridge_server.py
-> LIST_NODES|/Game/BP_MyCharacter.BP_MyCharacter
-> COMPILE|/Game/BP_MyCharacter.BP_MyCharacter
-```
-
-### Example Scripts
-
-- `graphbridge_example_flight.py` - Wire a flight ability Blueprint end-to-end
-- `graphbridge_example_anim_flight.py` - Wire an animation Blueprint end-to-end
-
-### From the Unreal Python Console
-
-```python
-import graphbridge_bridge
-import asyncio
-bridge = graphbridge_bridge.UnrealBridge()
-asyncio.run(bridge.connect())
-```
-
-## Implemented Commands
-
-The WebSocket bridge and the MCP transport share the same 81 commands (every command
-is available on both — MCP is just a second way to reach the identical dispatcher):
-
-**Graph Manipulation:** `SPAWN_NODE`, `SPAWN_NODE_IN_GRAPH`, `CONNECT_PINS`, `DISCONNECT_PINS`, `DELETE_NODE`, `CLEAR_NODES`, `SET_PIN_DEFAULT`, `GET_PIN_DEFAULT`, `GET_PIN_CONNECTIONS`, `SET_NODE_POSITION`, `CREATE_FUNCTION`
-
-**Variables:** `SPAWN_VARIABLE`, `ADD_VARIABLE`, `SET_VARIABLE_DEFAULT`, `SET_VARIABLE_REF`, `SET_VARIABLE_TYPE`, `LIST_VARIABLES`
-
-**Blueprint Lifecycle:** `CREATE_BLUEPRINT`, `COMPILE`, `GET_COMPILE_ERRORS`, `SAVE_BLUEPRINT`, `OPEN_BLUEPRINT`, `CLOSE_BLUEPRINT`
-
-**Discovery:** `LIST_NODES`, `GET_NODE_PINS`, `LIST_ASSETS`, `FIND_NODE_CLASS`, `LIST_ASSET_PROPERTIES`, `GET_ASSET_PROPERTY`, `SET_ASSET_PROPERTY`
-
-**Components & Input:** `ADD_COMPONENT`, `SET_INPUT_ACTION`, `SET_FUNCTION_REF`, `SET_EVENT_REF`, `CREATE_INPUT_ACTION`, `CREATE_IMC`, `ADD_IMC_MAPPING`, `ADD_IMC_TO_CHARACTER`
-
-**Animation:** `SET_ANIM_CLASS`, `SET_MONTAGE_SLOT`, `ADD_MONTAGE_SECTION`, `ADD_MONTAGE_NOTIFY`, `ADD_MONTAGE_NOTIFY_STATE`, `LIST_BLENDSPACES`, `LIST_SKELETON_SOCKETS`, `ADD_SKELETON_SOCKET`
-
-> `ADD_MONTAGE_NOTIFY` adds a single-frame `UAnimNotify`.
-> `ADD_MONTAGE_NOTIFY_STATE` adds a `UAnimNotifyState` — a begin/end window with a
-> required `duration > 0`, used for things like weapon-hitbox active frames.
-> The two are separate opcodes because `UAnimNotify` and `UAnimNotifyState` are
-> sibling classes, so neither call accepts the other's class.
-
-**Level & Actors:** `SPAWN_ACTOR_IN_LEVEL`, `LIST_LEVEL_ACTORS`, `SET_ACTOR_TRANSFORM`, `DELETE_LEVEL_ACTOR`, `GET_PLAYER_START`, `SET_LEVEL_GAMEMODE`
-
-**UMG Widgets** *(new in v1.0.8)*: `CREATE_WIDGET_BLUEPRINT`, `ADD_WIDGET_ELEMENT`, `SET_WIDGET_TEXT`
-
-**Materials** *(new in v1.0.8)*: `CREATE_MATERIAL`, `ADD_MATERIAL_NODE`, `CONNECT_MATERIAL_PINS`, `SET_MATERIAL_RESULT`, `COMPILE_MATERIAL`, `CLOSE_MATERIAL`
-
-**DataTables:** `LIST_DATATABLE_ROWS`, `ADD_DATATABLE_ROW`, `DELETE_DATATABLE_ROW`, `RENAME_DATATABLE_ROW`
-
----
-
-## Known Limitations
-
-- Windows 64-bit only (Mac/Linux planned for v1.2)
-- Python bridge server must be running locally for graph introspection
-- Requires an active Anthropic API key (billed at standard Anthropic rates)
-
----
+See Examples/ folder for Python agent scripts.
 
 ## License
 
-Copyright 2026 Corwin Hicks. All Rights Reserved.
+See LICENSE.md
 
-Third-party: IXWebSocket (MIT License) - https://github.com/machinezone/IXWebSocket
+---
+
+v2.0.0 is stable, production-ready, and locked for maintenance. New features in v3.
