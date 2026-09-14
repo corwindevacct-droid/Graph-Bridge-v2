@@ -3,6 +3,7 @@
 #include "GraphBridgev2.h"
 #include "GraphBridgeAutomationLibrary.h"
 #include "GraphBridgeSettings.h"
+#include "GraphBridgeCredentialStore.h"
 #include "GraphBridgeMCPServer.h"
 #include "Modules/ModuleManager.h"
 
@@ -21,6 +22,12 @@ FGraphBridgev2Module::~FGraphBridgev2Module() = default;
 
 void FGraphBridgev2Module::StartupModule()
 {
+    // One-time upgrade: move any pre-existing plaintext ApiKey out of
+    // DefaultEditorPerProjectUserSettings.ini into OS credential storage.
+    // No-op once that ini value has been cleared. Must run before anything
+    // else reads the key.
+    FGraphBridgeCredentialStore::MigrateFromIniIfNeeded();
+
     UGraphBridgeAutomationLibrary::StartGraphBridgeServer(
         UGraphBridgeSettings::Get()->ServerPort);
 

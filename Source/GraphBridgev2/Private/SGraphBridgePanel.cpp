@@ -5,6 +5,7 @@
 #include "SGraphBridgePanel.h"
 #include "GraphBridgev2.h"
 #include "GraphBridgeSettings.h"
+#include "GraphBridgeCredentialStore.h"
 #include "GraphBridgeAutomationLibrary.h"
 
 #include "Widgets/Layout/SBorder.h"
@@ -189,7 +190,38 @@ void SGraphBridgePanel::Construct(const FArguments& InArgs)
                 [
                     SAssignNew(ApiKeyBox, SEditableTextBox)
                     .IsPassword(true)
-                    .Text(FText::FromString(Settings->ApiKey))
+                    .Text(FText::FromString(FGraphBridgeCredentialStore::GetApiKey()))
+                ]
+            ]
+            + SVerticalBox::Slot()
+            .AutoHeight()
+            .Padding(0, 0, 0, 4)
+            [
+                SNew(SHorizontalBox)
+                + SHorizontalBox::Slot()
+                .AutoWidth()
+                .VAlign(VAlign_Center)
+                .Padding(0, 0, 8, 0)
+                [
+                    SNew(STextBlock)
+                    .Text(LOCTEXT("SessionTokenLabel", "Session Token:"))
+                    .ToolTipText(LOCTEXT("SessionTokenTooltip",
+                        "Required by every WebSocket client (see the bundled Python tools). "
+                        "Regenerated each time the server starts. Also mirrored to "
+                        "Saved/GraphBridge/session_token.txt for scripts to read automatically."))
+                ]
+                + SHorizontalBox::Slot()
+                .FillWidth(1.0f)
+                [
+                    SAssignNew(TokenBox, SEditableTextBox)
+                    .IsReadOnly(true)
+                    .Text(MakeAttributeLambda([]() -> FText
+                    {
+                        const FString Token = UGraphBridgeAutomationLibrary::GetSessionToken();
+                        return Token.IsEmpty()
+                            ? LOCTEXT("SessionTokenNone", "(start the server to mint a token)")
+                            : FText::FromString(Token);
+                    }))
                 ]
             ]
             + SVerticalBox::Slot()
@@ -440,7 +472,7 @@ void SGraphBridgePanel::OnSaveSettings()
 {
     UGraphBridgeSettings* Settings = UGraphBridgeSettings::Get();
     if (ApiKeyBox.IsValid())
-        Settings->ApiKey = ApiKeyBox->GetText().ToString();
+        FGraphBridgeCredentialStore::SetApiKey(ApiKeyBox->GetText().ToString());
     if (SelectedModel.IsValid())
     {
         Settings->SelectedModel = *SelectedModel;

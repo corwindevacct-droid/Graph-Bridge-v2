@@ -39,6 +39,7 @@ private:
 
     // Settings
     TSharedPtr<SEditableTextBox>               ApiKeyBox;
+    TSharedPtr<SEditableTextBox>               TokenBox; // read-only session token display
     TSharedPtr<SComboBox<TSharedPtr<FString>>> ModelComboBox;
     TArray<TSharedPtr<FString>>                ModelOptions;
     TSharedPtr<FString>                        SelectedModel;

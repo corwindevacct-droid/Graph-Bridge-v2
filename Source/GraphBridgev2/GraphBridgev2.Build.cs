@@ -94,5 +94,28 @@ public class GraphBridgev2 : ModuleRules
 
         // Suppress MSVC deprecation warnings from vendored IXWebSocket
         PublicDefinitions.Add("_CRT_SECURE_NO_WARNINGS=1");
+
+        // OS credential storage for the LLM provider API key
+        // (GraphBridgeCredentialStore.cpp) -- Windows Credential Manager /
+        // macOS Keychain, in place of storing it in project config.
+        if (Target.Platform == UnrealTargetPlatform.Win64)
+        {
+            PublicSystemLibraries.Add("Advapi32.lib");
+        }
+
+        // The macOS Keychain path in GraphBridgeCredentialStore.cpp has not
+        // been compiled or tested on a real Mac toolchain -- v2.0.1 ships it
+        // disabled and falls back to the GRAPHBRIDGE_API_KEY env var on Mac
+        // instead. Flip this to true (and re-add "Security" to
+        // PublicFrameworks below) only after building and smoke-testing
+        // GetApiKey()/SetApiKey()/ClearApiKey() on macOS -- see the #elif
+        // guard in GraphBridgeCredentialStore.cpp and README.md's Security
+        // section.
+        bool bEnableMacKeychain = false;
+        PublicDefinitions.Add("GRAPHBRIDGE_ENABLE_MAC_KEYCHAIN=" + (bEnableMacKeychain ? "1" : "0"));
+        if (Target.Platform == UnrealTargetPlatform.Mac && bEnableMacKeychain)
+        {
+            PublicFrameworks.Add("Security");
+        }
     }
 }
