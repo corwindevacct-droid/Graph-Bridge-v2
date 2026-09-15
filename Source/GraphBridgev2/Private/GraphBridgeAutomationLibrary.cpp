@@ -384,10 +384,6 @@ namespace
     };
 } // namespace
 
-// DEPRECATED: Replaced by FGraphBridgeCommandContext.ResultBuffer.
-// Kept as nullptr for debug assertions only.
-static FString* GSyncResultCapture = nullptr;
-
 // ---------------------------------------------------------------------------
 // COMMAND GRAMMAR REFERENCE
 // ---------------------------------------------------------------------------
