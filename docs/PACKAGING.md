@@ -82,10 +82,16 @@ folders `BuildPlugin` adds on top.
 /docs/
 /LICENSE.md
 !/Content/Python/__pycache__/
+!/docs/fab/
 !*.pdb
 !*.obj
 !*.sarif
 ```
+
+`!/docs/fab/` excludes internal, pre-2.0 Fab-submission working notes (stale
+version numbers, an obsolete command syntax) that would otherwise ship
+inside `/docs/`'s blanket allow-list — they're useful history to keep in
+the repo, not something a customer or reviewer should see in the package.
 
 If a new top-level file or folder needs to ship (another doc, an
 `Examples/` folder once its content is fixed and ready, etc.), it must be
