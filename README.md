@@ -144,4 +144,7 @@ See LICENSE.md
 
 ---
 
-v2.0.0 is stable, production-ready, and locked for maintenance. New features in v3.
+v2.0.1 is the current shipping version — a security-hardening point
+release on top of v2.0.0, with no command behavior changes. It receives
+bug fixes and security patches; new features are planned for v3. See
+CHANGELOG.md and RELEASE_HISTORY.md for the full version history.
