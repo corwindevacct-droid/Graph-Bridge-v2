@@ -22,7 +22,7 @@ GraphBridgev2 is a production-ready automation framework providing 129 fully-typ
 - Proven at scale; fully tested
 
 **Stable & Maintained:**
-- v2.0.0 is feature-complete and locked
+- v2.0.1 is the current, actively maintained release
 - Bug fixes and updates in v2; new features in v3
 - No breaking changes
 
