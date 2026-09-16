@@ -1,14 +1,18 @@
 ﻿# Roadmap
 
-## v2.0.0 (Current — Final Release)
+## v2.0.1 (Current — Security Hardening)
 
 **Status**: ✅ Complete and locked
 
+Point release on top of v2.0.0. No command behavior changed and no new
+tools were added — see CHANGELOG.md for the full list of security fixes
+(per-connection auth state, use-after-free fix, credential storage moved
+out of plaintext config, RUN_PYTHON off by default, and more).
+
+v2.0.0 shipped:
 - 129 fully-typed tools
 - Tier 1+2 with parameter bounds, enums, defaults
-- Python toolset auto-generated from manifest
 - MCP server with dual-server coexistence
-- Comprehensive test harness
 
 **Maintenance**: Bug fixes and critical updates only. No new features.
 
@@ -35,15 +39,11 @@ v3 will be shipped as a new plugin to allow major enhancements without breaking 
 
 | Version | Status | Support |
 |---------|--------|---------|
-| **v2.0.0** | Current | Bug fixes, security patches |
-| **v1.0.0** | Legacy | Critical security fixes only |
+| **v2.0.1** | Current | Bug fixes, security patches |
+| **v1.x** | Legacy | Critical security fixes only |
 | **v3.0.0** | Future | Active development |
-
-## How to Contribute
-
-- **v2**: Report issues, request documentation improvements
-- **v3**: Will accept feature PRs in the v3 repository when it launches
 
 ## Questions?
 
-See [USAGE.md](USAGE.md) for quick-start guides or file an issue on GitHub.
+See [USAGE.md](USAGE.md) for quick-start guides, or report issues through
+the support channel listed on the Fab product page.

@@ -14,14 +14,12 @@
 5. Restart the editor
 6. Enable the plugin: **Edit** → **Plugins** → Search "GraphBridge" → Check **Enabled**
 
-## Option 2: Manual Installation
+## Option 2: Manual Installation (source access only)
 
-1. Clone the repository:
-\\\ash
-cd YourProject/Plugins
-git clone https://github.com/YourOrg/GraphBridgev2.git
-\\\
+This path requires access to the plugin's source repository — it isn't
+available to a Fab customer using the packaged plugin from Option 1.
 
+1. Copy or clone the plugin source into your project's `Plugins/` folder
 2. Regenerate Visual Studio project files
 3. Compile the plugin
 4. Restart the editor
@@ -31,9 +29,9 @@ git clone https://github.com/YourOrg/GraphBridgev2.git
 After installation, verify that:
 
 1. **Plugin loads**: No "Incompatible or missing module" errors in the Output Log
-2. **WebSocket server active**: Connect to http://localhost:8080
-3. **MCP server active**: Connect to http://localhost:8090
-4. **Python toolset available**: Content/Python/GraphBridgeToolset.py exists
+2. **WebSocket server active**: `LogGraphBridge: GraphBridge: WebSocket server started on port 8080` appears in the Output Log
+3. **MCP server active**: `LogGraphBridge: GraphBridge MCP: listening on http://127.0.0.1:8090/mcp` appears in the Output Log
+4. **Session token minted**: `Saved/GraphBridge/session_token.txt` exists — every WebSocket client needs this to connect (see USAGE.md)
 
 ## Troubleshooting
 

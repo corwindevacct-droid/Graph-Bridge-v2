@@ -6,41 +6,52 @@ GraphBridgev2 runs two servers:
 
 | Server | Port | Protocol | Use Case |
 |--------|------|----------|----------|
-| **WebSocket** | 8080 | HTTP/JSON-RPC 2.0 | Native Python/CLI tools |
+| **WebSocket** | 8080 | WebSocket, pipe-delimited text commands + per-session token | Native Python/CLI tools |
 | **MCP** | 8090 | MCP 0.1+ | Claude/AI integration |
 
 Both servers are safe to run simultaneously. They do not conflict with Epic's native MCP server (:8000).
 
 ## WebSocket Usage (Native)
 
-### Python Example
-\\\python
-import requests
-import json
+Every WebSocket connection must present the per-session token minted each
+time the server starts, as a `?token=...` query parameter on the connection
+URI — otherwise the server closes the connection before any command can be
+dispatched. The bundled client below reads that token automatically from
+`Saved/GraphBridge/session_token.txt`; see the Security section of the main
+README for why the token exists and what it does and doesn't protect
+against.
 
-# Spawn a node
-response = requests.post('http://localhost:8080', json={
-    'Op': 'SPAWN_NODE',
-    'P': ['/Game/BP_Character', 'K2Node_CallFunction', 'MyComment', '100', '200']
-})
-print(response.json())
-\\\
+### Python Example
+```python
+import asyncio
+from graphbridge_bridge import UnrealBridge
+
+async def main():
+    bridge = UnrealBridge()  # reads the session token automatically
+    await bridge.connect()
+    result = await bridge._send_command(
+        "SPAWN_NODE|/Game/BP_Character|K2Node_CallFunction|MyComment|100|200"
+    )
+    print(result)
+    await bridge.close()
+
+asyncio.run(main())
+```
 
 ### Command Line
-\\\ash
-curl -X POST http://localhost:8080 \\
-  -H "Content-Type: application/json" \\
-  -d '{
-    "Op": "LIST_GRAPHS",
-    "P": ["/Game/BP_Character"]
-  }'
-\\\
+`graphbridge_server.py` (bundled under `Content/Python/`) is an interactive
+REPL against the WebSocket server — it handles the token for you:
+```bash
+python graphbridge_server.py
+# Connected. Type a command and press Enter. Type 'quit' to exit.
+> LIST_GRAPHS|/Game/BP_Character
+```
 
 ## MCP Usage (AI Integration)
 
 GraphBridgev2 is fully compatible with Claude via MCP. All 129 tools are available as typed MCP resources:
 
-\\\python
+```python
 import anthropic
 
 client = anthropic.Anthropic()
@@ -57,17 +68,29 @@ response = client.messages.create(
         "content": "Create a character controller blueprint for me"
     }]
 )
-\\\
+```
 
 ## Configuration
 
-Both servers start automatically when the plugin loads. Port configuration in GraphBridgeSettings.ini:
+Both servers start automatically when the plugin loads. Configure the
+WebSocket port, MCP port, and whether MCP auto-starts from
+**Project Settings → Plugins → GraphBridge AI**, or directly in
+`Config/DefaultEditorPerProjectUserSettings.ini`:
 
-\\\ini
-[GraphBridge.Server]
-WebSocketPort=8080
-MCPPort=8090
-\\\
+```ini
+[/Script/GraphBridgev2.GraphBridgeSettings]
+ServerPort=8080
+MCPServerPort=8090
+bEnableMCPServer=True
+```
+
+The WebSocket port can also be overridden independently via
+`Config/DefaultEditor.ini`:
+
+```ini
+[GraphBridge]
+Port=8080
+```
 
 ## Tool Categories
 

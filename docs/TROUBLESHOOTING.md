@@ -17,22 +17,22 @@
 - Check if another GraphBridge instance is running
 - Close all editor windows and wait 10 seconds
 - Use netstat to find the offending process:
-  \\\ash
+  ```bash
   netstat -ano | findstr :8080
-  \\\
+  ```
 
-## Python Toolset Not Found
+## Bundled Python Client Not Found
 
-**Problem**: ImportError for GraphBridgeToolset
+**Problem**: `ImportError` for `graphbridge_bridge` or `graphbridge_config`.
 
 **Solution**:
-1. Verify Content/Python/GraphBridgeToolset.py exists
-2. Add the plugin's Python folder to sys.path:
-   \\\python
+1. Verify `Content/Python/graphbridge_bridge.py` exists
+2. Add the plugin's Python folder to `sys.path`:
+   ```python
    import sys
    sys.path.insert(0, '/path/to/plugin/Content/Python')
-   import GraphBridgeToolset
-   \\\
+   from graphbridge_bridge import UnrealBridge
+   ```
 
 ## MCP Connection Failed
 
@@ -60,7 +60,7 @@
 **Solution**:
 - GraphBridgev2 requires Python 3.9+
 - Update your Python installation
-- Verify \python --version\ returns 3.9+
+- Verify `python --version` returns 3.9+
 
 ## Performance Issues
 
@@ -78,4 +78,4 @@ Check the logs:
 - MCP Log: Look for "GraphBridgeMCPServer" entries
 - Python Log: Print debug info from your scripts
 
-Report issues on [GitHub Issues](https://github.com/YourOrg/GraphBridgev2/issues).
+Report issues through the support channel listed on the Fab product page.

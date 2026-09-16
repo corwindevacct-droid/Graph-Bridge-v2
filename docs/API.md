@@ -10,26 +10,32 @@
 
 ## Calling Pattern
 
-All tools use the same request pattern:
+Every command below is written as a single pipe-delimited string:
 
-**HTTP POST to** http://localhost:8080 or MCP endpoint
+```
+COMMAND_NAME|param1|param2|...
+```
 
-**Request Body (JSON)**:
-\\\json
-{
-  "Op": "COMMAND_NAME",
-  "P": ["param1", "param2", ...]
-}
-\\\
+Two transports carry that string:
 
-**Response (JSON)**:
-\\\json
+- **WebSocket (port 8080)** — send it as a text frame. Every connection must
+  present the per-session token from `Saved/GraphBridge/session_token.txt`
+  as a `?token=...` query parameter on the connection URI, or the server
+  closes the connection before any command can be dispatched. The bundled
+  `graphbridge_bridge.py` (`UnrealBridge` class) handles this automatically
+  — the examples below use it. See USAGE.md for connection setup.
+- **MCP (port 8090)** — all 129 tools are exposed as typed MCP tools for
+  Claude and other MCP-compatible clients; no manual command-string
+  construction needed on that path.
+
+**Response (JSON)**, either transport:
+```json
 {
   "Success": true|false,
   "Result": { /* command-specific */ },
   "Error": "error message if Success=false"
 }
-\\\
+```
 
 ---
 
@@ -50,13 +56,12 @@ Spawn a new node in a Blueprint's EventGraph.
 | y | Integer | -100000 to 100000 | No | 0 | Y position in graph |
 
 **Example**:
-\\\python
-requests.post("http://localhost:8080", json={
-  "Op": "SPAWN_NODE",
-  "P": ["/Game/BP_MyBlueprint", "K2Node_VariableGet", "Get X", "100", "200"]
-}).json()
+```python
+await bridge._send_command("SPAWN_NODE|/Game/BP_MyBlueprint|K2Node_VariableGet|Get X|100|200")
+# Or via the bundled UnrealBridge wrapper method for this command,
+# if one exists in graphbridge_bridge.py -- see USAGE.md.
 # → {"Success": true, "Result": {"NodeGUID": "..."}}
-\\\
+```
 
 ### CONNECT_PINS
 
@@ -71,13 +76,12 @@ Connect an output pin from one node to an input pin on another.
 | to_pin_name | String | - | Yes | - | Target pin name (e.g., "Input") |
 
 **Example**:
-\\\python
-requests.post("http://localhost:8080", json={
-  "Op": "CONNECT_PINS",
-  "P": ["/Game/BP_MyBlueprint", "node_guid_1", "Output", "node_guid_2", "Input"]
-}).json()
+```python
+await bridge._send_command("CONNECT_PINS|/Game/BP_MyBlueprint|node_guid_1|Output|node_guid_2|Input")
+# Or via the bundled UnrealBridge wrapper method for this command,
+# if one exists in graphbridge_bridge.py -- see USAGE.md.
 # → {"Success": true, "Result": {...}}
-\\\
+```
 
 ### ADD_FUNCTION_PARAM
 
@@ -90,12 +94,11 @@ Add a parameter to a function or macro.
 | param_type | String | - | Yes | - | Type like "float", "int32", "FVector" |
 
 **Example**:
-\\\python
-requests.post("http://localhost:8080", json={
-  "Op": "ADD_FUNCTION_PARAM",
-  "P": ["/Game/BP_MyBlueprint.AttackFunction", "DamageAmount", "float"]
-}).json()
-\\\
+```python
+await bridge._send_command("ADD_FUNCTION_PARAM|/Game/BP_MyBlueprint.AttackFunction|DamageAmount|float")
+# Or via the bundled UnrealBridge wrapper method for this command,
+# if one exists in graphbridge_bridge.py -- see USAGE.md.
+```
 
 ### SET_VARIABLE_DEFAULT
 
@@ -107,12 +110,11 @@ Set the default value for a variable.
 | default_value | String | - | Yes | - | Value to assign (type-agnostic) |
 
 **Example**:
-\\\python
-requests.post("http://localhost:8080", json={
-  "Op": "SET_VARIABLE_DEFAULT",
-  "P": ["/Game/BP_MyBlueprint.MaxHealth", "100"]
-}).json()
-\\\
+```python
+await bridge._send_command("SET_VARIABLE_DEFAULT|/Game/BP_MyBlueprint.MaxHealth|100")
+# Or via the bundled UnrealBridge wrapper method for this command,
+# if one exists in graphbridge_bridge.py -- see USAGE.md.
+```
 
 ### LIST_ASSETS
 
@@ -124,13 +126,12 @@ List assets in the project matching a filter.
 | path_filter | String | - | No | "" | Filter by path prefix |
 
 **Example**:
-\\\python
-requests.post("http://localhost:8080", json={
-  "Op": "LIST_ASSETS",
-  "P": ["Blueprint", "/Game/Characters"]
-}).json()
+```python
+await bridge._send_command("LIST_ASSETS|Blueprint|/Game/Characters")
+# Or via the bundled UnrealBridge wrapper method for this command,
+# if one exists in graphbridge_bridge.py -- see USAGE.md.
 # → {"Success": true, "Result": {"Assets": [...]}}
-\\\
+```
 
 ### CREATE_ENUM
 
@@ -142,12 +143,11 @@ Create a new Enum asset.
 | values | String | - | No | "" | Comma-separated enum values |
 
 **Example**:
-\\\python
-requests.post("http://localhost:8080", json={
-  "Op": "CREATE_ENUM",
-  "P": ["/Game/CharacterState", "Idle,Walking,Running,Attacking"]
-}).json()
-\\\
+```python
+await bridge._send_command("CREATE_ENUM|/Game/CharacterState|Idle,Walking,Running,Attacking")
+# Or via the bundled UnrealBridge wrapper method for this command,
+# if one exists in graphbridge_bridge.py -- see USAGE.md.
+```
 
 ### CREATE_STRUCT
 
@@ -158,12 +158,11 @@ Create a new Struct asset.
 | struct_path | String | - | Yes | - | Path like /Game/MyStruct |
 
 **Example**:
-\\\python
-requests.post("http://localhost:8080", json={
-  "Op": "CREATE_STRUCT",
-  "P": ["/Game/AttackInfo"]
-}).json()
-\\\
+```python
+await bridge._send_command("CREATE_STRUCT|/Game/AttackInfo")
+# Or via the bundled UnrealBridge wrapper method for this command,
+# if one exists in graphbridge_bridge.py -- see USAGE.md.
+```
 
 ---
 
@@ -362,22 +361,22 @@ BUILD_LIGHTING, COMPRESS_MATERIAL_SHADER, DELETE_ASSET, DUPLICATE_ASSET, GET_ASS
 ## Response Patterns
 
 ### Success Response
-\\\json
+```json
 {
   "Success": true,
   "Result": {
     /* command-specific data */
   }
 }
-\\\
+```
 
 ### Error Response
-\\\json
+```json
 {
   "Success": false,
   "Error": "Blueprint not found at /Game/NonExistent"
 }
-\\\
+```
 
 ### Common Result Fields
 | Field | Type | Meaning |
@@ -404,7 +403,7 @@ BUILD_LIGHTING, COMPRESS_MATERIAL_SHADER, DELETE_ASSET, DUPLICATE_ASSET, GET_ASS
 
 ### Type Conversions
 
-\\\python
+```python
 # String is always safe
 "100"  # → always String
 
@@ -426,7 +425,7 @@ BUILD_LIGHTING, COMPRESS_MATERIAL_SHADER, DELETE_ASSET, DUPLICATE_ASSET, GET_ASS
 # Enum
 "Opaque"  # → valid
 "Invisible"  # → error (not in enum)
-\\\
+```
 
 ---
 
@@ -446,71 +445,79 @@ BUILD_LIGHTING, COMPRESS_MATERIAL_SHADER, DELETE_ASSET, DUPLICATE_ASSET, GET_ASS
 ## Examples by Use Case
 
 ### Setup Character from Scratch
-\\\python
+```python
 # 1. Create character Blueprint
-resp = requests.post("...", json={"Op": "CREATE_BLUEPRINT_CLASS", "P": ["/Game/BP_MyCharacter", "/Script/Engine.Character"]})
+await bridge._send_command(f"CREATE_BLUEPRINT_CLASS|/Game/BP_MyCharacter|/Script/Engine.Character")
 bp_path = "/Game/BP_MyCharacter"
 
 # 2. Set mesh
-requests.post("...", json={"Op": "SET_CHARACTER_MESH", "P": [bp_path, "/Game/Mannequin/SK_Mannequin"]})
+await bridge._send_command(f"SET_CHARACTER_MESH|{bp_path}|/Game/Mannequin/SK_Mannequin")
 
 # 3. Configure capsule
-requests.post("...", json={"Op": "SET_CHARACTER_CAPSULE", "P": [bp_path, "90", "42"]})
+await bridge._send_command(f"SET_CHARACTER_CAPSULE|{bp_path}|90|42")
 
 # 4. Setup camera
-requests.post("...", json={"Op": "SET_CAMERA_BOOM", "P": [bp_path, "300", "60"]})
-\\\
+await bridge._send_command(f"SET_CAMERA_BOOM|{bp_path}|300|60")
+```
 
 ### Create Attack Montage
-\\\python
+```python
 montage_path = "/Game/Montages/MontageAttack"
 skeleton = "/Game/Mannequin/SK_Mannequin"
 
 # 1. Create montage
-requests.post("...", json={"Op": "CREATE_ANIM_MONTAGE", "P": [montage_path, skeleton]})
+await bridge._send_command(f"CREATE_ANIM_MONTAGE|{montage_path}|{skeleton}")
 
 # 2. Add attack section
-requests.post("...", json={"Op": "ADD_MONTAGE_SECTION", "P": [montage_path, "Attack", "0"]})
+await bridge._send_command(f"ADD_MONTAGE_SECTION|{montage_path}|Attack|0")
 
 # 3. Add impact notify at 0.5s
-requests.post("...", json={"Op": "ADD_MONTAGE_NOTIFY", "P": [montage_path, "AnimNotify_PlaySound", "0.5"]})
-\\\
+await bridge._send_command(f"ADD_MONTAGE_NOTIFY|{montage_path}|AnimNotify_PlaySound|0.5")
+```
 
 ### Query Assets
-\\\python
+```python
 # List all Character Blueprints in /Game/Characters
-resp = requests.post("...", json={"Op": "LIST_ASSETS", "P": ["Character", "/Game/Characters"]})
-blueprints = resp.json()["Result"]["Assets"]
+result = await bridge._send_command("LIST_ASSETS|Character|/Game/Characters")
+blueprints = result["Result"]["Assets"]
 print(blueprints)
 # → ["/Game/Characters/BP_Player", "/Game/Characters/BP_Enemy", ...]
-\\\
+```
 
 ---
 
-## Python Auto-Toolset
+## Python Client
 
-**GraphBridgeToolset.py** (auto-generated) provides typed, doc-rich methods:
+`Content/Python/graphbridge_bridge.py`'s `UnrealBridge` class provides
+typed, async, doc-commented methods for the common commands (see its
+docstrings for the full method list) instead of hand-building pipe-delimited
+strings:
 
-\\\python
-from GraphBridgeToolset import GraphBridgeClient
+```python
+import asyncio
+from graphbridge_bridge import UnrealBridge
 
-client = GraphBridgeClient("http://localhost:8080")
+async def main():
+    bridge = UnrealBridge()
+    await bridge.connect()
 
-# Spawn node with type hints and docstring
-result = client.spawn_node(
-    blueprint_path="/Game/BP_MyBlueprint",
-    node_class="K2Node_VariableGet",
-    node_title="Get X",
-    x=100,  # int, range: -100000 to 100000
-    y=200   # int, range: -100000 to 100000
-)
-print(result["NodeGUID"])
-\\\
+    result = await bridge.spawn_node(
+        bp_path="/Game/BP_MyBlueprint",
+        node_class="K2Node_VariableGet",
+        node_title="Get X",
+        x=100,
+        y=200,
+    )
+    print(result["Result"]["NodeGUID"])
 
-Run GraphBridgeToolset.py directly for CLI help:
-\\\ash
-python GraphBridgeToolset.py spawn_node --help
-\\\
+    await bridge.close()
+
+asyncio.run(main())
+```
+
+Not every one of the 129 commands has a typed wrapper method yet — for
+anything without one, use `bridge._send_command("OP|param1|param2|...")`
+directly, matching the pipe-delimited format documented above.
 
 ---
 
