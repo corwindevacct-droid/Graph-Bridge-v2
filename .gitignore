@@ -54,3 +54,20 @@ Thumbs.db
 # Work held out of the current release (see repo history/commit messages
 # for why) -- not deleted, just not part of what ships.
 _deferred/
+
+# Internal notes and status docs -- not for the public repo or the
+# packaged plugin. Files on disk, just never tracked; explicit here so
+# they can't be swept in by a future `git add -A`.
+/FAB_SUBMISSION_README.md
+/Tests/TASK_*.md
+/Tests/HARNESS_STATUS.md
+/Tests/BRIDGE_TESTING_GUIDE.md
+/Tests/FIXTURE_*.md
+/Tests/GENERATOR_QUICK_START.md
+/Tests/GoldenData/
+/Content/Python/GraphBridgeToolset.py
+/Content/Python/create_test_fixture.py
+/Content/Python/fixture_commands.txt
+/Content/Python/setup_fixture_graphbridge.py
+/Content/Python/verify_fixture.py
+/Tools/
